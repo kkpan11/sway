@@ -1,16 +1,16 @@
 //! A value representing a function-local variable.
 
 use crate::{
-    constant::Constant,
     context::Context,
     irtype::{Type, TypeContent},
     pretty::DebugWithContext,
+    Constant,
 };
 
-/// A wrapper around an [ECS](https://github.com/fitzgen/generational-arena) handle into the
+/// A wrapper around an [ECS](https://github.com/orlp/slotmap) handle into the
 /// [`Context`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, DebugWithContext)]
-pub struct LocalVar(#[in_context(local_vars)] pub generational_arena::Index);
+pub struct LocalVar(#[in_context(local_vars)] pub slotmap::DefaultKey);
 
 #[doc(hidden)]
 #[derive(Clone, DebugWithContext)]

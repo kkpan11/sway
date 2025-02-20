@@ -1,13 +1,15 @@
 use lsp_types::{Position, Range};
+use std::path::PathBuf;
 use sway_ast::Intrinsic;
 use sway_core::{
+    decl_engine::parsed_id::ParsedDeclId,
     language::{
         parsed::{
             AbiCastExpression, AmbiguousPathExpression, Declaration, DelineatedPathExpression,
             EnumVariant, Expression, FunctionApplicationExpression, FunctionParameter,
-            MethodApplicationExpression, Scrutinee, StorageField, StructExpression,
-            StructExpressionField, StructField, StructScrutineeField, Supertrait, TraitFn,
-            UseStatement,
+            IncludeStatement, MethodApplicationExpression, Scrutinee, StorageField,
+            StorageNamespace, StructExpression, StructExpressionField, StructField,
+            StructScrutineeField, Supertrait, TraitFn, UseStatement,
         },
         ty,
     },
@@ -15,14 +17,14 @@ use sway_core::{
     type_system::{TypeId, TypeInfo, TypeParameter},
     Engines, TraitConstraint, TypeArgument, TypeEngine,
 };
-use sway_types::{Ident, Span, Spanned};
+use sway_types::{Ident, SourceEngine, Span, Spanned};
 
-/// The `AstToken` holds the types produced by the [sway_core::language::parsed::ParseProgram].
+/// The `ParsedAstToken` holds the types produced by the [sway_core::language::parsed::ParseProgram].
 /// These tokens have not been type-checked.
 /// See this issue https://github.com/FuelLabs/sway/issues/2257 for more information about why they are
 /// useful to the language server.
 #[derive(Debug, Clone)]
-pub enum AstToken {
+pub enum ParsedAstToken {
     AbiCastExpression(AbiCastExpression),
     AmbiguousPathExpression(AmbiguousPathExpression),
     Attribute(Attribute),
@@ -34,20 +36,22 @@ pub enum AstToken {
     FunctionApplicationExpression(FunctionApplicationExpression),
     FunctionParameter(FunctionParameter),
     Ident(Ident),
-    IncludeStatement,
+    ModuleName,
+    IncludeStatement(IncludeStatement),
     Intrinsic(Intrinsic),
     Keyword(Ident),
     LibrarySpan(Span),
     MethodApplicationExpression(MethodApplicationExpression),
     Scrutinee(Scrutinee),
     StorageField(StorageField),
+    StorageNamespace(StorageNamespace),
     StructExpression(StructExpression),
     StructExpressionField(StructExpressionField),
     StructField(StructField),
     StructScrutineeField(StructScrutineeField),
     Supertrait(Supertrait),
     TraitConstraint(TraitConstraint),
-    TraitFn(TraitFn),
+    TraitFn(ParsedDeclId<TraitFn>),
     TypeArgument(TypeArgument),
     TypeParameter(TypeParameter),
     UseStatement(UseStatement),
@@ -62,6 +66,8 @@ pub enum TypedAstToken {
     TypedScrutinee(ty::TyScrutinee),
     TyStructScrutineeField(ty::TyStructScrutineeField),
     TypedConstantDeclaration(ty::TyConstantDecl),
+    TypedConfigurableDeclaration(ty::TyConfigurableDecl),
+    TypedTraitTypeDeclaration(ty::TyTraitType),
     TypedFunctionDeclaration(ty::TyFunctionDecl),
     TypedFunctionParameter(ty::TyFunctionParameter),
     TypedStructField(ty::TyStructField),
@@ -75,7 +81,8 @@ pub enum TypedAstToken {
     TypedArgument(TypeArgument),
     TypedParameter(TypeParameter),
     TypedTraitConstraint(TraitConstraint),
-    TypedIncludeStatement,
+    TypedModuleName,
+    TypedIncludeStatement(ty::TyIncludeStatement),
     TypedUseStatement(ty::TyUseStatement),
     Ident(Ident),
 }
@@ -107,6 +114,8 @@ pub enum SymbolKind {
     Module,
     /// Emitted for numeric literals.
     NumericLiteral,
+    /// Emitted for keywords.
+    ProgramTypeKeyword,
     /// Emitted for the self function parameter and self path-specifier.
     SelfKeyword,
     /// Emitted for the Self type parameter.
@@ -117,6 +126,8 @@ pub enum SymbolKind {
     Struct,
     /// Emitted for traits.
     Trait,
+    /// Emitted for associated types.
+    TraitType,
     /// Emitted for type aliases.
     TypeAlias,
     /// Emitted for type parameters.
@@ -137,14 +148,19 @@ pub enum TypeDefinition {
     Ident(Ident),
 }
 
+#[derive(Debug, Clone)]
+pub enum TokenAstNode {
+    Parsed(ParsedAstToken),
+    Typed(TypedAstToken),
+}
+
 /// The `Token` type is created during traversal of the parsed and typed AST's of a program.
 /// It holds the parsed and typed data structures produced by the sway compiler.
 /// It also holds the type definition & semantic type of the token if they could be inferred
 /// during traversal of the AST's.
 #[derive(Debug, Clone)]
 pub struct Token {
-    pub parsed: AstToken,
-    pub typed: Option<TypedAstToken>,
+    pub ast_node: TokenAstNode,
     pub type_def: Option<TypeDefinition>,
     pub kind: SymbolKind,
 }
@@ -153,59 +169,110 @@ impl Token {
     /// Create a new token with the given [SymbolKind].
     /// This function is intended to be used during traversal of the
     /// [sway_core::language::parsed::ParseProgram] AST.
-    pub fn from_parsed(token: AstToken, kind: SymbolKind) -> Self {
+    pub fn from_parsed(token: ParsedAstToken, kind: SymbolKind) -> Self {
         Self {
-            parsed: token,
-            typed: None,
+            ast_node: TokenAstNode::Parsed(token),
             type_def: None,
             kind,
         }
     }
 
-    /// Return the [Ident] of the declaration of the provided token.
-    pub fn declared_token_ident(&self, engines: &Engines) -> Option<Ident> {
-        self.type_def.as_ref().and_then(|type_def| match type_def {
-            TypeDefinition::TypeId(type_id) => ident_of_type_id(engines, type_id),
-            TypeDefinition::Ident(ident) => Some(ident.clone()),
-        })
+    /// Get the `AstToken`, if this is a parsed token.
+    pub fn as_parsed(&self) -> Option<&ParsedAstToken> {
+        match &self.ast_node {
+            TokenAstNode::Parsed(token) => Some(token),
+            _ => None,
+        }
     }
 
-    /// Return the [Span] of the declaration of the provided token. This is useful for
-    /// performaing == comparisons on spans. We need to do this instead of comparing
-    /// the [Ident] because the [PartialEq] implementation is only comparing the name.
-    pub fn declared_token_span(&self, engines: &Engines) -> Option<Span> {
+    /// Get the `TypedAstToken`, if this is a typed token.
+    pub fn as_typed(&self) -> Option<&TypedAstToken> {
+        match &self.ast_node {
+            TokenAstNode::Typed(token) => Some(token),
+            _ => None,
+        }
+    }
+
+    /// Return the [TokenIdent] of the declaration of the provided token.
+    pub fn declared_token_ident(&self, engines: &Engines) -> Option<TokenIdent> {
         self.type_def.as_ref().and_then(|type_def| match type_def {
-            TypeDefinition::TypeId(type_id) => Some(ident_of_type_id(engines, type_id)?.span()),
-            TypeDefinition::Ident(ident) => Some(ident.span()),
+            TypeDefinition::TypeId(type_id) => ident_of_type_id(engines, type_id),
+            TypeDefinition::Ident(ident) => Some(TokenIdent::new(ident, engines.se())),
         })
     }
 }
 
-/// Check if the given method is a [core::ops] application desugared from short-hand syntax like / + * - etc.
+/// A more convenient [Ident] type for use in the language server.
+///
+/// This type is used as the key in the [TokenMap]. It's constructed during AST traversal
+/// where we compute the [Range] of the token and the convert [SourceId]'s to [PathBuf]'s.
+/// Although this introduces a small amount of overhead while traversing, precomputing this
+/// greatly speeds up performance in all other areas of the language server.
+///
+/// [TokenMap]: crate::core::token_map::TokenMap
+/// [SourceId]: sway_types::SourceId
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TokenIdent {
+    pub name: String,
+    pub range: Range,
+    pub path: Option<PathBuf>,
+    pub is_raw_ident: bool,
+}
+
+impl TokenIdent {
+    pub fn new(ident: &Ident, se: &SourceEngine) -> Self {
+        let path = ident
+            .span()
+            .source_id()
+            .map(|source_id| se.get_path(source_id));
+        Self {
+            name: ident.span().str(),
+            range: get_range_from_span(&ident.span()),
+            path,
+            is_raw_ident: ident.is_raw_ident(),
+        }
+    }
+
+    pub fn is_raw_ident(&self) -> bool {
+        self.is_raw_ident
+    }
+}
+
+impl std::hash::Hash for TokenIdent {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.range.start.line.hash(state);
+        self.range.start.character.hash(state);
+        self.range.end.line.hash(state);
+        self.range.end.character.hash(state);
+        self.path.hash(state);
+        self.is_raw_ident.hash(state);
+    }
+}
+
+/// Check if the given method is a [`core::ops`] application desugared from short-hand syntax like / + * - etc.
 pub fn desugared_op(prefixes: &[Ident]) -> bool {
-    let prefix0 = prefixes.get(0).map(|ident| ident.as_str());
-    let prefix1 = prefixes.get(1).map(|ident| ident.as_str());
+    let prefix0 = prefixes.first().map(sway_types::BaseIdent::as_str);
+    let prefix1 = prefixes.get(1).map(sway_types::BaseIdent::as_str);
     if let (Some("core"), Some("ops")) = (prefix0, prefix1) {
         return true;
     }
     false
 }
 
-/// We need to do this work around as the custom [PartialEq] for [Ident] impl
-/// only checks for the string, not the [Span].
-pub fn to_ident_key(ident: &Ident) -> (Ident, Span) {
-    (ident.clone(), ident.span())
-}
-
-/// Use the [TypeId] to look up the associated [TypeInfo] and return the [Ident] if one is found.
-pub fn ident_of_type_id(engines: &Engines, type_id: &TypeId) -> Option<Ident> {
-    match engines.te().get(*type_id) {
-        TypeInfo::UnknownGeneric { name, .. } => Some(name),
-        TypeInfo::Enum(decl_ref) => Some(engines.de().get_enum(&decl_ref).call_path.suffix),
-        TypeInfo::Struct(decl_ref) => Some(engines.de().get_struct(&decl_ref).call_path.suffix),
-        TypeInfo::Custom { call_path, .. } => Some(call_path.suffix),
-        _ => None,
-    }
+/// Use the [TypeId] to look up the associated [TypeInfo] and return the [TokenIdent] if one is found.
+pub fn ident_of_type_id(engines: &Engines, type_id: &TypeId) -> Option<TokenIdent> {
+    let ident = match &*engines.te().get(*type_id) {
+        TypeInfo::UnknownGeneric { name, .. } | TypeInfo::Alias { name, .. } => name.clone(),
+        TypeInfo::Enum(decl_ref) => engines.de().get_enum(decl_ref).call_path.suffix.clone(),
+        TypeInfo::Struct(decl_ref) => engines.de().get_struct(decl_ref).call_path.suffix.clone(),
+        TypeInfo::Custom {
+            qualified_call_path,
+            ..
+        } => qualified_call_path.call_path.suffix.clone(),
+        _ => return None,
+    };
+    Some(TokenIdent::new(&ident, engines.se()))
 }
 
 /// Intended to be used during traversal of the [sway_core::language::parsed::ParseProgram] AST.
@@ -229,7 +296,7 @@ pub fn type_info_to_symbol_kind(
         TypeInfo::UnsignedInteger(..) | TypeInfo::Boolean | TypeInfo::B256 => {
             SymbolKind::BuiltinType
         }
-        TypeInfo::Numeric | TypeInfo::Str(..) => SymbolKind::NumericLiteral,
+        TypeInfo::Numeric | TypeInfo::StringArray(..) => SymbolKind::NumericLiteral,
         TypeInfo::Custom { .. } | TypeInfo::Struct { .. } | TypeInfo::Contract => {
             SymbolKind::Struct
         }
@@ -238,7 +305,10 @@ pub fn type_info_to_symbol_kind(
             let type_info = type_engine.get(elem_ty.type_id);
             type_info_to_symbol_kind(type_engine, &type_info, Some(&elem_ty.span()))
         }
-        TypeInfo::SelfType => SymbolKind::SelfTypeKeyword,
+        TypeInfo::Slice(elem_ty) => {
+            let type_info = type_engine.get(elem_ty.type_id);
+            type_info_to_symbol_kind(type_engine, &type_info, Some(&elem_ty.span()))
+        }
         _ => SymbolKind::Unknown,
     }
 }
@@ -247,15 +317,8 @@ pub fn type_info_to_symbol_kind(
 pub fn get_range_from_span(span: &Span) -> Range {
     let start = span.start_pos().line_col();
     let end = span.end_pos().line_col();
-
-    let start_line = start.0 as u32 - 1;
-    let start_character = start.1 as u32 - 1;
-
-    let end_line = end.0 as u32 - 1;
-    let end_character = end.1 as u32 - 1;
-
     Range {
-        start: Position::new(start_line, start_character),
-        end: Position::new(end_line, end_character),
+        start: Position::new(start.line as u32 - 1, start.col as u32 - 1),
+        end: Position::new(end.line as u32 - 1, end.col as u32 - 1),
     }
 }

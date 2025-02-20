@@ -1,5 +1,4 @@
 use crate::{
-    config::items::ItemBraceStyle,
     formatter::{
         shape::{ExprKind, LineStyle},
         *,
@@ -11,6 +10,7 @@ use crate::{
 };
 use std::fmt::Write;
 use sway_ast::{
+    keywords::{ColonToken, DoubleDotToken, Keyword, MutToken, RefToken, Token, UnderscoreToken},
     Braces, CommaToken, ExprTupleDescriptor, PathExpr, Pattern, PatternStructField, Punctuated,
 };
 use sway_types::{ast::Delimiter, Spanned};
@@ -31,19 +31,19 @@ impl Format for Pattern {
                 formatted_code.push_str(" | ");
                 rhs.format(formatted_code, formatter)?;
             }
-            Self::Wildcard { underscore_token } => {
-                formatted_code.push_str(underscore_token.span().as_str())
-            }
+            Self::Wildcard {
+                underscore_token: _,
+            } => formatted_code.push_str(UnderscoreToken::AS_STR),
             Self::Var {
                 reference,
                 mutable,
                 name,
             } => {
-                if let Some(ref_token) = reference {
-                    write!(formatted_code, "{} ", ref_token.span().as_str())?;
+                if reference.is_some() {
+                    write!(formatted_code, "{} ", RefToken::AS_STR)?;
                 }
-                if let Some(mut_token) = mutable {
-                    write!(formatted_code, "{} ", mut_token.span().as_str())?;
+                if mutable.is_some() {
+                    write!(formatted_code, "{} ", MutToken::AS_STR)?;
                 }
                 name.format(formatted_code, formatter)?;
             }
@@ -126,7 +126,9 @@ impl Format for Pattern {
                     },
                 )?;
             }
-            Self::Error(..) => {}
+            Self::Error(..) => {
+                return Err(FormatterError::SyntaxError);
+            }
         }
         Ok(())
     }
@@ -154,19 +156,9 @@ impl CurlyBrace for Pattern {
         line: &mut String,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        let brace_style = formatter.config.items.item_brace_style;
-        match brace_style {
-            ItemBraceStyle::AlwaysNextLine => {
-                // Add openning brace to the next line.
-                write!(line, "\n{}", Delimiter::Brace.as_open_char())?;
-                formatter.shape.block_indent(&formatter.config);
-            }
-            _ => {
-                // Add opening brace to the same line
-                write!(line, " {}", Delimiter::Brace.as_open_char())?;
-                formatter.shape.block_indent(&formatter.config);
-            }
-        }
+        // Add opening brace to the same line
+        write!(line, " {}", Delimiter::Brace.as_open_char())?;
+        formatter.indent();
 
         Ok(())
     }
@@ -175,13 +167,13 @@ impl CurlyBrace for Pattern {
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         // Unindent by one block
-        formatter.shape.block_unindent(&formatter.config);
+        formatter.unindent();
         match formatter.shape.code_line.line_style {
             LineStyle::Inline => write!(line, "{}", Delimiter::Brace.as_close_char())?,
             _ => write!(
                 line,
                 "{}{}",
-                formatter.shape.indent.to_string(&formatter.config)?,
+                formatter.indent_to_str()?,
                 Delimiter::Brace.as_close_char()
             )?,
         }
@@ -197,16 +189,16 @@ impl Format for PatternStructField {
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         match self {
-            Self::Rest { token } => {
-                write!(formatted_code, "{}", token.span().as_str())?;
+            Self::Rest { token: _ } => {
+                write!(formatted_code, "{}", DoubleDotToken::AS_STR)?;
             }
             Self::Field {
                 field_name,
                 pattern_opt,
             } => {
-                write!(formatted_code, "{}", field_name.span().as_str())?;
-                if let Some((colon_token, pattern)) = pattern_opt {
-                    write!(formatted_code, "{} ", colon_token.span().as_str())?;
+                write!(formatted_code, "{}", field_name.as_str())?;
+                if let Some((_colon_token, pattern)) = pattern_opt {
+                    write!(formatted_code, "{} ", ColonToken::AS_STR)?;
                     pattern.format(formatted_code, formatter)?;
                 }
             }
@@ -222,12 +214,12 @@ fn get_field_width(
 ) -> Result<(usize, usize), FormatterError> {
     let mut largest_field: usize = 0;
     let mut body_width: usize = 3; // this is taking into account the opening brace, the following space and the ending brace.
-    for (field, comma_token) in &fields.value_separator_pairs {
+    for (field, _comma_token) in &fields.value_separator_pairs {
         let mut field_str = FormattedCode::new();
         field.format(&mut field_str, formatter)?;
         let mut field_length = field_str.chars().count();
 
-        field_length += comma_token.span().as_str().chars().count();
+        field_length += CommaToken::AS_STR.chars().count();
         body_width += &field_length + 1; // accounting for the following space
 
         if field_length > largest_field {

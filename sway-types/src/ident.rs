@@ -1,20 +1,19 @@
-use serde::Serialize;
-
 use crate::{span::Span, Spanned};
-
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::{Ord, Ordering},
     fmt,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 pub trait Named {
     fn name(&self) -> &BaseIdent;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BaseIdent {
-    name_override_opt: Option<String>,
+    name_override_opt: Option<Arc<String>>,
     span: Span,
     is_raw_ident: bool,
 }
@@ -23,6 +22,7 @@ impl BaseIdent {
     pub fn as_str(&self) -> &str {
         self.name_override_opt
             .as_deref()
+            .map(|x| x.as_str())
             .unwrap_or_else(|| self.span.as_str())
     }
 
@@ -31,7 +31,7 @@ impl BaseIdent {
     }
 
     pub fn name_override_opt(&self) -> Option<&str> {
-        self.name_override_opt.as_deref()
+        self.name_override_opt.as_deref().map(|x| x.as_str())
     }
 
     pub fn new(span: Span) -> Ident {
@@ -62,7 +62,7 @@ impl BaseIdent {
 
     pub fn new_with_override(name_override: String, span: Span) -> Ident {
         Ident {
-            name_override_opt: Some(name_override),
+            name_override_opt: Some(Arc::new(name_override)),
             span,
             is_raw_ident: false,
         }
@@ -70,7 +70,15 @@ impl BaseIdent {
 
     pub fn new_no_span(name: String) -> Ident {
         Ident {
-            name_override_opt: Some(name),
+            name_override_opt: Some(Arc::new(name)),
+            span: Span::dummy(),
+            is_raw_ident: false,
+        }
+    }
+
+    pub fn dummy() -> Ident {
+        Ident {
+            name_override_opt: Some(Arc::new("foo".into())),
             span: Span::dummy(),
             is_raw_ident: false,
         }
@@ -82,18 +90,6 @@ impl BaseIdent {
 /// representation, so that namespacing isn't reliant on the span itself, which will
 /// often be different.
 pub type Ident = BaseIdent;
-
-impl Serialize for Ident {
-    // Serialize an `Ident` struct with two fields: `to_string` and `span`.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-
-        let mut state = serializer.serialize_struct("Ident", 2)?;
-        state.serialize_field("to_string", &self.to_string())?;
-        state.serialize_field("span", &self.span)?;
-        state.end()
-    }
-}
 
 impl Hash for Ident {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -133,6 +129,12 @@ impl fmt::Display for Ident {
     }
 }
 
+impl fmt::Debug for Ident {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "{}", self.as_str())
+    }
+}
+
 /// An [IdentUnique] is an _identifier_ with a corresponding `span` from which it was derived.
 /// Its hash and equality implementation takes the full span into account, meaning that identifiers
 /// are considered unique if they originate from different files.
@@ -154,7 +156,7 @@ impl From<&Ident> for IdentUnique {
 impl From<&IdentUnique> for Ident {
     fn from(item: &IdentUnique) -> Self {
         Ident {
-            name_override_opt: item.0.name_override_opt().map(|s| s.to_string()),
+            name_override_opt: item.0.name_override_opt().map(|s| Arc::new(s.to_string())),
             span: item.0.span(),
             is_raw_ident: item.0.is_raw_ident(),
         }
@@ -164,18 +166,22 @@ impl From<&IdentUnique> for Ident {
 impl Hash for IdentUnique {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.span().hash(state);
+        self.0.as_str().hash(state);
     }
 }
 
 impl PartialEq for IdentUnique {
     fn eq(&self, other: &Self) -> bool {
-        self.0.span() == other.0.span()
+        self.0.as_str() == other.0.as_str() && self.0.span() == other.0.span()
     }
 }
 
 impl Ord for IdentUnique {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.span().cmp(&other.0.span())
+        self.0
+            .span()
+            .cmp(&other.0.span())
+            .then(self.0.as_str().cmp(other.0.as_str()))
     }
 }
 
@@ -186,3 +192,15 @@ impl PartialOrd for IdentUnique {
 }
 
 impl Eq for IdentUnique {}
+
+impl Spanned for IdentUnique {
+    fn span(&self) -> Span {
+        self.0.span()
+    }
+}
+
+impl fmt::Display for IdentUnique {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "{}", self.0.as_str())
+    }
+}

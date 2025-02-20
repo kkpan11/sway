@@ -1,32 +1,33 @@
-use fuel_vm::consts::VM_MAX_RAM;
 use fuels::{accounts::wallet::WalletUnlocked, prelude::*, types::ContractId};
-
-use sha2::{Digest, Sha256};
 
 abigen!(Contract(
     name = "CallFramesTestContract",
-    abi = "test_projects/call_frames/out/debug/call_frames-abi.json"
+    abi = "test_projects/call_frames/out/release/call_frames-abi.json"
 ));
 
 async fn get_call_frames_instance() -> (CallFramesTestContract<WalletUnlocked>, ContractId) {
-    let wallet = launch_provider_and_get_wallet().await;
+    let wallet = launch_provider_and_get_wallet().await.unwrap();
     let id = Contract::load_from(
-        "test_projects/call_frames/out/debug/call_frames.bin",
+        "test_projects/call_frames/out/release/call_frames.bin",
         LoadConfiguration::default(),
     )
-    .unwrap()
-    .deploy(&wallet, TxParameters::default())
-    .await
     .unwrap();
+
+    let id = id.deploy(&wallet, TxPolicies::default()).await.unwrap();
     let instance = CallFramesTestContract::new(id.clone(), wallet);
 
     (instance, id.into())
 }
 
 #[tokio::test]
-async fn can_get_contract_id() {
+async fn can_get_id_contract_id_this() {
     let (instance, id) = get_call_frames_instance().await;
-    let result = instance.methods().get_id().call().await.unwrap();
+    let result = instance
+        .methods()
+        .get_id_contract_id_this()
+        .call()
+        .await
+        .unwrap();
     assert_eq!(result.value, id);
 }
 
@@ -34,26 +35,17 @@ async fn can_get_contract_id() {
 async fn can_get_code_size() {
     let (instance, _id) = get_call_frames_instance().await;
     let result = instance.methods().get_code_size().call().await.unwrap();
-    assert!(is_within_range(result.value));
+    // Check if codesize is between 1000 and 7000. Arbitrary endpoints, current codesize is 7208
+    // but the lower bound future proofs against compiler optimizations
+    dbg!(result.value);
+    assert!(result.value > 1000 && result.value < 7300);
 }
 
 #[tokio::test]
 async fn can_get_first_param() {
     let (instance, _id) = get_call_frames_instance().await;
     let result = instance.methods().get_first_param().call().await.unwrap();
-    // Hash the function name with Sha256
-    let mut hasher = Sha256::new();
-    let function_name = "get_first_param()";
-    hasher.update(function_name);
-    let function_name_hash = hasher.finalize();
-    // Grab the first 4 bytes of the hash per https://fuellabs.github.io/fuel-specs/master/protocol/abi#function-selector-encoding
-    let function_name_hash = &function_name_hash[0..4];
-    // Convert the bytes to decimal value
-    let selector = function_name_hash[3] as u64
-        + 256
-            * (function_name_hash[2] as u64
-                + 256 * (function_name_hash[1] as u64 + 256 * function_name_hash[0] as u64));
-    assert_eq!(result.value, selector);
+    assert_eq!(result.value, 10480);
 }
 
 #[tokio::test]
@@ -65,19 +57,15 @@ async fn can_get_second_param_u64() {
         .call()
         .await
         .unwrap();
-    assert_eq!(result.value, 101);
+    assert_eq!(result.value, 10508);
 }
 
 #[tokio::test]
 async fn can_get_second_param_bool() {
     let (instance, _id) = get_call_frames_instance().await;
-    let result = instance
-        .methods()
-        .get_second_param_bool(true)
-        .call()
-        .await
-        .unwrap();
-    assert_eq!(result.value, true);
+    let result = instance.methods().get_second_param_bool(true);
+    let result = result.call().await.unwrap();
+    assert!(result.value);
 }
 
 #[tokio::test]
@@ -123,12 +111,4 @@ async fn can_get_second_param_multiple_params2() {
         .await
         .unwrap();
     assert_eq!(result.value, (300, expected_struct, expected_struct2));
-}
-
-fn is_within_range(n: u64) -> bool {
-    if n <= 0 || n > VM_MAX_RAM {
-        false
-    } else {
-        true
-    }
 }

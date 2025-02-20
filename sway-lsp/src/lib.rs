@@ -1,11 +1,11 @@
 #![recursion_limit = "256"]
 
-mod capabilities;
+pub mod capabilities;
 pub mod config;
-mod core;
+pub mod core;
 pub mod error;
 pub mod server_state;
-mod handlers {
+pub mod handlers {
     pub mod notification;
     pub mod request;
 }
@@ -16,9 +16,8 @@ pub mod utils;
 
 use lsp_types::{
     CodeActionProviderCapability, CodeLensOptions, CompletionOptions, ExecuteCommandOptions,
-    HoverProviderCapability, OneOf, RenameOptions, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    WorkDoneProgressOptions,
+    HoverProviderCapability, OneOf, RenameOptions, SemanticTokensLegend, SemanticTokensOptions,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
 };
 use server_state::ServerState;
 use tower_lsp::{LspService, Server};
@@ -26,7 +25,9 @@ use tower_lsp::{LspService, Server};
 pub async fn start() {
     let (service, socket) = LspService::build(ServerState::new)
         .custom_method("sway/show_ast", ServerState::show_ast)
+        .custom_method("sway/visualize", ServerState::visualize)
         .custom_method("sway/on_enter", ServerState::on_enter)
+        .custom_method("sway/metrics", ServerState::metrics)
         .finish();
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
         .serve(service)
@@ -61,14 +62,14 @@ pub fn server_capabilities() -> ServerCapabilities {
                 work_done_progress: Some(true),
             },
         })),
+        references_provider: Some(OneOf::Left(true)),
         semantic_tokens_provider: Some(
             SemanticTokensOptions {
                 legend: SemanticTokensLegend {
                     token_types: capabilities::semantic_tokens::SUPPORTED_TYPES.to_vec(),
                     token_modifiers: capabilities::semantic_tokens::SUPPORTED_MODIFIERS.to_vec(),
                 },
-                full: Some(SemanticTokensFullOptions::Bool(true)),
-                range: None,
+                range: Some(true),
                 ..Default::default()
             }
             .into(),

@@ -1,34 +1,41 @@
 contract;
 
+// ANCHOR: storage_namespace
 storage {
-    var: u64 = 0,
+    my_storage_namespace {
+        // ANCHOR_END: storage_namespace
+        var: u64 = 0,
+    }
 }
 
 // ANCHOR: read
 #[storage(read)]
 // ANCHOR_END: read
 fn read() {
-    let variable = storage.var.read();
+    // ANCHOR: storage_namespace_access
+    let variable = storage::my_storage_namespace.var.read();
+    // ANCHOR_END: storage_namespace_access
+
 }
 
 // ANCHOR: write
 #[storage(write)]
 // ANCHOR_END: write
 fn write() {
-    storage.var.write(storage.var.read() + 1);
+    storage::my_storage_namespace.var.write(storage::my_storage_namespace.var.read() + 1);
 }
 
 // ANCHOR: read_write
 #[storage(read, write)]
 // ANCHOR_END: read_write
 fn read_write() {
-    let var = storage.var.read();
-    storage.var.write(var + 1);
+    let var = storage::my_storage_namespace.var.read();
+    storage::my_storage_namespace.var.write(var + 1);
 }
 
 fn example() {
     // ANCHOR: example
-    let bar: str[4] = "sway";
+    let bar: str = "sway";
     let baz: bool = true;
     // ANCHOR_END: example
 }
@@ -80,3 +87,14 @@ fn foo() {}
 #[inline(always)]
 fn bar() {}
 // ANCHOR_END: always_inline
+
+
+// ANCHOR: allow_deprecated_annotation
+#[deprecated(note = "this is deprecated")]
+struct DeprecatedStruct {}
+
+#[allow(deprecated)]
+fn using_deprecated_struct() {
+    let _ = DeprecatedStruct {};
+}
+// ANCHOR_END: allow_deprecated_annotation

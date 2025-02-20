@@ -69,7 +69,7 @@ macro_rules! immediate_ident_opt (
 macro_rules! get_span (
     ($start:expr, ()) => { $start };
     ($start:expr, ($arg_name:ident,)) => {
-        Span::join($start, $arg_name.span().clone())
+        Span::join($start, &$arg_name.span())
     };
     ($start:expr, ($arg_name_head:ident, $($arg_name:ident,)*)) => {{
         let _ = $arg_name_head;
@@ -119,6 +119,14 @@ macro_rules! define_op_codes (
                 match self {
                     $(Instruction::$op_name { token, .. } => {
                         Ident::new(token.span())
+                    },)*
+                }
+            }
+
+            pub fn op_code_as_str(&self) -> &'static str {
+                match self {
+                    $(Instruction::$op_name { .. } => {
+                        $s
                     },)*
                 }
             }
@@ -200,6 +208,13 @@ define_op_codes!(
     (Srli, SrliOpcode, "srli", (ret: reg, lhs: reg, rhs: imm)),
     (Sub, SubOpcode, "sub", (ret: reg, lhs: reg, rhs: reg)),
     (Subi, SubiOpcode, "subi", (ret: reg, lhs: reg, rhs: imm)),
+    (Wqcm, WqcmOpcode, "wqcm", (ret: reg, lhs: reg, rhs: reg, op_mode: imm)),
+    (Wqop, WqopOpcode, "wqop", (ret: reg, lhs: reg, rhs: reg, op_mode: imm)),
+    (Wqml, WqmlOpcode, "wqml", (ret: reg, lhs: reg, rhs: reg, indirect: imm)),
+    (Wqdv, WqdvOpcode, "wqdv", (ret: reg, lhs: reg, rhs: reg, indirect: imm)),
+    (Wqmd, WqmdOpcode, "wqmd", (ret: reg, lhs_a: reg, lhs_b: reg, rhs: reg)),
+    (Wqam, WqamOpcode, "wqam", (ret: reg, lhs_a: reg, lhs_b: reg, rhs: reg)),
+    (Wqmm, WqmmOpcode, "wqmm", (ret: reg, lhs_a: reg, lhs_b: reg, rhs: reg)),
     (Xor, XorOpcode, "xor", (ret: reg, lhs: reg, rhs: reg)),
     (Xori, XoriOpcode, "xori", (ret: reg, lhs: reg, rhs: imm)),
     /* Control Flow Instructions */
@@ -213,6 +228,8 @@ define_op_codes!(
     (Aloc, AlocOpcode, "aloc", (size: reg)),
     (Cfei, CfeiOpcode, "cfei", (size: imm)),
     (Cfsi, CfsiOpcode, "cfsi", (size: imm)),
+    (Cfe, CfeOpcode, "cfe", (size: reg)),
+    (Cfs, CfsOpcode, "cfs", (size: reg)),
     (Lb, LbOpcode, "lb", (ret: reg, addr: reg, offset: imm)),
     (Lw, LwOpcode, "lw", (ret: reg, addr: reg, offset: imm)),
     (Mcl, MclOpcode, "mcl", (addr: reg, size: reg)),
@@ -241,7 +258,7 @@ define_op_codes!(
     (Bal, BalOpcode, "bal", (ret: reg, asset: reg, contract: reg)),
     (Bhei, BheiOpcode, "bhei", (ret: reg)),
     (Bhsh, BhshOpcode, "bhsh", (addr: reg, height: reg)),
-    (Burn, BurnOpcode, "burn", (coins: reg)),
+    (Burn, BurnOpcode, "burn", (coins: reg, sub_id: reg)),
     (
         Call,
         CallOpcode,
@@ -257,7 +274,9 @@ define_op_codes!(
     ),
     (Croo, CrooOpcode, "croo", (addr: reg, contract: reg)),
     (Csiz, CsizOpcode, "csiz", (ret: reg, contract: reg)),
-    (Ldc, LdcOpcode, "ldc", (contract: reg, addr: reg, size: reg)),
+    (Bsiz, BsizOpcode, "bsiz", (ret: reg, contract: reg)),
+    (Ldc, LdcOpcode, "ldc", (contract: reg, addr: reg, size: reg, mode: imm)),
+    (Bldd, BlddOpcode, "bldd", (dst_ptr: reg, addr: reg, offset: reg, len: reg)),
     (
         Log,
         LogOpcode,
@@ -270,7 +289,7 @@ define_op_codes!(
         "logd",
         (reg_a: reg, reg_b: reg, addr: reg, size: reg)
     ),
-    (Mint, MintOpcode, "mint", (coins: reg)),
+    (Mint, MintOpcode, "mint", (coins: reg, sub_id: reg)),
     (Retd, RetdOpcode, "retd", (addr: reg, size: reg)),
     (Rvrt, RvrtOpcode, "rvrt", (value: reg)),
     (
@@ -313,9 +332,13 @@ define_op_codes!(
         (addr: reg, output: reg, coins: reg, asset: reg)
     ),
     /* Cryptographic Instructions */
-    (Ecr, EcrOpcode, "ecr", (addr: reg, sig: reg, hash: reg)),
+    (Eck1, Eck1Opcode, "eck1", (addr: reg, sig: reg, hash: reg)),
+    (Ecr1, Ecr1Opcode, "ecr1", (addr: reg, sig: reg, hash: reg)),
+    (Ed19, Ed19Opcode, "ed19", (addr: reg, sig: reg, hash: reg, len: reg)),
     (K256, K256Opcode, "k256", (addr: reg, data: reg, size: reg)),
     (S256, S256Opcode, "s256", (addr: reg, data: reg, size: reg)),
+    (ECOP, ECOPOpcode, "ecop", (dst_addr: reg, curve: reg, operation: reg, src_addr: reg)),
+    (EPAR, EPAROpcode, "epar", (ret: reg, curve: reg, groups_of_points: reg, addr: reg)),
     /* Other Instructions */
     (Flag, FlagOpcode, "flag", (value: reg)),
     (Gm, GmOpcode, "gm", (ret: reg, op: imm)),

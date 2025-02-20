@@ -1,8 +1,13 @@
-use crate::diagnostic::{Code, Diagnostic, Hint, Issue, Reason, ToDiagnostic};
+use crate::{
+    diagnostic::{Code, Diagnostic, Hint, Issue, Reason, ToDiagnostic},
+    formatting::Indent,
+};
 
 use core::fmt;
 
-use sway_types::{Ident, SourceId, Span, Spanned};
+use either::Either;
+
+use sway_types::{Ident, IdentUnique, SourceId, Span, Spanned};
 
 // TODO: since moving to using Idents instead of strings,
 // the warning_content will usually contain a duplicate of the span.
@@ -65,6 +70,15 @@ pub enum Warning {
     ShadowsOtherSymbol {
         name: Ident,
     },
+    AsmBlockIsEmpty,
+    UninitializedAsmRegShadowsItem {
+        /// Text "Constant" or "Configurable" or "Variable".
+        /// Denotes the type of the `item` that shadows the uninitialized ASM register.
+        constant_or_configurable_or_variable: &'static str,
+        /// The name of the item that shadows the register, that points to the name in
+        /// the item declaration.
+        item: IdentUnique,
+    },
     OverridingTraitImplementation,
     DeadDeclaration,
     DeadEnumDeclaration,
@@ -84,7 +98,15 @@ pub enum Warning {
     DeadStorageDeclarationForFunction {
         unneeded_attrib: String,
     },
-    MatchExpressionUnreachableArm,
+    MatchExpressionUnreachableArm {
+        match_value: Span,
+        match_type: String,
+        // Either preceding non catch-all arms or a single interior catch-all arm.
+        preceding_arms: Either<Vec<Span>, Span>,
+        unreachable_arm: Span,
+        is_last_arm: bool,
+        is_catch_all_arm: bool,
+    },
     UnrecognizedAttribute {
         attrib_name: Ident,
     },
@@ -105,6 +127,20 @@ pub enum Warning {
         block_name: Ident,
     },
     ModulePrivacyDisabled,
+    UsingDeprecated {
+        message: String,
+    },
+    DuplicatedStorageKey {
+        first_field: IdentUnique,
+        first_field_full_name: String,
+        first_field_key_is_compiler_generated: bool,
+        second_field: IdentUnique,
+        second_field_full_name: String,
+        second_field_key_is_compiler_generated: bool,
+        key: String,
+        // True if the experimental feature `storage_domains` is used.
+        experimental_storage_domains: bool,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -169,9 +205,8 @@ impl fmt::Display for Warning {
             NonScreamingSnakeCaseConstName { name } => {
                 write!(
                     f,
-                    "Constant name \"{}\" is not idiomatic. Constant names should be SCREAMING_SNAKE_CASE, like \
+                    "Constant name \"{name}\" is not idiomatic. Constant names should be SCREAMING_SNAKE_CASE, like \
                     \"{}\".",
-                    name,
                     to_screaming_snake_case(name.as_str()),
                 )
             },
@@ -188,6 +223,15 @@ impl fmt::Display for Warning {
             ShadowsOtherSymbol { name } => write!(
                 f,
                 "This shadows another symbol in this scope with the same name \"{name}\"."
+            ),
+            AsmBlockIsEmpty => write!(
+                f,
+                "This ASM block is empty."
+            ),
+            UninitializedAsmRegShadowsItem { constant_or_configurable_or_variable, item } => write!(
+                f,
+                "This uninitialized register is shadowing a {}. You probably meant to also initialize it, like \"{item}: {item}\".",
+                constant_or_configurable_or_variable.to_ascii_lowercase(),
             ),
             OverridingTraitImplementation => write!(
                 f,
@@ -217,7 +261,7 @@ impl fmt::Display for Warning {
                 "This function's storage attributes declaration does not match its \
                  actual storage access pattern: '{unneeded_attrib}' attribute(s) can be removed."
             ),
-            MatchExpressionUnreachableArm => write!(f, "This match arm is unreachable."),
+            MatchExpressionUnreachableArm { .. } => write!(f, "This match arm is unreachable."),
             UnrecognizedAttribute {attrib_name} => write!(f, "Unknown attribute: \"{attrib_name}\"."),
             AttributeExpectedNumberOfArguments {attrib_name, received_args, expected_min_len, expected_max_len } => write!(
                 f,
@@ -243,9 +287,16 @@ impl fmt::Display for Warning {
             ModulePrivacyDisabled => write!(f, "Module privacy rules will soon change to make modules private by default.
                                             You can enable the new behavior with the --experimental-private-modules flag, which will become the default behavior in a later release.
                                             More details are available in the related RFC: https://github.com/FuelLabs/sway-rfcs/blob/master/rfcs/0008-private-modules.md"),
+            UsingDeprecated { message } => write!(f, "{}", message),
+            DuplicatedStorageKey { first_field_full_name, second_field_full_name, key, .. } =>
+                write!(f, "Two storage fields have the same storage key.\nFirst field: {first_field_full_name}\nSecond field: {second_field_full_name}\nKey: {key}"),
         }
     }
 }
+
+#[allow(dead_code)]
+const FUTURE_HARD_ERROR_HELP: &str =
+    "In future versions of Sway this warning will become a hard error.";
 
 impl ToDiagnostic for CompileWarning {
     fn to_diagnostic(&self, source_engine: &sway_types::SourceEngine) -> Diagnostic {
@@ -258,25 +309,175 @@ impl ToDiagnostic for CompileWarning {
                 issue: Issue::warning(
                     source_engine,
                     name.span(),
-                    format!("Constant \"{name}\" should be SCREAMING_SNAKE_CASE")
+                    format!("Constant \"{name}\" should be SCREAMING_SNAKE_CASE."),
                 ),
                 hints: vec![
-                    Hint::warning(
+                    Hint::help(
                         source_engine,
                         name.span(),
-                        format!("\"{name}\" should be SCREAMING_SNAKE_CASE, like \"{}\".", to_screaming_snake_case(name.as_str()))
+                        format!("Consider renaming it to, e.g., \"{}\".", to_screaming_snake_case(name.as_str())),
                     ),
                 ],
                 help: vec![
-                    "In Sway, ABIs, structs, traits, and enums are CapitalCase.".to_string(),
-                    "Modules, variables, and functions are snake_case, while constants are SCREAMING_SNAKE_CASE.".to_string(),
-                    format!("Consider renaming the constant to, e.g., \"{}\".", to_screaming_snake_case(name.as_str())),
+                    format!("In Sway, ABIs, structs, traits, and enums are CapitalCase."),
+                    format!("Modules, variables, and functions are snake_case, while constants are SCREAMING_SNAKE_CASE."),
+                ],
+            },
+            MatchExpressionUnreachableArm { match_value, match_type, preceding_arms, unreachable_arm, is_last_arm, is_catch_all_arm } => Diagnostic {
+                reason: Some(Reason::new(code(1), "Match arm is unreachable".to_string())),
+                issue: Issue::warning(
+                    source_engine,
+                    unreachable_arm.clone(),
+                    match (*is_last_arm, *is_catch_all_arm) {
+                        (true, true) => format!("Last catch-all match arm `{}` is unreachable.", unreachable_arm.as_str()),
+                        _ => format!("Match arm `{}` is unreachable.", unreachable_arm.as_str())
+                    }
+                ),
+                hints: vec![
+                    Hint::info(
+                        source_engine,
+                        match_value.clone(),
+                        format!("The expression to match on is of type \"{match_type}\".")
+                    ),
+                    if preceding_arms.is_right() {
+                        Hint::help(
+                            source_engine,
+                            preceding_arms.as_ref().unwrap_right().clone(),
+                            format!("Catch-all arm `{}` makes all match arms below it unreachable.", preceding_arms.as_ref().unwrap_right().as_str())
+                        )
+                    }
+                    else {
+                        Hint::info(
+                            source_engine,
+                            Span::join_all(preceding_arms.as_ref().unwrap_left().clone()),
+                            if *is_last_arm {
+                                format!("Preceding match arms already match all possible values of `{}`.", match_value.as_str())
+                            }
+                            else {
+                                format!("Preceding match arms already match all the values that `{}` can match.", unreachable_arm.as_str())
+                            }
+                        )
+                    }
+                ],
+                help: if preceding_arms.is_right() {
+                    let catch_all_arm = preceding_arms.as_ref().unwrap_right().as_str();
+                    vec![
+                        format!("Catch-all patterns make sense only in last match arms."),
+                        format!("Consider removing the catch-all arm `{catch_all_arm}` or making it the last arm."),
+                        format!("Consider removing the unreachable arms below the `{catch_all_arm}` arm."),
+                    ]
+                }
+                else if *is_last_arm && *is_catch_all_arm {
+                    vec![
+                        format!("Catch-all patterns are often used in last match arms."),
+                        format!("But in this case, the preceding arms already match all possible values of `{}`.", match_value.as_str()),
+                        format!("Consider removing the unreachable last catch-all arm."),
+                    ]
+                }
+                else {
+                    vec![
+                        format!("Consider removing the unreachable arm."),
+                    ]
+                }
+            },
+            UninitializedAsmRegShadowsItem { constant_or_configurable_or_variable, item } => Diagnostic {
+                reason: Some(Reason::new(code(1), format!("Uninitialized ASM register is shadowing a {}", constant_or_configurable_or_variable.to_ascii_lowercase()))),
+                issue: Issue::warning(
+                    source_engine,
+                    self.span(),
+                    format!("Uninitialized register \"{item}\" is shadowing a {} of the same name.", constant_or_configurable_or_variable.to_ascii_lowercase()),
+                ),
+                hints: {
+                    let mut hints = vec![
+                        Hint::info(
+                            source_engine,
+                            item.span(),
+                            format!("{constant_or_configurable_or_variable} \"{item}\" is declared here.")
+                        ),
+                    ];
+
+                    hints.append(&mut Hint::multi_help(
+                        source_engine,
+                        &self.span(),
+                        vec![
+                            format!("Are you trying to initialize the register to the value of the {}?", constant_or_configurable_or_variable.to_ascii_lowercase()),
+                            format!("In that case, you must do it explicitly: `{item}: {item}`."),
+                            format!("Otherwise, to avoid the confusion with the shadowed {}, consider renaming the register \"{item}\".", constant_or_configurable_or_variable.to_ascii_lowercase()),
+                        ]
+                    ));
+
+                    hints
+                },
+                help: vec![],
+            },
+            AsmBlockIsEmpty => Diagnostic {
+                reason: Some(Reason::new(code(1), "ASM block is empty".to_string())),
+                issue: Issue::warning(
+                    source_engine,
+                    self.span(),
+                    "This ASM block is empty.".to_string(),
+                ),
+                hints: vec![],
+                help: vec![
+                    "Consider adding assembly instructions or a return register to the ASM block, or removing the block altogether.".to_string(),
+                ],
+            },
+            DuplicatedStorageKey { first_field, first_field_full_name, first_field_key_is_compiler_generated, second_field, second_field_full_name, second_field_key_is_compiler_generated, key, experimental_storage_domains } => Diagnostic {
+                reason: Some(Reason::new(code(1), "Two storage fields have the same storage key".to_string())),
+                issue: Issue::warning(
+                    source_engine,
+                    first_field.span(),
+                    format!("\"{first_field_full_name}\" has the same storage key as \"{second_field_full_name}\"."),
+                ),
+                hints: vec![
+                    Hint::info(
+                        source_engine,
+                        second_field.span(),
+                        format!("\"{second_field_full_name}\" is declared here."),
+                    ),
+                ],
+                help: vec![
+                    if *first_field_key_is_compiler_generated || *second_field_key_is_compiler_generated {
+                        format!("The key of \"{}\" is generated by the compiler using the following formula:",
+                            if *first_field_key_is_compiler_generated {
+                                first_field_full_name
+                            } else {
+                                second_field_full_name
+                            }
+                        )
+                    } else {
+                        "Both keys are explicitly defined by using the `in` keyword.".to_string()
+                    },
+                    if *first_field_key_is_compiler_generated || *second_field_key_is_compiler_generated {
+                        if *experimental_storage_domains {
+                            format!("{}sha256((0u8, \"{}\"))",
+                                Indent::Single,
+                                if *first_field_key_is_compiler_generated {
+                                    first_field_full_name
+                                } else {
+                                    second_field_full_name
+                                }
+                            )
+                        } else {
+                            format!("{}sha256(\"{}\")",
+                                Indent::Single,
+                                if *first_field_key_is_compiler_generated {
+                                    first_field_full_name
+                                } else {
+                                    second_field_full_name
+                                }
+                            )
+                        }
+                    } else {
+                        Diagnostic::help_none()
+                    },
+                    format!("The common key is: {key}.")
                 ],
             },
            _ => Diagnostic {
                     // TODO: Temporary we use self here to achieve backward compatibility.
                     //       In general, self must not be used and will not be used once we
-                    //       switch to our own #[error] macro. All the values for the formating
+                    //       switch to our own #[error] macro. All the values for the formatting
                     //       of a diagnostic must come from the enum variant parameters.
                     issue: Issue::warning(source_engine, self.span(), format!("{}", self.warning_content)),
                     ..Default::default()

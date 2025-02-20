@@ -28,10 +28,9 @@ pub(crate) trait GenerateDocCodeAction<'a, T: Spanned>: CodeAction<'a, T> {
 
     /// Formats a vector of lines into a doc comment [String].
     fn format_lines(&self, lines: Vec<String>) -> String {
-        lines
-            .iter()
-            .map(|line| format!("{}/// {}\n", self.indentation(), line))
-            .collect()
+        lines.iter().fold(String::new(), |output, line| {
+            format!("{}{}/// {}\n", output, self.indentation(), line)
+        })
     }
 
     /// Formats a list item with a name and type into a [String].
@@ -42,7 +41,7 @@ pub(crate) trait GenerateDocCodeAction<'a, T: Spanned>: CodeAction<'a, T> {
         type_id: TypeId,
     ) -> String {
         let name_string = match name {
-            Some(name) => format!("`{}`: ", name),
+            Some(name) => format!("`{name}`: "),
             None => String::new(),
         };
         let type_string = match engines.te().get(type_id).is_unit() {

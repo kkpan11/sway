@@ -9,7 +9,15 @@ pub enum AbiMode {
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConstShadowingMode {
+    Allow,
     Sequential,
     #[default]
     ItemStyle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum GenericShadowingMode {
+    Disallow,
+    #[default]
+    Allow,
 }

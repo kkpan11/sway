@@ -9,11 +9,11 @@ use crate::{
     },
 };
 use std::fmt::Write;
-use sway_ast::{ItemUse, UseTree};
-use sway_types::{
-    ast::{Delimiter, PunctKind},
-    Spanned,
+use sway_ast::{
+    keywords::{AsToken, Keyword, SemicolonToken, StarToken, Token, UseToken},
+    CommaToken, DoubleColonToken, ItemUse, PubToken, UseTree,
 };
+use sway_types::{ast::Delimiter, Spanned};
 
 #[cfg(test)]
 mod tests;
@@ -63,82 +63,131 @@ impl Format for UseTree {
     ) -> Result<(), FormatterError> {
         match self {
             Self::Group { imports } => {
-                Self::open_curly_brace(formatted_code, formatter)?;
-                // sort group imports
-                let imports = imports.get();
-                let value_pairs = &imports.value_separator_pairs;
-                let mut ord_vec: Vec<String> = value_pairs
-                    .iter()
-                    .map(
-                        |(use_tree, comma_token)| -> Result<FormattedCode, FormatterError> {
-                            let mut buf = FormattedCode::new();
-                            use_tree.format(&mut buf, formatter)?;
-                            write!(buf, "{}", comma_token.span().as_str())?;
-
-                            Ok(buf)
-                        },
-                    )
-                    .collect::<Result<_, _>>()?;
-                if let Some(final_value) = &imports.final_value_opt {
-                    let mut buf = FormattedCode::new();
-                    final_value.format(&mut buf, formatter)?;
-                    write!(buf, "{}", PunctKind::Comma.as_char())?;
-
-                    ord_vec.push(buf);
-                }
-                ord_vec.sort_by_key(|x| x.to_lowercase());
-
-                match formatter.shape.code_line.line_style {
-                    LineStyle::Multiline => writeln!(
-                        formatted_code,
-                        "{}{}",
-                        formatter.shape.indent.to_string(&formatter.config)?,
-                        ord_vec.join(&format!(
-                            "\n{}",
-                            formatter.shape.indent.to_string(&formatter.config)?
-                        ))
-                    )?,
-                    _ => {
-                        let mut import_str = ord_vec.join(" ");
-                        if import_str.ends_with(PunctKind::Comma.as_char()) {
-                            import_str.pop();
-                        }
-                        write!(formatted_code, "{import_str}")?;
+                // check for only one import
+                if imports.inner.value_separator_pairs.is_empty()
+                    && !formatter.shape.code_line.line_style.is_multiline()
+                {
+                    // we can have: path::{single_import}
+                    if let Some(single_import) = &imports.inner.final_value_opt {
+                        single_import.format(formatted_code, formatter)?;
                     }
+                } else if imports.inner.value_separator_pairs.len() == 1
+                    && imports.inner.has_trailing_punctuation()
+                    && !formatter.shape.code_line.line_style.is_multiline()
+                {
+                    // but we can also have: path::{single_import,}
+                    // note that in the case of multiline we want to keep the trailing comma
+                    let single_import = &imports
+                        .inner
+                        .value_separator_pairs
+                        .first()
+                        .expect("the `if` condition ensures the existence of the first element")
+                        .0;
+                    single_import.format(formatted_code, formatter)?;
+                } else {
+                    Self::open_curly_brace(formatted_code, formatter)?;
+                    // sort group imports
+                    let imports = imports.get();
+                    let value_pairs = &imports.value_separator_pairs;
+                    // track how many commas we have, to simplify checking for trailing element or trailing comma
+                    let mut commas: Vec<()> = Vec::new();
+                    let mut ord_vec: Vec<String> = value_pairs
+                        .iter()
+                        .map(
+                            |(use_tree, _comma_token)| -> Result<FormattedCode, FormatterError> {
+                                let mut buf = FormattedCode::new();
+                                use_tree.format(&mut buf, formatter)?;
+                                commas.push(()); // we have a comma token
+                                Ok(buf)
+                            },
+                        )
+                        .collect::<Result<_, _>>()?;
+                    if let Some(final_value) = &imports.final_value_opt {
+                        let mut buf = FormattedCode::new();
+                        final_value.format(&mut buf, formatter)?;
+
+                        ord_vec.push(buf);
+                    }
+                    ord_vec.sort_by(|a, b| {
+                        if a == b {
+                            std::cmp::Ordering::Equal
+                        } else if a == "self" || b == "*" {
+                            std::cmp::Ordering::Less
+                        } else if b == "self" || a == "*" {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            a.to_lowercase().cmp(&b.to_lowercase())
+                        }
+                    });
+                    // zip will take only the parts of `ord_vec` before the last comma
+                    for (use_tree, _) in ord_vec.iter_mut().zip(commas.iter()) {
+                        write!(use_tree, "{}", CommaToken::AS_STR)?;
+                    }
+
+                    match formatter.shape.code_line.line_style {
+                        LineStyle::Multiline => {
+                            if imports.final_value_opt.is_some() {
+                                if let Some(last) = ord_vec.iter_mut().last() {
+                                    write!(last, "{}", CommaToken::AS_STR)?;
+                                }
+                            }
+
+                            writeln!(
+                                formatted_code,
+                                "{}{}",
+                                formatter.indent_to_str()?,
+                                ord_vec.join(&format!("\n{}", formatter.indent_to_str()?)),
+                            )?;
+                        }
+                        _ => {
+                            if imports.has_trailing_punctuation() {
+                                // remove the trailing punctuation
+                                write!(
+                                    formatted_code,
+                                    "{}",
+                                    ord_vec.join(" ").trim_end_matches(',')
+                                )?;
+                            } else {
+                                write!(formatted_code, "{}", ord_vec.join(" "))?;
+                            }
+                        }
+                    }
+                    Self::close_curly_brace(formatted_code, formatter)?;
                 }
-                Self::close_curly_brace(formatted_code, formatter)?;
             }
-            Self::Name { name } => write!(formatted_code, "{}", name.span().as_str())?,
+            Self::Name { name } => write!(formatted_code, "{}", name.as_str())?,
             Self::Rename {
                 name,
-                as_token,
+                as_token: _,
                 alias,
             } => {
                 write!(
                     formatted_code,
                     "{} {} {}",
-                    name.span().as_str(),
-                    as_token.span().as_str(),
-                    alias.span().as_str()
+                    name.as_str(),
+                    AsToken::AS_STR,
+                    alias.as_str(),
                 )?;
             }
-            Self::Glob { star_token } => {
-                write!(formatted_code, "{}", star_token.span().as_str())?;
+            Self::Glob { star_token: _ } => {
+                write!(formatted_code, "{}", StarToken::AS_STR)?;
             }
             Self::Path {
                 prefix,
-                double_colon_token,
+                double_colon_token: _,
                 suffix,
             } => {
                 write!(
                     formatted_code,
                     "{}{}",
-                    prefix.span().as_str(),
-                    double_colon_token.span().as_str()
+                    prefix.as_str(),
+                    DoubleColonToken::AS_STR,
                 )?;
                 suffix.format(formatted_code, formatter)?;
             }
-            Self::Error { .. } => {}
+            Self::Error { .. } => {
+                return Err(FormatterError::SyntaxError);
+            }
         }
 
         Ok(())
@@ -152,7 +201,7 @@ impl CurlyBrace for UseTree {
     ) -> Result<(), FormatterError> {
         match formatter.shape.code_line.line_style {
             LineStyle::Multiline => {
-                formatter.shape.block_indent(&formatter.config);
+                formatter.indent();
                 writeln!(line, "{}", Delimiter::Brace.as_open_char())?;
             }
             _ => write!(line, "{}", Delimiter::Brace.as_open_char())?,
@@ -166,11 +215,11 @@ impl CurlyBrace for UseTree {
     ) -> Result<(), FormatterError> {
         match formatter.shape.code_line.line_style {
             LineStyle::Multiline => {
-                formatter.shape.block_unindent(&formatter.config);
+                formatter.unindent();
                 write!(
                     line,
                     "{}{}",
-                    formatter.shape.indent.to_string(&formatter.config)?,
+                    formatter.indent_to_str()?,
                     Delimiter::Brace.as_close_char()
                 )?;
             }
@@ -186,19 +235,15 @@ fn format_use_stmt(
     formatted_code: &mut FormattedCode,
     formatter: &mut Formatter,
 ) -> Result<(), FormatterError> {
-    if let Some(pub_token) = &item_use.visibility {
-        write!(formatted_code, "{} ", pub_token.span().as_str())?;
+    if item_use.visibility.is_some() {
+        write!(formatted_code, "{} ", PubToken::AS_STR)?;
     }
-    write!(formatted_code, "{} ", item_use.use_token.span().as_str())?;
-    if let Some(root_import) = &item_use.root_import {
-        write!(formatted_code, "{}", root_import.span().as_str())?;
+    write!(formatted_code, "{} ", UseToken::AS_STR)?;
+    if item_use.root_import.is_some() {
+        write!(formatted_code, "{}", DoubleColonToken::AS_STR)?;
     }
     item_use.tree.format(formatted_code, formatter)?;
-    write!(
-        formatted_code,
-        "{}",
-        item_use.semicolon_token.span().as_str()
-    )?;
+    write!(formatted_code, "{}", SemicolonToken::AS_STR)?;
 
     Ok(())
 }

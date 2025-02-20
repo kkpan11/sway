@@ -1,6 +1,6 @@
 [package]
 name = "sway-error"
-version = "0.43.2"
+version.workspace = true
 description = "Sway's error handling"
 authors.workspace = true
 edition.workspace = true
@@ -9,12 +9,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-num-traits = "0.2.14"
-smallvec = "1.7"
-sway-types = { version = "0.43.2", path = "../sway-types" }
-thiserror = "1.0"
-uwuify = { version = "^0.2", optional = true }
+either.workspace = true
+in_definite.workspace = true
+num-traits.workspace = true
+smallvec.workspace = true
+strsim.workspace = true
+sway-types.workspace = true
+thiserror.workspace = true
 
 [features]
 default = []
-uwu = ["uwuify"]
+
+[lints.clippy]
+iter_over_hash_type = "deny"

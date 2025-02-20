@@ -1,74 +1,48 @@
-use serde::Serialize;
-
 use crate::SourceId;
-
-use {
-    lazy_static::lazy_static,
-    std::{cmp, fmt, hash::Hash, sync::Arc},
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp,
+    fmt::{self, Display},
+    hash::Hash,
+    sync::Arc,
 };
 
 lazy_static! {
     static ref DUMMY_SPAN: Span = Span::new(Arc::from(""), 0, 0, None).unwrap();
 }
 
-pub struct Position {
-    input: Arc<str>,
+pub struct Position<'a> {
+    input: &'a str,
     pos: usize,
 }
 
-impl Position {
-    pub fn new(input: Arc<str>, pos: usize) -> Option<Position> {
-        input.clone().get(pos..).map(|_| Position { input, pos })
+impl<'a> Position<'a> {
+    pub fn new(input: &'a str, pos: usize) -> Option<Position<'a>> {
+        input.get(pos..).map(|_| Position { input, pos })
     }
-    #[inline]
-    pub fn line_col(&self) -> (usize, usize) {
-        if self.pos > self.input.len() {
-            panic!("position out of bounds");
-        }
 
-        let mut pos = self.pos;
-        // Position's pos is always a UTF-8 border.
-        let slice = &self.input[..pos];
-        let mut chars = slice.chars().peekable();
+    pub fn line_col(&self) -> LineCol {
+        assert!(self.pos <= self.input.len(), "position out of bounds");
 
-        let mut line_col = (1, 1);
+        // This is performance critical, so we use bytecount instead of a naive implementation.
+        let newlines_up_to_pos = bytecount::count(&self.input.as_bytes()[..self.pos], b'\n');
+        let line = newlines_up_to_pos + 1;
 
-        while pos != 0 {
-            match chars.next() {
-                Some('\r') => {
-                    if let Some(&'\n') = chars.peek() {
-                        chars.next();
+        // Find the last newline character before the position
+        let last_newline_pos = match self.input[..self.pos].rfind('\n') {
+            Some(pos) => pos + 1, // Start after the newline
+            None => 0,            // If no newline, start is at the beginning
+        };
 
-                        if pos == 1 {
-                            pos -= 1;
-                        } else {
-                            pos -= 2;
-                        }
-
-                        line_col = (line_col.0 + 1, 1);
-                    } else {
-                        pos -= 1;
-                        line_col = (line_col.0, line_col.1 + 1);
-                    }
-                }
-                Some('\n') => {
-                    pos -= 1;
-                    line_col = (line_col.0 + 1, 1);
-                }
-                Some(c) => {
-                    pos -= c.len_utf8();
-                    line_col = (line_col.0, line_col.1 + 1);
-                }
-                None => unreachable!(),
-            }
-        }
-
-        line_col
+        // Column number should start from 1, not 0
+        let col = self.pos - last_newline_pos + 1;
+        LineCol { line, col }
     }
 }
 
 /// Represents a span of the source code in a specific file.
-#[derive(Clone, Ord, PartialOrd)]
+#[derive(Clone, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct Span {
     // The original source code.
     src: Arc<str>,
@@ -96,18 +70,6 @@ impl PartialEq for Span {
 
 impl Eq for Span {}
 
-impl Serialize for Span {
-    // Serialize a tuple two fields: `start` and `end`.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeTuple;
-
-        let mut state = serializer.serialize_tuple(2)?;
-        state.serialize_element(&self.start)?;
-        state.serialize_element(&self.end)?;
-        state.end()
-    }
-}
-
 impl From<Span> for std::ops::Range<usize> {
     fn from(value: Span) -> Self {
         Self {
@@ -132,6 +94,32 @@ impl Span {
         })
     }
 
+    /// Creates an empty [Span], means a span whose [Span::start] and [Span::end] are the same.
+    /// The resulting empty [Span] will point to the start of the provided `span` and
+    /// be in the same file.
+    pub fn empty_at_start(span: &Span) -> Span {
+        Span::new(
+            span.src().clone(),
+            span.start(),
+            span.start(),
+            span.source_id().copied(),
+        )
+        .expect("the existing `span` is a valid `Span`")
+    }
+
+    /// Creates an empty [Span], means a span whose [Span::start] and [Span::end] are the same.
+    /// The resulting empty [Span] will point to the end of the provided `span` and
+    /// be in the same file.
+    pub fn empty_at_end(span: &Span) -> Span {
+        Span::new(
+            span.src().clone(),
+            span.end(),
+            span.end(),
+            span.source_id().copied(),
+        )
+        .expect("the existing `span` is a valid `Span`")
+    }
+
     pub fn from_string(source: String) -> Span {
         let len = source.len();
         Span::new(Arc::from(source), 0, len, None).unwrap()
@@ -154,11 +142,11 @@ impl Span {
     }
 
     pub fn start_pos(&self) -> Position {
-        Position::new(self.src.clone(), self.start).unwrap()
+        Position::new(&self.src, self.start).unwrap()
     }
 
     pub fn end_pos(&self) -> Position {
-        Position::new(self.src.clone(), self.end).unwrap()
+        Position::new(&self.src, self.end).unwrap()
     }
 
     pub fn split(&self) -> (Position, Position) {
@@ -190,9 +178,26 @@ impl Span {
         }
     }
 
+    /// Creates a new span that points to very next char of the current span.
+    ///
+    /// ```ignore
+    /// let
+    ///    ^ <- span returned
+    /// ^^^  <- original span
+    /// ```
+    pub fn next_char_utf8(&self) -> Option<Span> {
+        let char = self.src[self.end..].chars().next()?;
+        Some(Span {
+            src: self.src.clone(),
+            source_id: self.source_id,
+            start: self.end,
+            end: self.end + char.len_utf8(),
+        })
+    }
+
     /// This panics if the spans are not from the same file. This should
     /// only be used on spans that are actually next to each other.
-    pub fn join(s1: Span, s2: Span) -> Span {
+    pub fn join(s1: Span, s2: &Span) -> Span {
         assert!(
             Arc::ptr_eq(&s1.src, &s2.src) && s1.source_id == s2.source_id,
             "Spans from different files cannot be joined.",
@@ -209,16 +214,24 @@ impl Span {
     pub fn join_all(spans: impl IntoIterator<Item = Span>) -> Span {
         spans
             .into_iter()
-            .reduce(Span::join)
+            .reduce(|s1: Span, s2: Span| Span::join(s1, &s2))
             .unwrap_or_else(Span::dummy)
     }
 
     /// Returns the line and column start and end.
-    pub fn line_col(&self) -> (LineCol, LineCol) {
-        (
-            self.start_pos().line_col().into(),
-            self.end_pos().line_col().into(),
-        )
+    pub fn line_col(&self) -> LineColRange {
+        LineColRange {
+            start: self.start_pos().line_col(),
+            end: self.end_pos().line_col(),
+        }
+    }
+
+    pub fn is_dummy(&self) -> bool {
+        self.eq(&DUMMY_SPAN)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
     }
 }
 
@@ -243,17 +256,31 @@ pub trait Spanned {
     fn span(&self) -> Span;
 }
 
-#[derive(Clone, Copy, Debug)]
+impl<T: Spanned> Spanned for Box<T> {
+    fn span(&self) -> Span {
+        (**self).span()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LineCol {
     pub line: usize,
     pub col: usize,
 }
 
-impl From<(usize, usize)> for LineCol {
-    fn from(o: (usize, usize)) -> Self {
-        LineCol {
-            line: o.0,
-            col: o.1,
-        }
+pub struct LineColRange {
+    pub start: LineCol,
+    pub end: LineCol,
+}
+
+impl Display for LineColRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("({}, {})", self.start, self.end))
+    }
+}
+
+impl Display for LineCol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("line {}:{}", self.line, self.col))
     }
 }

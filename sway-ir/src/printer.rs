@@ -11,19 +11,19 @@ use sway_types::SourceEngine;
 use crate::{
     asm::*,
     block::Block,
-    constant::{Constant, ConstantValue},
+    constant::{ConstantContent, ConstantValue},
     context::Context,
     function::{Function, FunctionContent},
-    instruction::{FuelVmInstruction, Instruction, Predicate, Register},
+    instruction::{FuelVmInstruction, InstOp, Predicate, Register},
     metadata::{MetadataIndex, Metadatum},
     module::{Kind, ModuleContent},
     value::{Value, ValueContent, ValueDatum},
-    AnalysisResult, AnalysisResultT, AnalysisResults, BinaryOpKind, BlockArgument, IrError, Module,
-    Pass, PassMutability, ScopedPass, UnaryOpKind,
+    AnalysisResult, AnalysisResultT, AnalysisResults, BinaryOpKind, BlockArgument, ConfigContent,
+    IrError, Module, Pass, PassMutability, ScopedPass, UnaryOpKind,
 };
 
 #[derive(Debug)]
-enum Doc {
+pub(crate) enum Doc {
     Empty,
     Space,
     Comma,
@@ -42,7 +42,7 @@ enum Doc {
 }
 
 impl Doc {
-    fn text<S: Into<String>>(s: S) -> Self {
+    pub(crate) fn text<S: Into<String>>(s: S) -> Self {
         Doc::Text(s.into())
     }
 
@@ -50,7 +50,7 @@ impl Doc {
         Doc::Line(Box::new(doc))
     }
 
-    fn text_line<S: Into<String>>(s: S) -> Self {
+    pub(crate) fn text_line<S: Into<String>>(s: S) -> Self {
         Doc::Line(Box::new(Doc::Text(s.into())))
     }
 
@@ -66,7 +66,7 @@ impl Doc {
         Doc::Parens(Box::new(Doc::list_sep(docs, Doc::Comma)))
     }
 
-    fn append(self, doc: Doc) -> Doc {
+    pub(crate) fn append(self, doc: Doc) -> Doc {
         match (&self, &doc) {
             (Doc::Empty, _) => doc,
             (_, Doc::Empty) => self,
@@ -81,31 +81,46 @@ impl Doc {
         }
     }
 
-    fn build(self) -> String {
+    pub(crate) fn build(self) -> String {
         build_doc(self, 0)
     }
 }
 
 /// Pretty-print a whole [`Context`] to a string.
 ///
-/// The ouput from this function must always be suitable for [`crate::parser::parse`].
+/// The output from this function must always be suitable for [crate::parser::parse].
 pub fn to_string(context: &Context) -> String {
+    context_print(context, &|_, doc| doc)
+}
+
+pub(crate) fn context_print(context: &Context, map_doc: &impl Fn(&Value, Doc) -> Doc) -> String {
     let mut md_namer = MetadataNamer::default();
     context
         .modules
         .iter()
         .fold(Doc::Empty, |doc, (_, module)| {
-            doc.append(module_to_doc(context, &mut md_namer, module))
+            doc.append(module_to_doc(context, &mut md_namer, module, map_doc))
         })
         .append(md_namer.to_doc(context))
         .build()
 }
 
+pub(crate) fn block_print(
+    context: &Context,
+    function: Function,
+    block: Block,
+    map_doc: &impl Fn(&Value, Doc) -> Doc,
+) -> String {
+    let mut md_namer = MetadataNamer::default();
+    let mut namer = Namer::new(function);
+    block_to_doc(context, &mut md_namer, &mut namer, &block, map_doc).build()
+}
+
 pub struct ModulePrinterResult;
 impl AnalysisResultT for ModulePrinterResult {}
 
-/// Print a module stdout.
-pub fn module_printer(
+/// Pass to print a module to stdout.
+pub fn module_printer_pass(
     context: &Context,
     _analyses: &AnalysisResults,
     module: Module,
@@ -116,7 +131,8 @@ pub fn module_printer(
         module_to_doc(
             context,
             &mut md_namer,
-            context.modules.get(module.0).unwrap()
+            context.modules.get(module.0).unwrap(),
+            &|_, doc| doc
         )
         .append(md_namer.to_doc(context))
         .build()
@@ -124,14 +140,47 @@ pub fn module_printer(
     Ok(Box::new(ModulePrinterResult))
 }
 
-pub const MODULEPRINTER_NAME: &str = "module_printer";
+/// Print a module to stdout.
+pub fn module_print(context: &Context, _analyses: &AnalysisResults, module: Module) {
+    let mut md_namer = MetadataNamer::default();
+    println!(
+        "{}",
+        module_to_doc(
+            context,
+            &mut md_namer,
+            context.modules.get(module.0).unwrap(),
+            &|_, doc| doc
+        )
+        .append(md_namer.to_doc(context))
+        .build()
+    );
+}
+
+/// Print a function to stdout.
+pub fn function_print(context: &Context, function: Function) {
+    let mut md_namer = MetadataNamer::default();
+    println!(
+        "{}",
+        function_to_doc(
+            context,
+            &mut md_namer,
+            &mut Namer::new(function),
+            context.functions.get(function.0).unwrap(),
+            &|_, doc| doc
+        )
+        .append(md_namer.to_doc(context))
+        .build()
+    );
+}
+
+pub const MODULE_PRINTER_NAME: &str = "module-printer";
 
 pub fn create_module_printer_pass() -> Pass {
     Pass {
-        name: MODULEPRINTER_NAME,
+        name: MODULE_PRINTER_NAME,
         descr: "Print module to stdout",
         deps: vec![],
-        runner: ScopedPass::ModulePass(PassMutability::Analysis(module_printer)),
+        runner: ScopedPass::ModulePass(PassMutability::Analysis(module_printer_pass)),
     }
 }
 
@@ -139,8 +188,8 @@ fn module_to_doc<'a>(
     context: &'a Context,
     md_namer: &mut MetadataNamer,
     module: &'a ModuleContent,
+    map_doc: &impl Fn(&Value, Doc) -> Doc,
 ) -> Doc {
-    let mut global_namer = GlobalNamer::new();
     Doc::line(Doc::Text(format!(
         "{} {{",
         match module.kind {
@@ -154,13 +203,13 @@ fn module_to_doc<'a>(
         4,
         Doc::List(
             module
-                .global_configurable
+                .configs
                 .values()
-                .map(|value| config_to_doc(context, md_namer, &mut global_namer, value))
+                .map(|value| config_to_doc(context, value, md_namer))
                 .collect(),
         ),
     ))
-    .append(if !module.global_configurable.is_empty() {
+    .append(if !module.configs.is_empty() {
         Doc::line(Doc::Empty)
     } else {
         Doc::Empty
@@ -175,8 +224,9 @@ fn module_to_doc<'a>(
                     function_to_doc(
                         context,
                         md_namer,
-                        &mut Namer::new(*function, global_namer.clone()),
+                        &mut Namer::new(*function),
                         &context.functions[function.0],
+                        map_doc,
                     )
                 })
                 .collect(),
@@ -186,56 +236,130 @@ fn module_to_doc<'a>(
     .append(Doc::text_line("}"))
 }
 
+fn config_to_doc(
+    context: &Context,
+    configurable: &ConfigContent,
+    md_namer: &mut MetadataNamer,
+) -> Doc {
+    match configurable {
+        ConfigContent::V0 {
+            name,
+            constant,
+            opt_metadata,
+            ..
+        } => Doc::line(
+            Doc::text(format!(
+                "{} = config {}",
+                name,
+                constant.get_content(context).as_lit_string(context)
+            ))
+            .append(md_namer.md_idx_to_doc(context, opt_metadata)),
+        ),
+        ConfigContent::V1 {
+            name,
+            ty,
+            encoded_bytes,
+            decode_fn,
+            opt_metadata,
+            ..
+        } => {
+            let ty = ty.as_string(context);
+            let bytes = encoded_bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<String>>()
+                .concat();
+            Doc::line(
+                Doc::text(format!(
+                    "{} = config {}, {}, 0x{}",
+                    name,
+                    ty,
+                    decode_fn.get().get_name(context),
+                    bytes,
+                ))
+                .append(md_namer.md_idx_to_doc(context, opt_metadata)),
+            )
+        }
+    }
+}
+
 fn function_to_doc<'a>(
     context: &'a Context,
     md_namer: &mut MetadataNamer,
     namer: &mut Namer,
     function: &'a FunctionContent,
+    map_doc: &impl Fn(&Value, Doc) -> Doc,
 ) -> Doc {
     let public = if function.is_public { "pub " } else { "" };
     let entry = if function.is_entry { "entry " } else { "" };
+    // TODO: Remove outer `if` once old encoding is fully removed.
+    //       This is an intentional "complication" so that we see
+    //       explicit using of `new_encoding` here.
+    //       For the time being, for the old encoding, we don't want
+    //       to show both `entry` and `entry_orig` although both
+    //       values will be true.
+    // TODO: When removing old encoding, remove also the TODO in the
+    //       `rule fn_decl()` definition of the IR parser.
+    let original_entry = if context.experimental.new_encoding {
+        if function.is_original_entry {
+            "entry_orig "
+        } else {
+            ""
+        }
+    } else if !function.is_entry && function.is_original_entry {
+        "entry_orig "
+    } else {
+        ""
+    };
+    let fallback = if function.is_fallback {
+        "fallback "
+    } else {
+        ""
+    };
     Doc::line(
-        Doc::text(format!("{}{}fn {}", public, entry, function.name))
-            .append(
-                function
-                    .selector
-                    .map(|bytes| {
-                        Doc::text(format!(
-                            "<{:02x}{:02x}{:02x}{:02x}>",
-                            bytes[0], bytes[1], bytes[2], bytes[3]
-                        ))
-                    })
-                    .unwrap_or(Doc::Empty),
-            )
-            .append(Doc::in_parens_comma_sep(
-                function
-                    .arguments
-                    .iter()
-                    .map(|(name, arg_val)| {
-                        if let ValueContent {
-                            value: ValueDatum::Argument(BlockArgument { ty, .. }),
-                            metadata,
-                            ..
-                        } = &context.values[arg_val.0]
-                        {
-                            Doc::text(name)
-                                .append(
-                                    Doc::Space
-                                        .and(md_namer.md_idx_to_doc_no_comma(context, metadata)),
-                                )
-                                .append(Doc::text(format!(": {}", ty.as_string(context))))
-                        } else {
-                            unreachable!("Unexpected non argument value for function arguments.")
-                        }
-                    })
-                    .collect(),
-            ))
-            .append(Doc::text(format!(
-                " -> {}",
-                function.return_type.as_string(context)
-            )))
-            .append(md_namer.md_idx_to_doc(context, &function.metadata))
-            .append(Doc::text(" {")),
+        Doc::text(format!(
+            "{}{}{}{}fn {}",
+            public, entry, original_entry, fallback, function.name
+        ))
+        .append(
+            function
+                .selector
+                .map(|bytes| {
+                    Doc::text(format!(
+                        "<{:02x}{:02x}{:02x}{:02x}>",
+                        bytes[0], bytes[1], bytes[2], bytes[3]
+                    ))
+                })
+                .unwrap_or(Doc::Empty),
+        )
+        .append(Doc::in_parens_comma_sep(
+            function
+                .arguments
+                .iter()
+                .map(|(name, arg_val)| {
+                    if let ValueContent {
+                        value: ValueDatum::Argument(BlockArgument { ty, .. }),
+                        metadata,
+                        ..
+                    } = &context.values[arg_val.0]
+                    {
+                        Doc::text(name)
+                            .append(
+                                Doc::Space.and(md_namer.md_idx_to_doc_no_comma(context, metadata)),
+                            )
+                            .append(Doc::text(format!(": {}", ty.as_string(context))))
+                    } else {
+                        unreachable!("Unexpected non argument value for function arguments.")
+                    }
+                })
+                .collect(),
+        ))
+        .append(Doc::text(format!(
+            " -> {}",
+            function.return_type.as_string(context)
+        )))
+        .append(md_namer.md_idx_to_doc(context, &function.metadata))
+        .append(Doc::text(" {")),
     )
     .append(Doc::indent(
         4,
@@ -250,7 +374,7 @@ fn function_to_doc<'a>(
                             let init_doc = match &var_content.initializer {
                                 Some(const_val) => Doc::text(format!(
                                     " = const {}",
-                                    const_val.as_lit_string(context)
+                                    const_val.get_content(context).as_lit_string(context)
                                 )),
                                 None => Doc::Empty,
                             };
@@ -270,7 +394,7 @@ fn function_to_doc<'a>(
                     function
                         .blocks
                         .iter()
-                        .map(|block| block_to_doc(context, md_namer, namer, block))
+                        .map(|block| block_to_doc(context, md_namer, namer, block, map_doc))
                         .collect(),
                     Doc::line(Doc::Empty),
                 ),
@@ -286,6 +410,7 @@ fn block_to_doc(
     md_namer: &mut MetadataNamer,
     namer: &mut Namer,
     block: &Block,
+    map_doc: &impl Fn(&Value, Doc) -> Doc,
 ) -> Doc {
     let block_content = &context.blocks[block.0];
     Doc::line(
@@ -305,36 +430,14 @@ fn block_to_doc(
         ),
     )
     .append(Doc::List(
-        block_content
-            .instructions
-            .iter()
-            .map(|ins| instruction_to_doc(context, md_namer, namer, block, ins))
+        block
+            .instruction_iter(context)
+            .map(|current_value| {
+                let doc = instruction_to_doc(context, md_namer, namer, block, &current_value);
+                (map_doc)(&current_value, doc)
+            })
             .collect(),
     ))
-}
-
-fn config_to_doc(
-    context: &Context,
-    md_namer: &mut MetadataNamer,
-    global_namer: &mut GlobalNamer,
-    const_val: &Value,
-) -> Doc {
-    if let ValueContent {
-        value: ValueDatum::Configurable(configurable),
-        metadata,
-    } = &context.values[const_val.0]
-    {
-        Doc::line(
-            Doc::text(format!(
-                "{} = config {}",
-                global_namer.name(context, const_val),
-                configurable.as_lit_string(context)
-            ))
-            .append(md_namer.md_idx_to_doc(context, metadata)),
-        )
-    } else {
-        unreachable!("Not a constant value.")
-    }
 }
 
 fn constant_to_doc(
@@ -352,7 +455,7 @@ fn constant_to_doc(
             Doc::text(format!(
                 "{} = const {}",
                 namer.name(context, const_val),
-                constant.as_lit_string(context)
+                constant.get_content(context).as_lit_string(context)
             ))
             .append(md_namer.md_idx_to_doc(context, metadata)),
         )
@@ -387,12 +490,12 @@ fn instruction_to_doc<'a>(
         metadata,
     } = &context.values[ins_value.0]
     {
-        match instruction {
-            Instruction::AsmBlock(asm, args) => {
+        match &instruction.op {
+            InstOp::AsmBlock(asm, args) => {
                 asm_block_to_doc(context, md_namer, namer, ins_value, asm, args, metadata)
             }
-            Instruction::BitCast(value, ty) => {
-                maybe_constant_to_doc(context, md_namer, namer, value).append(Doc::line(
+            InstOp::BitCast(value, ty) => maybe_constant_to_doc(context, md_namer, namer, value)
+                .append(Doc::line(
                     Doc::text(format!(
                         "{} = bitcast {} to {}",
                         namer.name(context, ins_value),
@@ -400,9 +503,8 @@ fn instruction_to_doc<'a>(
                         ty.as_string(context),
                     ))
                     .append(md_namer.md_idx_to_doc(context, metadata)),
-                ))
-            }
-            Instruction::UnaryOp { op, arg } => {
+                )),
+            InstOp::UnaryOp { op, arg } => {
                 let op_str = match op {
                     UnaryOpKind::Not => "not",
                 };
@@ -415,7 +517,7 @@ fn instruction_to_doc<'a>(
                     .append(md_namer.md_idx_to_doc(context, metadata)),
                 ))
             }
-            Instruction::BinaryOp { op, arg1, arg2 } => {
+            InstOp::BinaryOp { op, arg1, arg2 } => {
                 let op_str = match op {
                     BinaryOpKind::Add => "add",
                     BinaryOpKind::Sub => "sub",
@@ -440,7 +542,7 @@ fn instruction_to_doc<'a>(
                         .append(md_namer.md_idx_to_doc(context, metadata)),
                     ))
             }
-            Instruction::Branch(to_block) =>
+            InstOp::Branch(to_block) =>
             // Handle possibly constant block parameters
             {
                 to_block
@@ -463,7 +565,7 @@ fn instruction_to_doc<'a>(
                             ),
                     ))
             }
-            Instruction::Call(func, args) => args
+            InstOp::Call(func, args) => args
                 .iter()
                 .fold(Doc::Empty, |doc, arg_val| {
                     doc.append(maybe_constant_to_doc(context, md_namer, namer, arg_val))
@@ -481,7 +583,7 @@ fn instruction_to_doc<'a>(
                     ))
                     .append(md_namer.md_idx_to_doc(context, metadata)),
                 )),
-            Instruction::CastPtr(val, ty) => Doc::line(
+            InstOp::CastPtr(val, ty) => Doc::line(
                 Doc::text(format!(
                     "{} = cast_ptr {} to {}",
                     namer.name(context, ins_value),
@@ -490,7 +592,7 @@ fn instruction_to_doc<'a>(
                 ))
                 .append(md_namer.md_idx_to_doc(context, metadata)),
             ),
-            Instruction::Cmp(pred, lhs_value, rhs_value) => {
+            InstOp::Cmp(pred, lhs_value, rhs_value) => {
                 let pred_str = match pred {
                     Predicate::Equal => "eq",
                     Predicate::LessThan => "lt",
@@ -508,7 +610,7 @@ fn instruction_to_doc<'a>(
                         .append(md_namer.md_idx_to_doc(context, metadata)),
                     ))
             }
-            Instruction::ConditionalBranch {
+            InstOp::ConditionalBranch {
                 cond_value,
                 true_block,
                 false_block,
@@ -549,7 +651,7 @@ fn instruction_to_doc<'a>(
                     ),
                 ))
             }
-            Instruction::ContractCall {
+            InstOp::ContractCall {
                 return_type,
                 name,
                 params,
@@ -564,7 +666,7 @@ fn instruction_to_doc<'a>(
                         "{} = contract_call {} {} {}, {}, {}, {}",
                         namer.name(context, ins_value),
                         return_type.as_string(context),
-                        name,
+                        name.as_deref().unwrap_or(""),
                         namer.name(context, params),
                         namer.name(context, coins),
                         namer.name(context, asset_id),
@@ -572,7 +674,7 @@ fn instruction_to_doc<'a>(
                     ))
                     .append(md_namer.md_idx_to_doc(context, metadata)),
                 )),
-            Instruction::FuelVm(fuel_vm_instr) => match fuel_vm_instr {
+            InstOp::FuelVm(fuel_vm_instr) => match fuel_vm_instr {
                 FuelVmInstruction::Gtf { index, tx_field_id } => {
                     maybe_constant_to_doc(context, md_namer, namer, index).append(Doc::line(
                         Doc::text(format!(
@@ -627,6 +729,10 @@ fn instruction_to_doc<'a>(
                         Doc::text(format!("revert {}", namer.name(context, v),))
                             .append(md_namer.md_idx_to_doc(context, metadata)),
                     )),
+                FuelVmInstruction::JmpMem => Doc::line(
+                    Doc::text("jmp_mem".to_string())
+                        .append(md_namer.md_idx_to_doc(context, metadata)),
+                ),
                 FuelVmInstruction::Smo {
                     recipient,
                     message,
@@ -783,7 +889,6 @@ fn instruction_to_doc<'a>(
                             .append(md_namer.md_idx_to_doc(context, metadata)),
                         ))
                 }
-
                 FuelVmInstruction::WideCmpOp { op, arg1, arg2 } => {
                     let pred_str = match op {
                         Predicate::Equal => "eq",
@@ -802,8 +907,20 @@ fn instruction_to_doc<'a>(
                             .append(md_namer.md_idx_to_doc(context, metadata)),
                         ))
                 }
+                FuelVmInstruction::Retd { ptr, len } => {
+                    maybe_constant_to_doc(context, md_namer, namer, ptr)
+                        .append(maybe_constant_to_doc(context, md_namer, namer, len))
+                        .append(Doc::line(
+                            Doc::text(format!(
+                                "retd {} {}",
+                                namer.name(context, ptr),
+                                namer.name(context, len),
+                            ))
+                            .append(md_namer.md_idx_to_doc(context, metadata)),
+                        ))
+                }
             },
-            Instruction::GetElemPtr {
+            InstOp::GetElemPtr {
                 base,
                 elem_ptr_ty,
                 indices,
@@ -828,7 +945,7 @@ fn instruction_to_doc<'a>(
                     ))
                     .append(md_namer.md_idx_to_doc(context, metadata)),
                 )),
-            Instruction::GetLocal(local_var) => {
+            InstOp::GetLocal(local_var) => {
                 let name = block
                     .get_function(context)
                     .lookup_local_name(context, local_var)
@@ -842,8 +959,20 @@ fn instruction_to_doc<'a>(
                     .append(md_namer.md_idx_to_doc(context, metadata)),
                 )
             }
-            Instruction::IntToPtr(value, ty) => {
-                maybe_constant_to_doc(context, md_namer, namer, value).append(Doc::line(
+            InstOp::GetConfig(_, name) => Doc::line(
+                match block.get_module(context).get_config(context, name).unwrap() {
+                    ConfigContent::V0 { name, ptr_ty, .. }
+                    | ConfigContent::V1 { name, ptr_ty, .. } => Doc::text(format!(
+                        "{} = get_config {}, {}",
+                        namer.name(context, ins_value),
+                        ptr_ty.as_string(context),
+                        name,
+                    )),
+                }
+                .append(md_namer.md_idx_to_doc(context, metadata)),
+            ),
+            InstOp::IntToPtr(value, ty) => maybe_constant_to_doc(context, md_namer, namer, value)
+                .append(Doc::line(
                     Doc::text(format!(
                         "{} = int_to_ptr {} to {}",
                         namer.name(context, ins_value),
@@ -851,9 +980,8 @@ fn instruction_to_doc<'a>(
                         ty.as_string(context),
                     ))
                     .append(md_namer.md_idx_to_doc(context, metadata)),
-                ))
-            }
-            Instruction::Load(src_value) => Doc::line(
+                )),
+            InstOp::Load(src_value) => Doc::line(
                 Doc::text(format!(
                     "{} = load {}",
                     namer.name(context, ins_value),
@@ -861,7 +989,7 @@ fn instruction_to_doc<'a>(
                 ))
                 .append(md_namer.md_idx_to_doc(context, metadata)),
             ),
-            Instruction::MemCopyBytes {
+            InstOp::MemCopyBytes {
                 dst_val_ptr,
                 src_val_ptr,
                 byte_len,
@@ -874,7 +1002,7 @@ fn instruction_to_doc<'a>(
                 ))
                 .append(md_namer.md_idx_to_doc(context, metadata)),
             ),
-            Instruction::MemCopyVal {
+            InstOp::MemCopyVal {
                 dst_val_ptr,
                 src_val_ptr,
             } => Doc::line(
@@ -885,12 +1013,12 @@ fn instruction_to_doc<'a>(
                 ))
                 .append(md_namer.md_idx_to_doc(context, metadata)),
             ),
-            Instruction::Nop => Doc::line(
+            InstOp::Nop => Doc::line(
                 Doc::text(format!("{} = nop", namer.name(context, ins_value)))
                     .append(md_namer.md_idx_to_doc(context, metadata)),
             ),
-            Instruction::PtrToInt(value, ty) => {
-                maybe_constant_to_doc(context, md_namer, namer, value).append(Doc::line(
+            InstOp::PtrToInt(value, ty) => maybe_constant_to_doc(context, md_namer, namer, value)
+                .append(Doc::line(
                     Doc::text(format!(
                         "{} = ptr_to_int {} to {}",
                         namer.name(context, ins_value),
@@ -898,9 +1026,8 @@ fn instruction_to_doc<'a>(
                         ty.as_string(context),
                     ))
                     .append(md_namer.md_idx_to_doc(context, metadata)),
-                ))
-            }
-            Instruction::Ret(v, t) => {
+                )),
+            InstOp::Ret(v, t) => {
                 maybe_constant_to_doc(context, md_namer, namer, v).append(Doc::line(
                     Doc::text(format!(
                         "ret {} {}",
@@ -910,7 +1037,7 @@ fn instruction_to_doc<'a>(
                     .append(md_namer.md_idx_to_doc(context, metadata)),
                 ))
             }
-            Instruction::Store {
+            InstOp::Store {
                 dst_val_ptr,
                 stored_val,
             } => maybe_constant_to_doc(context, md_namer, namer, stored_val).append(Doc::line(
@@ -936,18 +1063,18 @@ fn asm_block_to_doc(
     args: &[AsmArg],
     metadata: &Option<MetadataIndex>,
 ) -> Doc {
-    let AsmBlockContent {
+    let AsmBlock {
         body,
         return_type,
         return_name,
         ..
-    } = &context.asm_blocks[asm.0];
+    } = &asm;
     args.iter()
         .fold(
             Doc::Empty,
             |doc, AsmArg { initializer, .. }| match initializer {
                 Some(init_val) if init_val.is_constant(context) => {
-                    doc.append(constant_to_doc(context, md_namer, namer, init_val))
+                    doc.append(maybe_constant_to_doc(context, md_namer, namer, init_val))
                 }
                 _otherwise => doc,
             },
@@ -967,13 +1094,14 @@ fn asm_block_to_doc(
                         .collect(),
                 ))
                 .append(
-                    return_name
-                        .as_ref()
-                        .map(|rn| {
-                            Doc::text(format!(" -> {} {rn}", return_type.as_string(context)))
-                                .append(md_namer.md_idx_to_doc(context, metadata))
-                        })
-                        .unwrap_or(Doc::Empty),
+                    Doc::text(format!(
+                        " -> {}{}",
+                        return_type.as_string(context),
+                        return_name
+                            .as_ref()
+                            .map_or("".to_string(), |rn| format!(" {rn}"))
+                    ))
+                    .append(md_namer.md_idx_to_doc(context, metadata)),
                 )
                 .append(Doc::text(" {")),
         ))
@@ -983,7 +1111,7 @@ fn asm_block_to_doc(
                 body.iter()
                     .map(
                         |AsmInstruction {
-                             name,
+                             op_name: name,
                              args,
                              immediate,
                              metadata,
@@ -1009,7 +1137,7 @@ fn asm_block_to_doc(
         .append(Doc::text_line("}"))
 }
 
-impl Constant {
+impl ConstantContent {
     fn as_lit_string(&self, context: &Context) -> String {
         match &self.value {
             ConstantValue::Undef => format!("{} undef", self.ty.as_string(context)),
@@ -1027,13 +1155,17 @@ impl Constant {
                         .concat()
                 )
             }
-            ConstantValue::B256(bs) => format!(
-                "b256 0x{}",
-                bs.iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<Vec<String>>()
-                    .concat()
-            ),
+            ConstantValue::B256(v) => {
+                let bytes = v.to_be_bytes();
+                format!(
+                    "b256 0x{}",
+                    bytes
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<String>>()
+                        .concat()
+                )
+            }
             ConstantValue::String(bs) => format!(
                 "{} \"{}\"",
                 self.ty.as_string(context),
@@ -1057,6 +1189,15 @@ impl Constant {
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
+            ConstantValue::Slice(elems) => format!(
+                "__slice[{}] [{}]",
+                self.ty.as_string(context),
+                elems
+                    .iter()
+                    .map(|elem| elem.as_lit_string(context))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
             ConstantValue::Struct(fields) => format!(
                 "{} {{ {} }}",
                 self.ty.as_string(context),
@@ -1066,56 +1207,32 @@ impl Constant {
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
+            ConstantValue::Reference(constant) => format!("&({})", constant.as_lit_string(context)),
+            ConstantValue::RawUntypedSlice(bytes) => {
+                format!(
+                    "{} 0x{}",
+                    self.ty.as_string(context),
+                    bytes
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<String>>()
+                        .concat()
+                )
+            }
         }
-    }
-}
-
-#[derive(Clone)]
-struct GlobalNamer {
-    names: HashMap<Value, String>,
-    next_configurable_idx: u64,
-}
-
-impl GlobalNamer {
-    fn new() -> Self {
-        GlobalNamer {
-            names: HashMap::new(),
-            next_configurable_idx: 0,
-        }
-    }
-
-    fn name(&mut self, context: &Context, value: &Value) -> String {
-        match &context.values[value.0].value {
-            ValueDatum::Configurable(_) => self.default_configurable_name(value),
-            _ => todo!(),
-        }
-    }
-
-    fn default_configurable_name(&mut self, value: &Value) -> String {
-        self.names.get(value).cloned().unwrap_or_else(|| {
-            let new_name = format!("c{}", self.next_configurable_idx);
-            self.next_configurable_idx += 1;
-            self.names.insert(*value, new_name.clone());
-            new_name
-        })
     }
 }
 
 struct Namer {
     function: Function,
-
-    // To make things easier, each `Namer` also gets a `GlobalNamer` which includes all globally
-    // available names (such as config constants).
-    global_namer: GlobalNamer,
     names: HashMap<Value, String>,
     next_value_idx: u64,
 }
 
 impl Namer {
-    fn new(function: Function, global_namer: GlobalNamer) -> Self {
+    fn new(function: Function) -> Self {
         Namer {
             function,
-            global_namer,
             names: HashMap::new(),
             next_value_idx: 0,
         }
@@ -1128,7 +1245,6 @@ impl Namer {
                 .lookup_arg_name(context, value)
                 .cloned()
                 .unwrap_or_else(|| self.default_name(value)),
-            ValueDatum::Configurable(_) => self.global_namer.name(context, value),
             ValueDatum::Constant(_) => self.default_name(value),
             ValueDatum::Instruction(_) => self.default_name(value),
         }

@@ -20,14 +20,9 @@ use crate::{
     context::Context, irtype::Type, metadata::MetadataIndex, pretty::DebugWithContext, value::Value,
 };
 
-/// A wrapper around an [ECS](https://github.com/fitzgen/generational-arena) handle into the
-/// [`Context`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, DebugWithContext)]
-pub struct AsmBlock(#[in_context(asm_blocks)] pub generational_arena::Index);
-
 #[doc(hidden)]
 #[derive(Clone, Debug, DebugWithContext)]
-pub struct AsmBlockContent {
+pub struct AsmBlock {
     pub args_names: Vec<Ident>,
     pub body: Vec<AsmInstruction>,
     pub return_type: Type,
@@ -42,43 +37,101 @@ pub struct AsmArg {
 
 #[derive(Clone, Debug)]
 pub struct AsmInstruction {
-    pub name: Ident,
+    pub op_name: Ident,
     pub args: Vec<Ident>,
     pub immediate: Option<Ident>,
     pub metadata: Option<MetadataIndex>,
 }
 
+impl AsmInstruction {
+    pub fn log_no_span(
+        ra: impl Into<String>,
+        rb: impl Into<String>,
+        rc: impl Into<String>,
+        rd: impl Into<String>,
+    ) -> Self {
+        AsmInstruction {
+            op_name: Ident::new(sway_types::Span::from_string("log".into())),
+            args: vec![
+                Ident::new_no_span(ra.into()),
+                Ident::new_no_span(rb.into()),
+                Ident::new_no_span(rc.into()),
+                Ident::new_no_span(rd.into()),
+            ],
+            immediate: None,
+            metadata: None,
+        }
+    }
+
+    pub fn lw_no_span(
+        dst: impl Into<String>,
+        src: impl Into<String>,
+        offset: impl Into<String>,
+    ) -> Self {
+        AsmInstruction {
+            op_name: Ident::new(sway_types::Span::from_string("lw".into())),
+            args: vec![
+                Ident::new_no_span(dst.into()),
+                Ident::new_no_span(src.into()),
+            ],
+            immediate: Some(Ident::new_no_span(offset.into())),
+            metadata: None,
+        }
+    }
+
+    pub fn mul_no_span(dst: impl Into<String>, a: impl Into<String>, b: impl Into<String>) -> Self {
+        AsmInstruction {
+            op_name: Ident::new(sway_types::Span::from_string("mul".into())),
+            args: vec![
+                Ident::new_no_span(dst.into()),
+                Ident::new_no_span(a.into()),
+                Ident::new_no_span(b.into()),
+            ],
+            immediate: None,
+            metadata: None,
+        }
+    }
+
+    pub fn add_no_span(dst: impl Into<String>, a: impl Into<String>, b: impl Into<String>) -> Self {
+        AsmInstruction {
+            op_name: Ident::new(sway_types::Span::from_string("add".into())),
+            args: vec![
+                Ident::new_no_span(dst.into()),
+                Ident::new_no_span(a.into()),
+                Ident::new_no_span(b.into()),
+            ],
+            immediate: None,
+            metadata: None,
+        }
+    }
+
+    pub fn sub_no_span(dst: impl Into<String>, a: impl Into<String>, b: impl Into<String>) -> Self {
+        AsmInstruction {
+            op_name: Ident::new(sway_types::Span::from_string("sub".into())),
+            args: vec![
+                Ident::new_no_span(dst.into()),
+                Ident::new_no_span(a.into()),
+                Ident::new_no_span(b.into()),
+            ],
+            immediate: None,
+            metadata: None,
+        }
+    }
+}
+
 impl AsmBlock {
     /// Create a new [`AsmBlock`] in the passed context and return its handle.
     pub fn new(
-        context: &mut Context,
         args_names: Vec<Ident>,
         body: Vec<AsmInstruction>,
         return_type: Type,
         return_name: Option<Ident>,
     ) -> Self {
-        let content = AsmBlockContent {
+        AsmBlock {
             args_names,
             body,
             return_type,
             return_name,
-        };
-        AsmBlock(context.asm_blocks.insert(content))
-    }
-
-    /// Return the [`AsmBlock`] return type.
-    pub fn get_type(&self, context: &Context) -> Type {
-        // The type is a named register, which will be a u64.
-        context.asm_blocks[self.0].return_type
-    }
-
-    /// Change the [`AsmBlock`] return type.
-    pub fn set_type(&self, context: &mut Context, new_ret_type: Type) {
-        context.asm_blocks[self.0].return_type = new_ret_type
-    }
-
-    /// Get a reference to the [`AsmBlockContent`] for this ASM block.
-    pub fn get_content<'a>(&self, context: &'a Context) -> &'a AsmBlockContent {
-        &context.asm_blocks[self.0]
+        }
     }
 }

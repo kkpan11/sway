@@ -2,25 +2,24 @@
 library;
 
 use ::logging::log;
-use ::error_signals::FAILED_REQUIRE_SIGNAL;
+use ::error_signals::{FAILED_REQUIRE_SIGNAL, REVERT_WITH_LOG_SIGNAL};
 
 /// Will either panic or revert with a given number depending on the context.
+///
+/// # Additional Information
+///
 /// If used in a predicate, it will panic.
 /// If used in a contract, it will revert.
 ///
-/// ### Arguments
+/// # Arguments
 ///
-/// * `code` - The code with which to revert the program.
+/// * `code`: [u64] - The code with which to revert the program.
 ///
-/// ### Reverts
+/// # Reverts
 ///
-/// Reverts when called in a contract.
+/// * Reverts unconditionally.
 ///
-/// ### Panics
-///
-/// Panics when called in a predicate.
-///
-/// ### Examples
+/// # Examples
 ///
 /// ```sway
 /// fn foo(should_revert: bool) {
@@ -30,22 +29,22 @@ use ::error_signals::FAILED_REQUIRE_SIGNAL;
 ///     }
 /// }
 /// ```
-pub fn revert(code: u64) {
+pub fn revert(code: u64) -> ! {
     __revert(code)
 }
 
 /// Checks if the given `condition` is `true` and if not, logs `value` and reverts.
 ///
-/// ### Arguments
+/// # Arguments
 ///
-/// * `condition` - The condition upon which to decide whether to revert or not.
-/// * `value` - The value which will be logged in case `condition` is `false`.
+/// * `condition`: [bool] - The condition upon which to decide whether to revert or not.
+/// * `value`: [T] - The value which will be logged in case `condition` is `false`.
 ///
-/// ### Reverts
+/// # Reverts
 ///
-/// Reverts when `condition` is `false`.
+/// * Reverts when `condition` is `false`.
 ///
-/// ### Examples
+/// # Examples
 ///
 /// ```sway
 /// fn foo(a: u64, b: u64) {
@@ -54,9 +53,53 @@ pub fn revert(code: u64) {
 ///     log("The require function did not revert");
 /// }
 /// ```
+#[cfg(experimental_new_encoding = false)]
 pub fn require<T>(condition: bool, value: T) {
     if !condition {
         log(value);
         revert(FAILED_REQUIRE_SIGNAL)
     }
+}
+
+#[cfg(experimental_new_encoding = true)]
+pub fn require<T>(condition: bool, value: T)
+where
+    T: AbiEncode,
+{
+    if !condition {
+        log(value);
+        revert(FAILED_REQUIRE_SIGNAL)
+    }
+}
+
+/// Reverts unconditionally and logs `value`.
+///
+/// # Arguments
+///
+/// * `value`: [T] - The value which will be logged.
+///
+/// # Reverts
+///
+/// * Reverts unconditionally.
+///
+/// # Examples
+///
+/// ```sway
+/// fn foo() {
+///     revert_with_log("Example error message");
+/// }
+/// ```
+#[cfg(experimental_new_encoding = false)]
+pub fn revert_with_log<T>(value: T) {
+    log(value);
+    revert(REVERT_WITH_LOG_SIGNAL)
+}
+
+#[cfg(experimental_new_encoding = true)]
+pub fn revert_with_log<T>(value: T)
+where
+    T: AbiEncode,
+{
+    log(value);
+    revert(REVERT_WITH_LOG_SIGNAL)
 }

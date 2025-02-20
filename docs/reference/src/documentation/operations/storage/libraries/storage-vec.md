@@ -1,6 +1,6 @@
 # StorageVec
 
-A `StorageVec` is a vector that permanently stores its data in `storage`. It replicates the functionality of a regular vector however its data is not stored contigiously because it utilizes hashing and [generics](../../../language/generics/index.md) to find a location to store the value `T`.
+A `StorageVec` is a vector that permanently stores its data in `storage`. It replicates the functionality of a regular vector however its data is not stored contiguously because it utilizes hashing and [generics](../../../language/generics/index.md) to find a location to store the value `T`.
 
 There is a number of methods in the [standard library](https://github.com/FuelLabs/sway/blob/master/sway-lib-std/src/storage.sw) however we will take a look at pushing and retrieving data.
 
@@ -18,7 +18,7 @@ There are two `storage` variables: `balance` & `user`. `balance` takes a single 
 
 ## Reading from Storage
 
-Retrieving data from a storage variable is done through the `.get(index)` method. That is to say that we state which index by specifiying it inside `.get()` and appending that to the end of the storage variable.
+Retrieving data from a storage variable is done through the `.get(index)` method. That is to say that we state which index by specifying it inside `.get()` and appending that to the end of the storage variable.
 
 In this example we look at how we can retrieve a single value `balance` and how we can unpack multiple values from `user`.
 

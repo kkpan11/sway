@@ -104,3 +104,37 @@ fn foo(  ) {
 }
 }"
 );
+
+fmt_test_item!(impl_contains_const
+"impl ConstantId for Struct {
+    const ID: u32 = 5;
+}",
+intermediate_whitespace
+"impl ConstantId for Struct {
+    const ID: u32=5;
+}"
+);
+
+fmt_test_item!(impl_for_struct_where_clause
+"impl MyStructWithWhere<T, A>
+where
+    T: Something,
+    A: Something,
+{
+    fn do() {}
+}",
+intermediate_whitespace
+"impl MyStructWithWhere<T, A> where T: Something, A: Something { fn do() {} }"
+);
+
+fmt_test_item!(impl_trait_for_struct_where_clause
+"impl MyTrait<T, A> for MyStructWithWhere<T, A>
+where
+    T: Something,
+    A: Something,
+{
+    fn do() {}
+}",
+intermediate_whitespace
+"impl MyTrait<T, A> for MyStructWithWhere<T, A> where T: Something, A: Something { fn do() {} }"
+);

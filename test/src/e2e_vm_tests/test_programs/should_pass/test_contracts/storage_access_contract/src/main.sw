@@ -33,7 +33,7 @@ storage {
         int32: 6,
     },
     ), e2: E = E::A(777),
-    string: str[40] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    string: str[40] = __to_str_array("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
 }
 
 impl StorageAccess for Contract {
@@ -48,6 +48,7 @@ impl StorageAccess for Contract {
         storage.s.write(s);
     }
     #[storage(write)]fn set_boolean(boolean: bool) {
+        log(boolean);
         storage.boolean.write(boolean);
     }
     #[storage(write)]fn set_int8(int8: u8) {

@@ -3,8 +3,9 @@ use crate::{
     config::user_opts::HeuristicsOptions,
     constants::{
         DEFAULT_ATTR_FN_LIKE_WIDTH, DEFAULT_CHAIN_WIDTH, DEFAULT_COLLECTION_WIDTH,
-        DEFAULT_FN_CALL_WIDTH, DEFAULT_MAX_LINE_WIDTH, DEFAULT_SINGLE_LINE_IF_ELSE_WIDTH,
-        DEFAULT_STRUCTURE_LIT_WIDTH, DEFAULT_STRUCTURE_VAR_WIDTH,
+        DEFAULT_FN_CALL_WIDTH, DEFAULT_MAX_LINE_WIDTH, DEFAULT_SHORT_ARRAY_ELEM_WIDTH_THRESHOLD,
+        DEFAULT_SINGLE_LINE_IF_ELSE_WIDTH, DEFAULT_STRUCTURE_LIT_WIDTH,
+        DEFAULT_STRUCTURE_VAR_WIDTH,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ pub struct Heuristics {
 impl Default for Heuristics {
     fn default() -> Self {
         Self {
-            heuristics_pref: HeuristicsPreferences::Scaled,
+            heuristics_pref: Default::default(),
             use_small_heuristics: true,
         }
     }
@@ -41,13 +42,14 @@ impl Heuristics {
 /// Heuristic settings that can be used to simplify
 /// the configuration of the granular width configurations
 /// like `struct_lit_width`, `array_width`, etc.
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Default)]
 pub enum HeuristicsPreferences {
     /// Turn off any heuristics
     Off,
     /// Turn on max heuristics
     Max,
     /// Use scaled values based on the value of `max_width`
+    #[default]
     Scaled,
 }
 
@@ -84,19 +86,21 @@ pub struct WidthHeuristics {
     // Maximum line length for single line if-else expressions. A value
     // of zero means always break if-else expressions.
     pub(crate) single_line_if_else_max_width: usize,
+    pub(crate) short_array_element_width: usize,
 }
 
 impl WidthHeuristics {
     /// Using this WidthHeuristics means we ignore heuristics.
     pub fn off() -> WidthHeuristics {
         WidthHeuristics {
-            fn_call_width: usize::max_value(),
-            attr_fn_like_width: usize::max_value(),
+            fn_call_width: usize::MAX,
+            attr_fn_like_width: usize::MAX,
             structure_lit_width: 0,
             structure_field_width: 0,
-            collection_width: usize::max_value(),
-            chain_width: usize::max_value(),
+            collection_width: usize::MAX,
+            chain_width: usize::MAX,
             single_line_if_else_max_width: 0,
+            short_array_element_width: 0,
         }
     }
 
@@ -109,6 +113,7 @@ impl WidthHeuristics {
             collection_width: max_width,
             chain_width: max_width,
             single_line_if_else_max_width: max_width,
+            short_array_element_width: max_width,
         }
     }
 
@@ -133,6 +138,9 @@ impl WidthHeuristics {
             collection_width: (DEFAULT_COLLECTION_WIDTH as f32 * max_width_ratio).round() as usize,
             chain_width: (DEFAULT_CHAIN_WIDTH as f32 * max_width_ratio).round() as usize,
             single_line_if_else_max_width: (DEFAULT_SINGLE_LINE_IF_ELSE_WIDTH as f32
+                * max_width_ratio)
+                .round() as usize,
+            short_array_element_width: (DEFAULT_SHORT_ARRAY_ELEM_WIDTH_THRESHOLD as f32
                 * max_width_ratio)
                 .round() as usize,
         }

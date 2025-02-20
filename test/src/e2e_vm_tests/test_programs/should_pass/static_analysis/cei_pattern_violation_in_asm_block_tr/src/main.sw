@@ -1,6 +1,6 @@
 contract;
 
-use std::token::force_transfer_to_contract;
+use std::asset::transfer;
 
 abi TestAbi {
     fn deposit();
@@ -15,9 +15,9 @@ impl TestAbi for Contract {
         // effect -- therefore violation of CEI where effect should go before interaction
         let amount = 10;
         let address = 0x0000000000000000000000000000000000000000000000000000000000000001;
-        let asset = ContractId::from(address);
+        let asset = AssetId::from(address);
         let pool = ContractId::from(address);
-        // `force_transfer_to_contract` uses `tr` asm instruction
-        force_transfer_to_contract(amount, asset, pool);
+        // `transfer` uses `tr` asm instruction for ContractId
+        transfer(Identity::ContractId(pool), asset, amount);
     }
 }

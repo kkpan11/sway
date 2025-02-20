@@ -16,16 +16,23 @@ use crate::{
     context::Context,
     error::IrError,
     function::Function,
-    instruction::{FuelVmInstruction, Instruction, InstructionInserter, InstructionIterator},
-    pretty::DebugWithContext,
+    instruction::{FuelVmInstruction, InstOp},
     value::{Value, ValueDatum},
-    BranchToWithArgs, Type,
+    BranchToWithArgs, DebugWithContext, Instruction, InstructionInserter, InstructionIterator,
+    Module, Type,
 };
 
-/// A wrapper around an [ECS](https://github.com/fitzgen/generational-arena) handle into the
+/// A wrapper around an [ECS](https://github.com/orlp/slotmap) handle into the
 /// [`Context`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, DebugWithContext)]
-pub struct Block(pub generational_arena::Index);
+pub struct Block(pub slotmap::DefaultKey);
+
+impl Block {
+    pub fn get_module<'a>(&self, context: &'a Context) -> &'a Module {
+        let f = context.blocks[self.0].function;
+        &context.functions[f.0].module
+    }
+}
 
 #[doc(hidden)]
 pub struct BlockContent {
@@ -34,7 +41,7 @@ pub struct BlockContent {
     /// The function containing this block.
     pub function: Function,
     /// List of instructions in the block.
-    pub instructions: Vec<Value>,
+    pub(crate) instructions: Vec<Value>,
     /// Block arguments: Another form of SSA PHIs.
     pub args: Vec<Value>,
     /// CFG predecessors
@@ -51,7 +58,7 @@ pub struct BlockArgument {
 }
 
 impl BlockArgument {
-    /// Get the actual parameter passed to this block argument from `from_block`
+    /// Get the actual parameter passed to this block argument from `from_block`.
     pub fn get_val_coming_from(&self, context: &Context, from_block: &Block) -> Option<Value> {
         for BranchToWithArgs {
             block: succ_block,
@@ -92,8 +99,11 @@ impl Block {
     }
 
     /// Create a new [`InstructionInserter`] to more easily append instructions to this block.
-    pub fn ins<'a, 'eng>(&self, context: &'a mut Context<'eng>) -> InstructionInserter<'a, 'eng> {
-        InstructionInserter::new(context, *self)
+    pub fn append<'a, 'eng>(
+        &self,
+        context: &'a mut Context<'eng>,
+    ) -> InstructionInserter<'a, 'eng> {
+        InstructionInserter::new(context, *self, crate::InsertionPosition::End)
     }
 
     /// Get the label of this block.  If it wasn't given one upon creation it will be a generated
@@ -110,7 +120,7 @@ impl Block {
         context.blocks[self.0].label = unique_label;
     }
 
-    /// Get the number of instructions in this block
+    /// Get the number of instructions in this block.
     pub fn num_instructions(&self, context: &Context) -> usize {
         context.blocks[self.0].instructions.len()
     }
@@ -164,7 +174,7 @@ impl Block {
     }
 
     /// Get an iterator over this block's args.
-    pub fn arg_iter<'a>(&'a self, context: &'a Context) -> impl Iterator<Item = &Value> {
+    pub fn arg_iter<'a>(&'a self, context: &'a Context) -> impl Iterator<Item = &'a Value> {
         context.blocks[self.0].args.iter()
     }
 
@@ -174,7 +184,7 @@ impl Block {
     }
 
     /// Get an iterator over this block's predecessor blocks.
-    pub fn pred_iter<'a>(&'a self, context: &'a Context) -> impl Iterator<Item = &Block> {
+    pub fn pred_iter<'a>(&'a self, context: &'a Context) -> impl Iterator<Item = &'a Block> {
         context.blocks[self.0].preds.iter()
     }
 
@@ -194,28 +204,45 @@ impl Block {
         self.add_pred(context, new_source);
     }
 
-    /// Get a reference to the block terminator.
+    /// Get instruction at position `pos`.
     ///
-    /// Returns `None` if block is empty.
+    /// Returns `None` if block is empty or if `pos` is out of bounds.
+    pub fn get_instruction_at(&self, context: &Context, pos: usize) -> Option<Value> {
+        context.blocks[self.0].instructions.get(pos).cloned()
+    }
+
+    /// Get a reference to the final instruction in the block, provided it is a terminator.
+    ///
+    /// Returns `None` if the final instruction is not a terminator. This can only happen during IR
+    /// generation when the block is still being populated.
     pub fn get_terminator<'a>(&self, context: &'a Context) -> Option<&'a Instruction> {
         context.blocks[self.0].instructions.last().and_then(|val| {
             // It's guaranteed to be an instruction value.
             if let ValueDatum::Instruction(term_inst) = &context.values[val.0].value {
-                Some(term_inst)
+                if term_inst.op.is_terminator() {
+                    Some(term_inst)
+                } else {
+                    None
+                }
             } else {
                 None
             }
         })
     }
 
-    /// Get a mut reference to the block terminator.
+    /// Get a mutable reference to the final instruction in the block, provided it is a terminator.
     ///
-    /// Returns `None` if block is empty.
+    /// Returns `None` if the final instruction is not a terminator. This can only happen during IR
+    /// generation when the block is still being populated.
     pub fn get_terminator_mut<'a>(&self, context: &'a mut Context) -> Option<&'a mut Instruction> {
         context.blocks[self.0].instructions.last().and_then(|val| {
             // It's guaranteed to be an instruction value.
             if let ValueDatum::Instruction(term_inst) = &mut context.values[val.0].value {
-                Some(term_inst)
+                if term_inst.op.is_terminator() {
+                    Some(term_inst)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -225,13 +252,20 @@ impl Block {
     /// Get the CFG successors (and the parameters passed to them) of this block.
     pub(super) fn successors<'a>(&'a self, context: &'a Context) -> Vec<BranchToWithArgs> {
         match self.get_terminator(context) {
-            Some(Instruction::ConditionalBranch {
-                true_block,
-                false_block,
+            Some(Instruction {
+                op:
+                    InstOp::ConditionalBranch {
+                        true_block,
+                        false_block,
+                        ..
+                    },
                 ..
             }) => vec![true_block.clone(), false_block.clone()],
 
-            Some(Instruction::Branch(block)) => vec![block.clone()],
+            Some(Instruction {
+                op: InstOp::Branch(block),
+                ..
+            }) => vec![block.clone()],
 
             _otherwise => Vec::new(),
         }
@@ -252,9 +286,13 @@ impl Block {
         succ: &Block,
     ) -> Option<&'a mut Vec<Value>> {
         match self.get_terminator_mut(context) {
-            Some(Instruction::ConditionalBranch {
-                true_block,
-                false_block,
+            Some(Instruction {
+                op:
+                    InstOp::ConditionalBranch {
+                        true_block,
+                        false_block,
+                        ..
+                    },
                 ..
             }) => {
                 if true_block.block == *succ {
@@ -265,7 +303,10 @@ impl Block {
                     None
                 }
             }
-            Some(Instruction::Branch(block)) if block.block == *succ => Some(&mut block.args),
+            Some(Instruction {
+                op: InstOp::Branch(block),
+                ..
+            }) if block.block == *succ => Some(&mut block.args),
             _ => None,
         }
     }
@@ -282,23 +323,27 @@ impl Block {
         let mut modified = false;
         if let Some(term) = self.get_terminator_mut(context) {
             match term {
-                Instruction::ConditionalBranch {
-                    true_block:
-                        BranchToWithArgs {
-                            block: true_block,
-                            args: true_opds,
+                Instruction {
+                    op:
+                        InstOp::ConditionalBranch {
+                            true_block:
+                                BranchToWithArgs {
+                                    block: true_block,
+                                    args: true_opds,
+                                },
+                            false_block:
+                                BranchToWithArgs {
+                                    block: false_block,
+                                    args: false_opds,
+                                },
+                            cond_value: _,
                         },
-                    false_block:
-                        BranchToWithArgs {
-                            block: false_block,
-                            args: false_opds,
-                        },
-                    cond_value: _,
+                    ..
                 } => {
                     if old_succ == *true_block {
                         modified = true;
                         *true_block = new_succ;
-                        *true_opds = new_params.clone();
+                        true_opds.clone_from(&new_params);
                     }
                     if old_succ == *false_block {
                         modified = true;
@@ -307,7 +352,10 @@ impl Block {
                     }
                 }
 
-                Instruction::Branch(BranchToWithArgs { block, args }) if *block == old_succ => {
+                Instruction {
+                    op: InstOp::Branch(BranchToWithArgs { block, args }),
+                    ..
+                } if *block == old_succ => {
                     *block = new_succ;
                     *args = new_params;
                     modified = true;
@@ -321,21 +369,23 @@ impl Block {
         }
     }
 
-    /// Return whether this block is already terminated.  Checks if the final instruction, if it
-    /// exists, is a terminator.
-    pub fn is_terminated(&self, context: &Context) -> bool {
-        context.blocks[self.0]
-            .instructions
-            .last()
-            .map_or(false, |val| val.is_terminator(context))
-    }
-
-    /// Return whether this block is already terminated specifically by a Ret instruction.
-    pub fn is_terminated_by_ret_or_revert(&self, context: &Context) -> bool {
-        self.get_terminator(context).map_or(false, |i| {
+    /// Return whether this block is already terminated by non-branching instructions,
+    /// means with instructions that cause either revert, or local or context returns.
+    /// Those instructions are: [InstOp::Ret], [FuelVmInstruction::Retd],
+    /// [FuelVmInstruction::JmpMem], and [FuelVmInstruction::Revert]).
+    pub fn is_terminated_by_return_or_revert(&self, context: &Context) -> bool {
+        self.get_terminator(context).is_some_and(|i| {
             matches!(
                 i,
-                Instruction::Ret(..) | Instruction::FuelVm(FuelVmInstruction::Revert(..))
+                Instruction {
+                    op: InstOp::Ret(..)
+                        | InstOp::FuelVm(
+                            FuelVmInstruction::Revert(..)
+                                | FuelVmInstruction::JmpMem
+                                | FuelVmInstruction::Retd { .. }
+                        ),
+                    ..
+                }
             )
         })
     }
@@ -364,10 +414,38 @@ impl Block {
         }
     }
 
+    /// Remove an instruction at position `pos` from this block.
+    ///
+    /// **NOTE:** We must be very careful!  We mustn't remove the phi or the terminator.  Some
+    /// extra checks should probably be performed here to avoid corruption! Ideally we use get a
+    /// user/uses system implemented.  Using `Vec::remove()` is also O(n) which we may want to
+    /// avoid someday.
+    pub fn remove_instruction_at(&self, context: &mut Context, pos: usize) {
+        context.blocks[self.0].instructions.remove(pos);
+    }
+
+    /// Remove the last instruction in the block.
+    ///
+    /// **NOTE:** The caller must be very careful if removing the terminator.
+    pub fn remove_last_instruction(&self, context: &mut Context) {
+        context.blocks[self.0].instructions.pop();
+    }
+
     /// Remove instructions from block that satisfy a given predicate.
     pub fn remove_instructions<T: Fn(Value) -> bool>(&self, context: &mut Context, pred: T) {
         let ins = &mut context.blocks[self.0].instructions;
         ins.retain(|value| !pred(*value));
+    }
+
+    /// Clear the current instruction list and take the one provided.
+    pub fn take_body(&self, context: &mut Context, new_insts: Vec<Value>) {
+        let _ = std::mem::replace(&mut (context.blocks[self.0].instructions), new_insts);
+        for inst in &context.blocks[self.0].instructions {
+            let ValueDatum::Instruction(inst) = &mut context.values[inst.0].value else {
+                continue;
+            };
+            inst.parent = *self;
+        }
     }
 
     /// Insert instruction(s) at the beginning of the block.
@@ -379,12 +457,13 @@ impl Block {
 
     /// Replace an instruction in this block with another.  Will return a ValueNotFound on error.
     /// Any use of the old instruction value will also be replaced by the new value throughout the
-    /// owning function.
+    /// owning function if `replace_uses` is set.
     pub fn replace_instruction(
         &self,
         context: &mut Context,
         old_instr_val: Value,
         new_instr_val: Value,
+        replace_uses: bool,
     ) -> Result<(), IrError> {
         match context.blocks[self.0]
             .instructions
@@ -396,12 +475,14 @@ impl Block {
             )),
             Some(instr_val) => {
                 *instr_val = new_instr_val;
-                self.get_function(context).replace_value(
-                    context,
-                    old_instr_val,
-                    new_instr_val,
-                    Some(*self),
-                );
+                if replace_uses {
+                    self.get_function(context).replace_value(
+                        context,
+                        old_instr_val,
+                        new_instr_val,
+                        Some(*self),
+                    );
+                }
                 Ok(())
             }
         }
@@ -455,6 +536,10 @@ impl Block {
 
             // Split the instructions at the index and append them to the new block.
             let mut tail_instructions = context.blocks[self.0].instructions.split_off(split_idx);
+            // Update the parent of tail_instructions.
+            for instr in &tail_instructions {
+                instr.get_instruction_mut(context).unwrap().parent = new_block;
+            }
             context.blocks[new_block.0]
                 .instructions
                 .append(&mut tail_instructions);
@@ -465,12 +550,19 @@ impl Block {
             // Copying the candidate blocks and putting them in a vector to avoid borrowing context
             // as immutable and then mutable in the loop body.
             for to_block in match new_block.get_terminator(context) {
-                Some(Instruction::Branch(to_block)) => {
+                Some(Instruction {
+                    op: InstOp::Branch(to_block),
+                    ..
+                }) => {
                     vec![to_block.block]
                 }
-                Some(Instruction::ConditionalBranch {
-                    true_block,
-                    false_block,
+                Some(Instruction {
+                    op:
+                        InstOp::ConditionalBranch {
+                            true_block,
+                            false_block,
+                            ..
+                        },
                     ..
                 }) => {
                     vec![true_block.block, false_block.block]
@@ -493,7 +585,7 @@ impl Block {
 
 /// An iterator over each block in a [`Function`].
 pub struct BlockIterator {
-    blocks: Vec<generational_arena::Index>,
+    blocks: Vec<slotmap::DefaultKey>,
     next: usize,
 }
 

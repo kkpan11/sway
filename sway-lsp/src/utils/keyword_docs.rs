@@ -796,13 +796,13 @@ impl KeywordDocs {
             type_keyword,
         ];
 
-        keywords.iter().for_each(|keyword| {
+        for keyword in &keywords {
             let ident = keyword.ident.clone().to_string();
             // remove "_keyword" suffix to get the keyword name
             let name = ident.trim_end_matches("_keyword").to_owned();
             let mut documentation = String::new();
             keyword.attrs.iter().for_each(|attr| {
-                let tokens = attr.tokens.to_token_stream();
+                let tokens = attr.meta.clone().to_token_stream();
                 let lit = extract_lit(tokens);
                 writeln!(documentation, "{lit}").unwrap();
             });
@@ -810,7 +810,7 @@ impl KeywordDocs {
                 name,
                 documentation.replace("///\n", "\n").replace("/// ", ""),
             );
-        });
+        }
 
         Self(keyword_docs)
     }
@@ -825,8 +825,8 @@ impl std::ops::Deref for KeywordDocs {
 
 /// Extracts the literal from a token stream and returns it as a string.
 fn extract_lit(tokens: TokenStream) -> String {
-    let mut res = "".to_string();
-    for token in tokens.into_iter() {
+    let mut res = String::new();
+    for token in tokens {
         if let TokenTree::Literal(l) = token {
             let s = l.to_string();
             let s = s.trim_start_matches("r\""); // remove the r" sequence at the beginning
@@ -837,8 +837,8 @@ fn extract_lit(tokens: TokenStream) -> String {
     res
 }
 
-#[test]
-fn keywords_in_sync() {
+#[tokio::test]
+async fn keywords_in_sync() {
     let keyword_docs = KeywordDocs::new();
     let lsp_keywords: Vec<_> = keyword_docs.keys().collect();
     let compiler_keywords: Vec<_> = sway_parse::RESERVED_KEYWORDS

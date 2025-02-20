@@ -1,5 +1,3 @@
-use std::collections::hash_map::Entry;
-
 /// Constant value demotion.
 ///
 /// This pass demotes 'by-value' constant types to 'by-reference` pointer types, based on target
@@ -8,18 +6,19 @@ use std::collections::hash_map::Entry;
 /// Storage for constant values is created on the stack in variables which are initialized with the
 /// original values.
 use crate::{
-    AnalysisResults, Block, Constant, Context, Function, Instruction, IrError, Pass,
-    PassMutability, ScopedPass, Value,
+    AnalysisResults, Block, Constant, Context, Function, InstOp, IrError, Pass, PassMutability,
+    ScopedPass, Value,
 };
 
 use rustc_hash::FxHashMap;
+use sway_types::FxIndexMap;
 
-pub const CONSTDEMOTION_NAME: &str = "constdemotion";
+pub const CONST_DEMOTION_NAME: &str = "const-demotion";
 
 pub fn create_const_demotion_pass() -> Pass {
     Pass {
-        name: CONSTDEMOTION_NAME,
-        descr: "By-value constant demotion to by-reference.",
+        name: CONST_DEMOTION_NAME,
+        descr: "Demotion of by-value constants to by-reference",
         deps: Vec::new(),
         runner: ScopedPass::FunctionPass(PassMutability::Transform(const_demotion)),
     }
@@ -31,19 +30,19 @@ pub fn const_demotion(
     function: Function,
 ) -> Result<bool, IrError> {
     // Find all candidate constant values and their wrapped constants.
-    let mut candidate_values: FxHashMap<Block, Vec<(Value, Constant)>> = FxHashMap::default();
+    let mut candidate_values: FxIndexMap<Block, Vec<(Value, Constant)>> = FxIndexMap::default();
 
     for (block, inst) in function.instruction_iter(context) {
-        let operands = inst.get_instruction(context).unwrap().get_operands();
+        let operands = inst.get_instruction(context).unwrap().op.get_operands();
         for val in operands.iter() {
             if let Some(c) = val.get_constant(context) {
-                if super::target_fuel::is_demotable_type(context, &c.ty) {
-                    let dem = (*val, c.clone());
+                if super::target_fuel::is_demotable_type(context, &c.get_content(context).ty) {
+                    let dem = (*val, *c);
                     match candidate_values.entry(block) {
-                        Entry::Occupied(mut occ) => {
+                        indexmap::map::Entry::Occupied(mut occ) => {
                             occ.get_mut().push(dem);
                         }
-                        Entry::Vacant(vac) => {
+                        indexmap::map::Entry::Vacant(vac) => {
                             vac.insert(vec![dem]);
                         }
                     }
@@ -65,12 +64,12 @@ pub fn const_demotion(
             let var = function.new_unique_local_var(
                 context,
                 "__const".to_owned(),
-                c.ty,
-                Some(c.clone()),
+                c.get_content(context).ty,
+                Some(c),
                 false,
             );
-            let var_val = Value::new_instruction(context, Instruction::GetLocal(var));
-            let load_val = Value::new_instruction(context, Instruction::Load(var_val));
+            let var_val = Value::new_instruction(context, block, InstOp::GetLocal(var));
+            let load_val = Value::new_instruction(context, block, InstOp::Load(var_val));
             replace_map.insert(c_val, load_val);
             this_block_new.push(var_val);
             this_block_new.push(load_val);

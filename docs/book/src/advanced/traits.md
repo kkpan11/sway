@@ -20,7 +20,7 @@ We have just declared a trait called `Compare`. After the name of the trait, the
 
 ## Implementing a Trait
 
-Ok, so I know that numbers can be equal. I want to implement my `Compare` trait for `u64`. Let's take a look at how that is done:
+The example below implements a `Compare` trait for `u64` to check if two numbers are equal. Let's take a look at how that is done:
 
 ```sway
 impl Compare for u64 {
@@ -34,8 +34,8 @@ The above snippet declares all of the methods in the trait `Compare` for the typ
 
 ## Supertraits
 
-When using multiple traits, scenarios often come up where one trait may require functionality from another trait. This is where supertraits come in as they allow you to require a trait when implementing another
-trait (ie. a trait with a trait). A good example of this is the `Ord` trait of the `core` library of Sway. The `Ord` trait requires the `Eq` trait, so `Eq` is kept as a separate trait as one may decide to implement `Eq`
+When using multiple traits, scenarios often come up where one trait may require functionality from another trait. This is where supertraits come in as they allow you to require a trait when implementing another trait, i.e., a trait with a trait.
+A good example of this is the `Ord` trait of the `core` library of Sway. The `Ord` trait requires the `Eq` trait, so `Eq` is kept as a separate trait as one may decide to implement `Eq`
 without implementing other parts of the `Ord` trait.
 
 ```sway
@@ -88,6 +88,7 @@ Traits can declare different kinds of associated items in their interface surfac
 
 - [Functions](#associated-functions)
 - [Constants](#associated-constants)
+- [Types](#associated-types)
 
 ### Associated functions
 
@@ -119,6 +120,57 @@ trait Trait {
 
 Check the `associated consts` section on [constants](../basics/constants.md) page.
 
+### Associated types
+
+Associated types in Sway allow you to define placeholder types within a trait, which can be customized by concrete
+implementations of that trait. These associated types are used to specify the return types of trait methods or to
+define type relationships within the trait.
+
+```sway
+trait MyTrait {
+    type AssociatedType;
+}
+```
+
+Check the `associated types` section on [associated types](./associated_types.md) page.
+
+## Trait Constraints
+
+When writing generic code, you can constraint the choice of types for a generic argument by using the `where` keyword. The `where` keyword specifies which traits the concrete generic parameter must implement. In the below example, the function `expects_some_trait` can be called only if the parameter `t` is of a type that has `SomeTrait` implemented. To call the `expects_both_traits`, parameter `t` must be of a type that implements _both_ `SomeTrait` and `SomeOtherTrait`.
+
+```sway
+trait SomeTrait { }
+trait SomeOtherTrait { }
+
+fn expects_some_trait<T>(t: T) where T: SomeTrait {
+    // ...
+}
+
+fn expects_some_other_trait<T>(t: T) where T: SomeOtherTrait {
+    // ...
+}
+
+fn expects_both_traits<T>(t: T) where T: SomeTrait + SomeOtherTrait {
+    // ...
+}
+```
+
+## Marker Traits
+
+Sway types can be classified in various ways according to their intrinsic properties. These classifications are represented as marker traits. Marker traits are implemented by the compiler and cannot be explicitly implemented in code.
+
+E.g., all types whose instances can be used in the `panic` expression automatically implement the `Error` marker trait. We can use that trait, e.g., to specify that a generic argument must be compatible with the `panic` expression:
+
+```sway
+fn panic_with_error<E>(err: E) where E: Error {
+    panic err;
+}
+```
+
+> **Note** `panic` expression and error types [have not yet been implemented](https://github.com/FuelLabs/sway/issues/6765)
+
+All marker traits are defined in the `core::marker` module.
+
 ## Use Cases
 
 ### Custom Types (structs, enums)
@@ -144,8 +196,6 @@ fn play_game_with_deck<T>(a: Vec<T>) where T: Card {
     // insert some creative card game here
 }
 ```
-
-> **Note** Trait constraints (i.e. using the `where` keyword) [have not yet been implemented](https://github.com/FuelLabs/sway/issues/970)
 
 Now, if you want to use the function `play_game_with_deck` with your struct, you must implement `Card` for your struct. Note that the following code example assumes a dependency _games_ has been included in the `Forc.toml` file.
 

@@ -3,7 +3,10 @@ use crate::{
     utils::map::byte_span::{ByteSpan, LeafSpans},
 };
 use std::fmt::Write;
-use sway_ast::{WhereBound, WhereClause};
+use sway_ast::{
+    keywords::{ColonToken, Keyword, Token, WhereToken},
+    CommaToken, WhereBound, WhereClause,
+};
 use sway_types::Spanned;
 
 impl Format for WhereClause {
@@ -15,10 +18,10 @@ impl Format for WhereClause {
         writeln!(
             formatted_code,
             "{}{}",
-            &formatter.shape.indent.to_string(&formatter.config)?,
-            self.where_token.span().as_str(),
+            formatter.indent_to_str()?,
+            WhereToken::AS_STR,
         )?;
-        formatter.shape.block_indent(&formatter.config);
+        formatter.indent();
         // We should add a multiline field to `Shape`
         // so we can reduce this code block to:
         //
@@ -27,18 +30,19 @@ impl Format for WhereClause {
         // ```
         //
         let value_pairs = self.bounds.value_separator_pairs.clone();
-        for pair in value_pairs.iter() {
+        for (bound, _comma_token) in value_pairs.iter() {
             // `WhereBound`
-            pair.0.format(formatted_code, formatter)?;
+            bound.format(formatted_code, formatter)?;
             // `CommaToken`
-            writeln!(formatted_code, "{}", pair.1.span().as_str())?;
+            writeln!(formatted_code, "{}", CommaToken::AS_STR)?;
         }
         if let Some(final_value) = &self.bounds.final_value_opt {
             final_value.format(formatted_code, formatter)?;
-            writeln!(formatted_code)?;
+            writeln!(formatted_code, "{}", CommaToken::AS_STR)?;
         }
         // reset indent
-        formatter.shape.block_unindent(&formatter.config);
+        formatter.unindent();
+
         Ok(())
     }
 }
@@ -52,11 +56,12 @@ impl Format for WhereBound {
         write!(
             formatted_code,
             "{}{}{} ",
-            &formatter.shape.indent.to_string(&formatter.config)?, // `Indent`
-            self.ty_name.span().as_str(),                          // `Ident`
-            self.colon_token.span().as_str(),                      // `ColonToken`
+            formatter.indent_to_str()?,
+            self.ty_name.as_str(),
+            ColonToken::AS_STR,
         )?;
         self.bounds.format(formatted_code, formatter)?;
+
         Ok(())
     }
 }

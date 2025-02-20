@@ -1,13 +1,13 @@
 use crate::{
-    asm_generation::fuel::compiler_constants,
+    asm_generation::fuel::{analyses::liveness_analysis, compiler_constants},
     asm_lang::{
-        allocated_ops::AllocatedRegister, virtual_register::*, AllocatedAbstractOp, ControlFlowOp,
-        Label, Op, VirtualImmediate12, VirtualImmediate18, VirtualImmediate24, VirtualOp,
+        allocated_ops::AllocatedRegister, virtual_register::*, AllocatedAbstractOp, Op,
+        VirtualImmediate12, VirtualImmediate18, VirtualImmediate24, VirtualOp,
     },
-    size_bytes_round_up_to_word_alignment,
 };
 
 use either::Either;
+use indexmap::IndexMap;
 use petgraph::{
     stable_graph::NodeIndex,
     visit::EdgeRef,
@@ -16,7 +16,8 @@ use petgraph::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{hash_map, BTreeSet, HashMap};
 use sway_error::error::CompileError;
-use sway_types::Span;
+use sway_ir::size_bytes_round_up_to_word_alignment;
+use sway_types::{FxIndexSet, Span};
 
 use super::allocated_abstract_instruction_set::AllocatedAbstractInstructionSet;
 
@@ -104,104 +105,6 @@ impl RegisterPool {
         allocated_reg.map(|RegisterAllocationStatus { reg, used_by: _ }| reg.clone())
     }
 }
-/// Given a list of instructions `ops` of a program, do liveness analysis for the full program.
-///
-/// A virtual registers is live at some point in the program if it has previously been defined by
-/// an instruction and will be used by an instruction in the future.
-///
-/// The analysis function below assumes that it is possible that a virtual register is assigned
-/// more than once. That is, it doesn't assume that the intermediate assembly is in SSA form.
-///
-/// Two tables are generated: `live_in` and `live_out`. Each row in the tables corresponds to an
-/// instruction in the program.
-/// * A virtual register is in the `live_out` table for a given instruction if it is live on any
-/// of that node's out-edges
-/// * A virtual register is in the `live_in` table for a given instruction if it is live on any
-/// of that node's in-edges
-///
-///
-/// Algorithm:
-/// ===============================================================================================
-/// for each instruction op:
-///     live_in(op) = {}
-///     live_out(op) = {}
-///     def(op) = list of virtual registers defined by op
-///     use(op) = list of virtual registers used by op
-///
-/// repeat
-///     for each instruction op (traversed in reverse topological order of the CFG)
-///         prev_live_in(op) = live_in(op)
-///         prev_live_out(op) = live_out(op)
-///         live_out(op) = live_in(s_1) UNION live_in(s_2) UNION live_in(s_3) UNION ...
-///                        where s_1, s_2, s_3, ... are all the successors of op in the CFG.
-///         live_in(op) = use(op) UNION (live_out(op) - def(op))
-/// until     prev_live_in(op) = live_in(op)
-///       AND prev_live_out(op) = live_out(op)
-/// ===============================================================================================
-///
-/// Note that we're only looking at registers that have the enum variant
-/// VirtualRegister::Virtual(_). All other registers (i.e. ones with the
-/// VirtualRegister::Constant(_) variant) are assumed to be live throughout the full program.
-///
-/// This function finally returns `live_out` because it has all the liveness information needed.
-/// `live_in` is computed because it is needed to compute `live_out` iteratively.
-///
-pub(crate) fn liveness_analysis(ops: &[Op]) -> Vec<FxHashSet<VirtualRegister>> {
-    // Vectors representing maps that will reprsent the live_in and live_out tables. Each entry
-    // corresponds to an instruction in `ops`.
-    let mut live_in: Vec<FxHashSet<VirtualRegister>> = vec![FxHashSet::default(); ops.len()];
-    let mut live_out: Vec<FxHashSet<VirtualRegister>> = vec![FxHashSet::default(); ops.len()];
-    let mut label_to_index: HashMap<Label, usize> = HashMap::new();
-
-    // Keep track of an map between jump labels and op indices. Useful to compute op successors.
-    for (idx, op) in ops.iter().enumerate() {
-        if let Either::Right(ControlFlowOp::Label(op_label)) = op.opcode {
-            label_to_index.insert(op_label, idx);
-        }
-    }
-
-    let mut modified = true;
-    while modified {
-        modified = false;
-        // Iterate in reverse topological order of the CFG (which is basically the same as the
-        // reverse order of `ops`. This makes the outer `while` loop converge faster.
-        for (ix, op) in ops.iter().rev().enumerate() {
-            let mut local_modified = false;
-            let rev_ix = ops.len() - ix - 1;
-
-            // Get use and def vectors without any of the Constant registers
-            let mut op_use = op.use_registers();
-            let mut op_def = op.def_registers();
-            op_use.retain(|&reg| reg.is_virtual());
-            op_def.retain(|&reg| reg.is_virtual());
-
-            // Compute live_out(op) = live_in(s_1) UNION live_in(s_2) UNION ..., where s1, s_2, ...
-            // are successors of op
-            for s in &op.successors(rev_ix, ops, &label_to_index) {
-                for l in live_in[*s].iter() {
-                    local_modified |= live_out[rev_ix].insert(l.clone());
-                }
-            }
-
-            // Compute live_in(op) = use(op) UNION (live_out(op) - def(op))
-            // Add use(op)
-            for u in op_use {
-                local_modified |= live_in[rev_ix].insert(u.clone());
-            }
-            // Add live_out(op) - def(op)
-            for l in live_out[rev_ix].iter() {
-                if !op_def.contains(&l) {
-                    local_modified |= live_in[rev_ix].insert(l.clone());
-                }
-            }
-
-            // Did anything change in this iteration?
-            modified |= local_modified;
-        }
-    }
-
-    live_out
-}
 
 /// Given a list of instructions `ops` and a `live_out` table computed using the method
 /// `liveness_analysis()`, create an interference graph (aka a "conflict" graph):
@@ -218,11 +121,11 @@ pub(crate) fn liveness_analysis(ops: &[Op]) -> Vec<FxHashSet<VirtualRegister>> {
 ///        add edges (v, b_1), ..., (v, b_n) for any b_i different from c.
 /// 3. for non-MOVE def of virtual register v with live_out virtual registers b_1, ..., b_n:
 ///        add edges (v, b_1), ..., (v, b_n)
-/// ===============================================================================================
 ///
+/// ===============================================================================================
 pub(crate) fn create_interference_graph(
     ops: &[Op],
-    live_out: &[FxHashSet<VirtualRegister>],
+    live_out: &[BTreeSet<VirtualRegister>],
 ) -> (InterferenceGraph, HashMap<VirtualRegister, NodeIndex>) {
     let mut interference_graph = InterferenceGraph::with_capacity(0, 0);
 
@@ -288,22 +191,22 @@ pub(crate) fn create_interference_graph(
 /// * When two registers are coalesced, a new node with a new virtual register (generated using the
 ///   register sequencer) is created in the interference graph.
 /// * When a MOVE instruction is removed, the offset of each subsequent instruction has to be
-/// updated, as well as the immediate values for some or all jump instructions (`ji`, `jnei`, and
-/// `jnzi for now).
+///   updated, as well as the immediate values for some or all jump instructions (`ji`, `jnei`, and
+///   `jnzi for now).
 ///
 pub(crate) fn coalesce_registers(
     ops: &[Op],
-    live_out: Vec<FxHashSet<VirtualRegister>>,
+    live_out: Vec<BTreeSet<VirtualRegister>>,
     interference_graph: &mut InterferenceGraph,
     reg_to_node_map: &mut HashMap<VirtualRegister, NodeIndex>,
-) -> (Vec<Op>, Vec<FxHashSet<VirtualRegister>>) {
+) -> (Vec<Op>, Vec<BTreeSet<VirtualRegister>>) {
     // A map from the virtual registers that are removed to the virtual registers that they are
     // replaced with during the coalescing process.
-    let mut reg_to_reg_map: HashMap<&VirtualRegister, &VirtualRegister> = HashMap::new();
+    let mut reg_to_reg_map = IndexMap::<&VirtualRegister, &VirtualRegister>::new();
 
     // To hold the final *reduced* list of ops
     let mut reduced_ops: Vec<Op> = Vec::with_capacity(ops.len());
-    let mut reduced_live_out: Vec<FxHashSet<VirtualRegister>> = Vec::with_capacity(live_out.len());
+    let mut reduced_live_out: Vec<BTreeSet<VirtualRegister>> = Vec::with_capacity(live_out.len());
     assert!(ops.len() == live_out.len());
 
     for (op_idx, op) in ops.iter().enumerate() {
@@ -335,10 +238,10 @@ pub(crate) fn coalesce_registers(
 
                         let r1_neighbours = interference_graph
                             .neighbors_undirected(*ix1)
-                            .collect::<FxHashSet<_>>();
+                            .collect::<FxIndexSet<_>>();
                         let r2_neighbours = interference_graph
                             .neighbors_undirected(*ix2)
-                            .collect::<FxHashSet<_>>();
+                            .collect::<FxIndexSet<_>>();
 
                         // Using either of the two safety conditions below, it's guaranteed
                         // that we aren't turning a k-colourable graph into one that's not,
@@ -413,7 +316,7 @@ pub(crate) fn coalesce_registers(
 
     // Create a *final* reg-to-reg map that We keep looking for mappings within reg_to_reg_map
     // until we find a register that doesn't map to any other.
-    let mut final_reg_to_reg_map: HashMap<&VirtualRegister, &VirtualRegister> = HashMap::new();
+    let mut final_reg_to_reg_map = IndexMap::<&VirtualRegister, &VirtualRegister>::new();
     for reg in reg_to_reg_map.keys() {
         let mut temp = reg;
         while let Some(t) = reg_to_reg_map.get(temp) {
@@ -483,12 +386,13 @@ fn compute_def_use_points(ops: &[Op]) -> FxHashMap<VirtualRegister, (Vec<usize>,
 /// 3. If some vertex n still has k or more neighbors, then the graph may not be k colorable.
 ///     We still add it to the stack as is, as a potential spill. When popping, if we still
 ///     can't colour it, then it becomes an actual spill.
+///
 /// ===============================================================================================
 ///
 pub(crate) fn color_interference_graph(
     interference_graph: &mut InterferenceGraph,
     ops: &[Op],
-    live_out: &[FxHashSet<VirtualRegister>],
+    live_out: &[BTreeSet<VirtualRegister>],
 ) -> Result<Vec<NodeIndex>, FxHashSet<VirtualRegister>> {
     let mut stack = Vec::with_capacity(interference_graph.node_count());
     let mut on_stack = FxHashSet::default();
@@ -651,7 +555,6 @@ pub(crate) fn color_interference_graph(
 /// list `self.ops`. The algorithm used is Chaitin's graph-coloring register allocation
 /// algorithm (https://en.wikipedia.org/wiki/Chaitin%27s_algorithm). The individual steps of
 /// the algorithm are thoroughly explained in register_allocator.rs.
-
 pub(crate) fn allocate_registers(
     ops: &[Op],
 ) -> Result<AllocatedAbstractInstructionSet, CompileError> {
@@ -669,7 +572,7 @@ pub(crate) fn allocate_registers(
 
     fn try_color(ops: &[Op]) -> ColouringResult {
         // Step 1: Liveness Analysis.
-        let live_out = liveness_analysis(ops);
+        let live_out = liveness_analysis(ops, true);
 
         // Step 2: Construct the interference graph.
         let (mut interference_graph, mut reg_to_node_ix) =
@@ -811,11 +714,11 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
     let mut cfs_idx_opt = None;
     for (op_idx, op) in ops.iter().enumerate() {
         match &op.opcode {
-            Either::Left(VirtualOp::CFEI(_)) => {
+            Either::Left(VirtualOp::CFEI(..)) => {
                 assert!(cfe_idx_opt.is_none(), "Found more than one stack extension");
                 cfe_idx_opt = Some(op_idx);
             }
-            Either::Left(VirtualOp::CFSI(_)) => {
+            Either::Left(VirtualOp::CFSI(..)) => {
                 assert!(cfs_idx_opt.is_none(), "Found more than one stack shrink");
                 cfs_idx_opt = Some(op_idx);
             }
@@ -825,12 +728,14 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
 
     let cfe_idx = cfe_idx_opt.expect("Function does not have CFEI instruction for locals");
 
-    let Either::Left(VirtualOp::CFEI(VirtualImmediate24 {
-        value: locals_size_bytes,
-    })) = ops[cfe_idx].opcode
+    let Either::Left(VirtualOp::CFEI(
+        VirtualRegister::Constant(ConstantRegister::StackPointer),
+        virt_imm_24,
+    )) = &ops[cfe_idx].opcode
     else {
         panic!("Unexpected opcode");
     };
+    let locals_size_bytes = virt_imm_24.value();
 
     // pad up the locals size in bytes to a word.
     let locals_size_bytes = size_bytes_round_up_to_word_alignment!(locals_size_bytes);
@@ -852,18 +757,26 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
         if op_idx == cfe_idx {
             // This is the CFE instruction, use the new stack size.
             spilled.push(Op {
-                opcode: Either::Left(VirtualOp::CFEI(VirtualImmediate24 {
-                    value: new_locals_byte_size,
-                })),
+                opcode: Either::Left(VirtualOp::CFEI(
+                    VirtualRegister::Constant(ConstantRegister::StackPointer),
+                    VirtualImmediate24::new_unchecked(
+                        new_locals_byte_size.into(),
+                        "new_locals_byte_size must fit in 24 bits",
+                    ),
+                )),
                 comment: op.comment.clone() + &format!(" and {spills_size} bytes for spills"),
                 owning_span: op.owning_span.clone(),
             });
         } else if matches!(cfs_idx_opt, Some(cfs_idx) if cfs_idx == op_idx) {
             // This is the CFS instruction, use the new stack size.
             spilled.push(Op {
-                opcode: Either::Left(VirtualOp::CFSI(VirtualImmediate24 {
-                    value: new_locals_byte_size,
-                })),
+                opcode: Either::Left(VirtualOp::CFSI(
+                    VirtualRegister::Constant(ConstantRegister::StackPointer),
+                    VirtualImmediate24::new_unchecked(
+                        new_locals_byte_size.into(),
+                        "new_locals_byte_size must fit in 24 bits",
+                    ),
+                )),
                 comment: op.comment.clone() + &format!(" and {spills_size} bytes for spills"),
                 owning_span: op.owning_span.clone(),
             });
@@ -884,11 +797,12 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                     let offset_mov_instr = Op {
                         opcode: Either::Left(VirtualOp::MOVI(
                             VirtualRegister::Constant(ConstantRegister::Scratch),
-                            VirtualImmediate18 {
-                                value: offset_bytes,
-                            },
+                            VirtualImmediate18::new_unchecked(
+                                offset_bytes.into(),
+                                "offset_bytes must fit in 18 bits",
+                            ),
                         )),
-                        comment: "Spill/Refill: Set offset".to_string(),
+                        comment: "[spill/refill]: set offset".to_string(),
                         owning_span: None,
                     };
                     inst_list.push(offset_mov_instr);
@@ -898,13 +812,13 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                             VirtualRegister::Constant(ConstantRegister::Scratch),
                             VirtualRegister::Constant(ConstantRegister::LocalsBase),
                         )),
-                        comment: "Spill/Refill: Add offset to stack base".to_string(),
+                        comment: "[spill/refill]: add offset to stack base".to_string(),
                         owning_span: None,
                     };
                     inst_list.push(offset_add_instr);
                     (
                         VirtualRegister::Constant(ConstantRegister::Scratch),
-                        VirtualImmediate12 { value: 0 },
+                        VirtualImmediate12::new_unchecked(0, "zero must fit in 12 bits"),
                     )
                 } else {
                     assert!(offset_bytes <= compiler_constants::TWENTY_FOUR_BITS as u32);
@@ -920,11 +834,12 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                     let offset_upper_mov_instr = Op {
                         opcode: Either::Left(VirtualOp::MOVI(
                             VirtualRegister::Constant(ConstantRegister::Scratch),
-                            VirtualImmediate18 {
-                                value: offset_upper_12,
-                            },
+                            VirtualImmediate18::new_unchecked(
+                                offset_upper_12.into(),
+                                "Upper part of offset must fit in 18 bits",
+                            ),
                         )),
-                        comment: "Spill/Refill: Offset computation".to_string(),
+                        comment: "[spill/refill]: compute offset".to_string(),
                         owning_span: None,
                     };
                     inst_list.push(offset_upper_mov_instr);
@@ -932,9 +847,9 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                         opcode: Either::Left(VirtualOp::SLLI(
                             VirtualRegister::Constant(ConstantRegister::Scratch),
                             VirtualRegister::Constant(ConstantRegister::Scratch),
-                            VirtualImmediate12 { value: 12 },
+                            VirtualImmediate12::new_unchecked(12, "twelve must fit in 12 bits"),
                         )),
-                        comment: "Spill/Refill: Offset computation".to_string(),
+                        comment: "[spill/refill]: compute offset".to_string(),
                         owning_span: None,
                     };
                     inst_list.push(offset_upper_shift_instr);
@@ -944,16 +859,17 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                             VirtualRegister::Constant(ConstantRegister::Scratch),
                             VirtualRegister::Constant(ConstantRegister::LocalsBase),
                         )),
-                        comment: "Spill/Refill: Offset computation".to_string(),
+                        comment: "[spill/refill]: compute offset".to_string(),
                         owning_span: None,
                     };
                     inst_list.push(offset_add_instr);
                     (
                         VirtualRegister::Constant(ConstantRegister::Scratch),
-                        VirtualImmediate12 {
-                            // This will be multiplied by 8 by the VM
-                            value: (offset_lower_12 / 8) as u16,
-                        },
+                        // This will be multiplied by 8 by the VM
+                        VirtualImmediate12::new_unchecked(
+                            (offset_lower_12 / 8).into(),
+                            "Lower part of offset must fit in 12 bits",
+                        ),
                     )
                 }
             }
@@ -968,12 +884,13 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                         opcode: Either::Left(VirtualOp::LW(
                             spilled_use.clone(),
                             VirtualRegister::Constant(ConstantRegister::LocalsBase),
-                            VirtualImmediate12 {
-                                // This will be multiplied by 8 by the VM
-                                value: (offset_bytes / 8) as u16,
-                            },
+                            // This will be multiplied by 8 by the VM
+                            VirtualImmediate12::new_unchecked(
+                                (offset_bytes / 8).into(),
+                                "offset_bytes must fit in 12 bits",
+                            ),
                         )),
-                        comment: "Refilling from spill".to_string(),
+                        comment: "[spill/refill]: refill from spill".to_string(),
                         owning_span: None,
                     });
                 } else {
@@ -986,7 +903,7 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                             // This will be multiplied by 8 by the VM
                             offset_imm_word,
                         )),
-                        comment: "Refilling from spill".to_string(),
+                        comment: "[spill/refill]: refill from spill".to_string(),
                         owning_span: None,
                     };
                     spilled.push(lw);
@@ -1006,12 +923,13 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                         opcode: Either::Left(VirtualOp::SW(
                             VirtualRegister::Constant(ConstantRegister::LocalsBase),
                             spilled_def.clone(),
-                            VirtualImmediate12 {
-                                // This will be multiplied by 8 by the VM
-                                value: (offset_bytes / 8) as u16,
-                            },
+                            // This will be multiplied by 8 by the VM
+                            VirtualImmediate12::new_unchecked(
+                                (offset_bytes / 8).into(),
+                                "offset_bytes must fit in 12 bits",
+                            ),
                         )),
-                        comment: "Spill".to_string(),
+                        comment: "[spill/refill]: spill".to_string(),
                         owning_span: None,
                     });
                 } else {
@@ -1024,7 +942,7 @@ fn spill(ops: &[Op], spills: &FxHashSet<VirtualRegister>) -> Vec<Op> {
                             // This will be multiplied by 8 by the VM
                             offset_imm_word,
                         )),
-                        comment: "Spill".to_string(),
+                        comment: "[spill/refill]: spill".to_string(),
                         owning_span: None,
                     };
                     spilled.push(sw);

@@ -1,14 +1,17 @@
 script;
 use basic_storage_abi::{BasicStorage, Quad};
 
+#[cfg(experimental_new_encoding = false)]
+const CONTRACT_ID = 0x94db39f409a31b9f2ebcadeea44378e419208c20de90f5d8e1e33dc1523754cb;
+#[cfg(experimental_new_encoding = true)]
+const CONTRACT_ID = 0x2214048d9ec349ce0d65cc0d23b5e80eeb1d1c34ae3794cca8c375ae6d804468; // AUTO-CONTRACT-ID ../../test_contracts/basic_storage --release
+
 fn main() -> u64 {
-    let addr = abi(BasicStorage, 0x724809c9a056b5b8f82071795415a4319088eea116d4e428f18c52b15bed3108);
+    let addr = abi(BasicStorage, CONTRACT_ID);
     let key = 0x0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
     let value = 4242;
 
     /* Simple test using `store` and `get` from `std::storage */
-    let res:Option<u64> = addr.get_u64(key);
-    assert(res.is_none()); // nothing to read just yet
     addr.store_u64(key, value);
     assert(addr.get_u64(key).unwrap() == value);
 

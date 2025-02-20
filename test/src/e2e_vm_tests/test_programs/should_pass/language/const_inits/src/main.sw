@@ -70,13 +70,17 @@ const EN1a = En1::Int(101);
 const EN1b = En1::Arr(ARR2);
 const EN1c = En1::NoVal;
 
-const ETH_ID0_VALUE = ETH_ID0.value;
+const ETH_ID0_VALUE = ETH_ID0.bits();
 const TUP1_idx2 = TUP1.2;
 
 const INT1 = 1;
 
+// b256
 const ZERO_B256 = 0x0000000000000000000000000000000000000000000000000000000000000000;
+const ONE_B256 = 0x0000000000000000000000000000000000000000000000000000000000000001;
 const KEY = ZERO_B256;
+const BITWISE_B256: b256 = !ZERO_B256 & ZERO_B256 | ZERO_B256 ^ ZERO_B256;
+const SHIFT_B256: b256 = ZERO_B256 >> 1 << 1;
 
 const BAR: u32 = 6;
 const FOO: u32 = ((u32::min() + 1) * 12 / 2 - 1) % 6;
@@ -90,6 +94,15 @@ const CARR1 = [X_SIZE - Y_SIZE + 1; 4];
 // This doesn't work because const-eval happens after type-checking,
 // and the type checker needs to know the size of the array.
 // const CARR2 = [1; X_SIZE - Y_SIZE + 1];
+
+// Const init with Self
+struct WithSelf { value: u64 }
+impl WithSelf {
+    pub fn size() -> u64 {
+        __transmute::<Self, u64>(Self { value: 1u64 })
+    }
+}
+const WithSelfValue: u64 =  WithSelf::size();
 
 fn main() -> u64 {
     const int1 = 1;
@@ -141,7 +154,7 @@ fn main() -> u64 {
     }
 
     // Struct and enum field access.
-    assert(ETH_ID0.value == ETH_ID0_VALUE);
+    assert(ETH_ID0.bits() == ETH_ID0_VALUE);
     assert(TUP1_idx2 == TUP1.2);
     assert(XPY == 2);
     assert(SO == __size_of::<u64>());
@@ -153,6 +166,8 @@ fn main() -> u64 {
     assert(OPS == 23);
 
     test_not();
+
+    assert(WithSelfValue == 1);
 
     1
 }

@@ -6,7 +6,7 @@
       "inputs": [
         {
           "name": "burn_amount",
-          "type": 3,
+          "type": 4,
           "typeArguments": null
         }
       ],
@@ -22,7 +22,7 @@
       "inputs": [
         {
           "name": "coins",
-          "type": 3,
+          "type": 4,
           "typeArguments": null
         },
         {
@@ -32,7 +32,7 @@
         },
         {
           "name": "c_id",
-          "type": 2,
+          "type": 3,
           "typeArguments": null
         }
       ],
@@ -48,7 +48,7 @@
       "inputs": [
         {
           "name": "mint_amount",
-          "type": 3,
+          "type": 4,
           "typeArguments": null
         }
       ],
@@ -78,19 +78,31 @@
     {
       "components": [
         {
-          "name": "value",
+          "name": "bits",
+          "type": 1,
+          "typeArguments": null
+        }
+      ],
+      "type": "struct std::asset_id::AssetId",
+      "typeId": 2,
+      "typeParameters": null
+    },
+    {
+      "components": [
+        {
+          "name": "bits",
           "type": 1,
           "typeArguments": null
         }
       ],
       "type": "struct std::contract_id::ContractId",
-      "typeId": 2,
+      "typeId": 3,
       "typeParameters": null
     },
     {
       "components": null,
       "type": "u64",
-      "typeId": 3,
+      "typeId": 4,
       "typeParameters": null
     }
   ]

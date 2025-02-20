@@ -19,7 +19,7 @@ enum Foo {
 }
 ```
 
-In Sway, enums are simplified. Enums variants must all specify exactly one type. This type represents their interior data. This is actually isomorphic to what Rust offers, just with a different syntax. I'll now rewrite the above enum but with Sway syntax:
+In Sway, enums are simplified. Enums variants must all specify exactly one type. This type represents their interior data. This is actually isomorphic to what Rust offers, but with a different syntax. You can see the above enum but with Sway syntax below:
 
 ```sway
 // This is equivalent Sway syntax for the above Rust enum.
@@ -34,3 +34,9 @@ struct MyStruct {
     field_two: bool,
 }
 ```
+
+## Memory Allocation
+
+In Rust, the borrow checker implements Rust's [ownership system](https://doc.rust-lang.org/1.8.0/book/ownership.html)
+
+In Sway, there is no borrow checker.  This means there is no concept of ownership, borrowing, or lifetimes.  Instead, objects are copied and moved similar to C++.  Also Sway does not have any destructors nor `Drop` traits.  This means allocated memory lives for the entire transaction and is not deallocated until the end of the transaction.  A transaction may allocate up to [64 MB](https://github.com/FuelLabs/fuel-vm/blob/a80f82ed7c793763de6a73ca72d946b311b0fd0b/fuel-vm/src/consts.rs#L26) of memory.

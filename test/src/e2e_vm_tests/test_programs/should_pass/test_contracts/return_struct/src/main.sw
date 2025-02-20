@@ -1,13 +1,14 @@
 contract;
 
-mod data_structures;
+pub mod data_structures;
 mod interface;
 
 use interface::MyContract;
 use data_structures::MyStruct;
+use std::hash::*;
 
 storage {
-    a: StorageMap<u64, MyStruct> = StorageMap {}
+    a: StorageMap<u64, MyStruct> = StorageMap::<u64, MyStruct> {}
 }
 
 impl MyContract for Contract {

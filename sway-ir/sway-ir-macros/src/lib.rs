@@ -4,7 +4,7 @@ use {
     quote::{format_ident, quote},
     syn::{
         parse_macro_input, Attribute, Data, DeriveInput, Fields, FieldsNamed, FieldsUnnamed, Ident,
-        Meta, NestedMeta, Variant,
+        Variant,
     },
 };
 
@@ -170,7 +170,7 @@ fn pass_through_context(field_name: &Ident, attrs: &[Attribute]) -> proc_macro2:
         attrs
             .iter()
             .filter_map(|attr| {
-                let attr_name = attr.path.get_ident()?;
+                let attr_name = attr.path().get_ident()?;
                 if attr_name != "in_context" {
                     return None;
                 }
@@ -199,23 +199,16 @@ fn pass_through_context(field_name: &Ident, attrs: &[Attribute]) -> proc_macro2:
 }
 
 fn try_parse_context_field_from_attr(attr: &Attribute) -> Option<Ident> {
-    let meta = attr.parse_meta().ok()?;
-    let meta_list = match meta {
-        Meta::List(meta_list) => meta_list,
-        _ => return None,
-    };
-    if meta_list.nested.len() != 1 {
-        return None;
+    let mut context_fields = Vec::new();
+
+    let _ = attr.parse_nested_meta(|nested_meta| {
+        context_fields.push(nested_meta.path.get_ident().unwrap().clone());
+        Ok(())
+    });
+
+    if context_fields.len() != 1 {
+        None
+    } else {
+        context_fields.pop()
     }
-    let nested_meta = meta_list.nested.first()?;
-    let inner_meta = match nested_meta {
-        NestedMeta::Meta(inner_meta) => inner_meta,
-        _ => return None,
-    };
-    let path = match inner_meta {
-        Meta::Path(path) => path,
-        _ => return None,
-    };
-    let context_field_name = path.get_ident()?.clone();
-    Some(context_field_name)
 }

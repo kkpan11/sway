@@ -1,10 +1,13 @@
+use crate::{
+    engine_threading::*,
+    language::{parsed::VariableDeclaration, ty::*},
+    type_system::*,
+};
+use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
+use sway_types::{Ident, Named, Spanned};
 
-use sway_types::Ident;
-
-use crate::{engine_threading::*, language::ty::*, type_system::*};
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TyVariableDecl {
     pub name: Ident,
     pub body: TyExpression,
@@ -13,17 +16,33 @@ pub struct TyVariableDecl {
     pub type_ascription: TypeArgument,
 }
 
+impl TyDeclParsedType for TyVariableDecl {
+    type ParsedType = VariableDeclaration;
+}
+
+impl Named for TyVariableDecl {
+    fn name(&self) -> &sway_types::BaseIdent {
+        &self.name
+    }
+}
+
+impl Spanned for TyVariableDecl {
+    fn span(&self) -> sway_types::Span {
+        self.name.span()
+    }
+}
+
 impl EqWithEngines for TyVariableDecl {}
 impl PartialEqWithEngines for TyVariableDecl {
-    fn eq(&self, other: &Self, engines: &Engines) -> bool {
-        let type_engine = engines.te();
+    fn eq(&self, other: &Self, ctx: &PartialEqWithEnginesContext) -> bool {
+        let type_engine = ctx.engines().te();
         self.name == other.name
-            && self.body.eq(&other.body, engines)
+            && self.body.eq(&other.body, ctx)
             && self.mutability == other.mutability
             && type_engine
                 .get(self.return_type)
-                .eq(&type_engine.get(other.return_type), engines)
-            && self.type_ascription.eq(&other.type_ascription, engines)
+                .eq(&type_engine.get(other.return_type), ctx)
+            && self.type_ascription.eq(&other.type_ascription, ctx)
     }
 }
 
@@ -46,17 +65,9 @@ impl HashWithEngines for TyVariableDecl {
 }
 
 impl SubstTypes for TyVariableDecl {
-    fn subst_inner(&mut self, type_mapping: &TypeSubstMap, engines: &Engines) {
-        self.return_type.subst(type_mapping, engines);
-        self.type_ascription.subst(type_mapping, engines);
-        self.body.subst(type_mapping, engines)
-    }
-}
-
-impl ReplaceSelfType for TyVariableDecl {
-    fn replace_self_type(&mut self, engines: &Engines, self_type: TypeId) {
-        self.return_type.replace_self_type(engines, self_type);
-        self.type_ascription.replace_self_type(engines, self_type);
-        self.body.replace_self_type(engines, self_type)
+    fn subst_inner(&mut self, ctx: &SubstTypesContext) -> HasChanges {
+        self.return_type.subst(ctx);
+        self.type_ascription.subst(ctx);
+        self.body.subst(ctx)
     }
 }

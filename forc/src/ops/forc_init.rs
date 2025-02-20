@@ -1,7 +1,7 @@
 use crate::cli::InitCommand;
 use crate::utils::{defaults, program_type::ProgramType};
 use anyhow::Context;
-use forc_util::{forc_result_bail, validate_name, ForcResult};
+use forc_util::{forc_result_bail, validate_project_name, ForcResult};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,10 +16,11 @@ enum InitType {
 
 fn print_welcome_message() {
     let read_the_docs = format!(
-        "Read the Docs:\n- {}\n- {}\n- {}",
-        "Sway Book: https://fuellabs.github.io/sway/latest",
-        "Rust SDK Book: https://fuellabs.github.io/fuels-rs/latest",
-        "TypeScript SDK: https://fuellabs.github.io/fuels-ts/"
+        "Read the Docs:\n- {}\n- {}\n- {}\n- {}",
+        "Sway Book: https://docs.fuel.network/docs/sway",
+        "Forc Book: https://docs.fuel.network/docs/forc",
+        "Rust SDK Book: https://docs.fuel.network/docs/fuels-rs",
+        "TypeScript SDK: https://docs.fuel.network/docs/fuels-ts"
     );
 
     let join_the_community = format!(
@@ -77,7 +78,7 @@ pub fn init(command: InitCommand) -> ForcResult<()> {
             .into_owned(),
     };
 
-    validate_name(&project_name, "project name")?;
+    validate_project_name(&project_name)?;
 
     let init_type = match (
         command.contract,
@@ -159,7 +160,6 @@ pub fn init(command: InitCommand) -> ForcResult<()> {
     let gitignore_path = Path::new(&project_dir).join(".gitignore");
     // Append to existing gitignore if it exists otherwise create a new one.
     let mut gitignore_file = fs::OpenOptions::new()
-        .write(true)
         .append(true)
         .create(true)
         .open(&gitignore_path)?;
