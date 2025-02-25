@@ -1,10 +1,8 @@
 use crate::{error::CompileError, warning::CompileWarning};
-use std::collections::HashMap;
-
 use core::cell::RefCell;
 
 /// A handler with which you can emit diagnostics.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Handler {
     /// The inner handler.
     /// This construction is used to avoid `&mut` all over the compiler.
@@ -13,7 +11,7 @@ pub struct Handler {
 
 /// Contains the actual data for `Handler`.
 /// Modelled this way to afford an API using interior mutability.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct HandlerInner {
     /// The sink through which errors will be emitted.
     errors: Vec<CompileError>,
@@ -34,6 +32,11 @@ impl Handler {
         ErrorEmitted { _priv: () }
     }
 
+    // Compilation should be cancelled.
+    pub fn cancel(&self) -> ErrorEmitted {
+        ErrorEmitted { _priv: () }
+    }
+
     /// Emit the warning `warn`.
     pub fn emit_warn(&self, warn: CompileWarning) {
         self.inner.borrow_mut().warnings.push(warn);
@@ -41,6 +44,10 @@ impl Handler {
 
     pub fn has_errors(&self) -> bool {
         !self.inner.borrow().errors.is_empty()
+    }
+
+    pub fn find_error(&self, f: impl FnMut(&&CompileError) -> bool) -> Option<CompileError> {
+        self.inner.borrow().errors.iter().find(f).cloned()
     }
 
     pub fn has_warnings(&self) -> bool {
@@ -64,7 +71,7 @@ impl Handler {
         }
     }
 
-    /// Extract all the errors from this handler.
+    /// Extract all the warnings and errors from this handler.
     pub fn consume(self) -> (Vec<CompileError>, Vec<CompileWarning>) {
         let inner = self.inner.into_inner();
         (inner.errors, inner.warnings)
@@ -85,10 +92,41 @@ impl Handler {
         inner.errors = dedup_unsorted(inner.errors.clone());
         inner.warnings = dedup_unsorted(inner.warnings.clone());
     }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` for which `f(&e)` returns `false`.
+    /// This method operates in place, visiting each element exactly once in the
+    /// original order, and preserves the order of the retained elements.
+    pub fn retain_err<F>(&self, f: F)
+    where
+        F: FnMut(&CompileError) -> bool,
+    {
+        self.inner.borrow_mut().errors.retain(f)
+    }
+
+    // Map all errors from `other` into this handler. If any mapping returns `None` it is ignored. This
+    // method returns if any error was mapped or not.
+    pub fn map_and_emit_errors_from(
+        &self,
+        other: Handler,
+        mut f: impl FnMut(CompileError) -> Option<CompileError>,
+    ) -> Result<(), ErrorEmitted> {
+        let mut emitted = Ok(());
+
+        let (errs, _) = other.consume();
+        for err in errs {
+            if let Some(err) = (f)(err) {
+                emitted = Err(self.emit_err(err));
+            }
+        }
+
+        emitted
+    }
 }
 
 /// Proof that an error was emitted through a `Handler`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ErrorEmitted {
     _priv: (),
 }
@@ -98,37 +136,10 @@ pub struct ErrorEmitted {
 /// Stdlib dedup in Rust assumes sorted data for efficiency, but we don't want that.
 /// A hash set would also mess up the order, so this is just a brute force way of doing it
 /// with a vector.
-fn dedup_unsorted<T: PartialEq + std::hash::Hash>(mut data: Vec<T>) -> Vec<T> {
-    // TODO(Centril): Consider using `IndexSet` instead for readability.
-    use smallvec::SmallVec;
-    use std::collections::hash_map::{DefaultHasher, Entry};
-    use std::hash::Hasher;
+fn dedup_unsorted<T: PartialEq + std::hash::Hash + Clone + Eq>(mut data: Vec<T>) -> Vec<T> {
+    use std::collections::HashSet;
 
-    let mut write_index = 0;
-    let mut indexes: HashMap<u64, SmallVec<[usize; 1]>> = HashMap::with_capacity(data.len());
-    for read_index in 0..data.len() {
-        let hash = {
-            let mut hasher = DefaultHasher::new();
-            data[read_index].hash(&mut hasher);
-            hasher.finish()
-        };
-        let index_vec = match indexes.entry(hash) {
-            Entry::Occupied(oe) => {
-                if oe
-                    .get()
-                    .iter()
-                    .any(|index| data[*index] == data[read_index])
-                {
-                    continue;
-                }
-                oe.into_mut()
-            }
-            Entry::Vacant(ve) => ve.insert(SmallVec::new()),
-        };
-        data.swap(write_index, read_index);
-        index_vec.push(write_index);
-        write_index += 1;
-    }
-    data.truncate(write_index);
+    let mut seen = HashSet::new();
+    data.retain(|item| seen.insert(item.clone()));
     data
 }

@@ -2,11 +2,13 @@ use crate::{
     block::Block, AnalysisResult, AnalysisResultT, AnalysisResults, BranchToWithArgs, Context,
     Function, IrError, Pass, PassMutability, ScopedPass,
 };
+use indexmap::IndexSet;
 /// Dominator tree and related algorithms.
 /// The algorithms implemented here are from the paper
 // "A Simple, Fast Dominance Algorithm" -- Keith D. Cooper, Timothy J. Harvey, and Ken Kennedy.
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt::Write;
+use sway_types::{FxIndexMap, FxIndexSet};
 
 /// Represents a node in the dominator tree.
 pub struct DomTreeNode {
@@ -26,11 +28,12 @@ impl DomTreeNode {
 }
 
 // The dominator tree is represented by mapping each Block to its DomTreeNode.
-pub type DomTree = FxHashMap<Block, DomTreeNode>;
+#[derive(Default)]
+pub struct DomTree(FxIndexMap<Block, DomTreeNode>);
 impl AnalysisResultT for DomTree {}
 
 // Dominance frontier sets.
-pub type DomFronts = FxHashMap<Block, FxHashSet<Block>>;
+pub type DomFronts = FxIndexMap<Block, FxIndexSet<Block>>;
 impl AnalysisResultT for DomFronts {}
 
 /// Post ordering of blocks in the CFG.
@@ -118,11 +121,11 @@ fn compute_dom_tree(
     let entry = function.get_entry_block(context);
 
     // This is to make the algorithm happy. It'll be changed to None later.
-    dom_tree.insert(entry, DomTreeNode::new(Some(entry)));
+    dom_tree.0.insert(entry, DomTreeNode::new(Some(entry)));
     // initialize the dominators tree. This allows us to do dom_tree[b] fearlessly.
     // Note that we just previously initialized "entry", so we skip that here.
     for b in po.po_to_block.iter().take(po.po_to_block.len() - 1) {
-        dom_tree.insert(*b, DomTreeNode::new(None));
+        dom_tree.0.insert(*b, DomTreeNode::new(None));
     }
     let mut changed = true;
 
@@ -137,7 +140,7 @@ fn compute_dom_tree(
                     // "p" may not be reachable, and hence not in dom_tree.
                     po.block_to_po
                         .get(p)
-                        .map_or(false, |p_po| *p_po > po.block_to_po[b])
+                        .is_some_and(|p_po| *p_po > po.block_to_po[b])
                 })
                 .cloned()
                 .unwrap();
@@ -147,12 +150,12 @@ fn compute_dom_tree(
                 .pred_iter(context)
                 .filter(|p| **p != picked_pred && po.block_to_po.contains_key(p))
             {
-                if dom_tree[p].parent.is_some() {
+                if dom_tree.0[p].parent.is_some() {
                     // if doms[p] already calculated
                     new_idom = intersect(po, &dom_tree, *p, new_idom);
                 }
             }
-            let b_node = dom_tree.get_mut(b).unwrap();
+            let b_node = dom_tree.0.get_mut(b).unwrap();
             match b_node.parent {
                 Some(idom) if idom == new_idom => {}
                 _ => {
@@ -173,35 +176,60 @@ fn compute_dom_tree(
     ) -> Block {
         while finger1 != finger2 {
             while po.block_to_po[&finger1] < po.block_to_po[&finger2] {
-                finger1 = dom_tree[&finger1].parent.unwrap();
+                finger1 = dom_tree.0[&finger1].parent.unwrap();
             }
             while po.block_to_po[&finger2] < po.block_to_po[&finger1] {
-                finger2 = dom_tree[&finger2].parent.unwrap();
+                finger2 = dom_tree.0[&finger2].parent.unwrap();
             }
         }
         finger1
     }
 
     // Fix the root.
-    dom_tree.get_mut(&entry).unwrap().parent = None;
+    dom_tree.0.get_mut(&entry).unwrap().parent = None;
     // Build the children.
     let child_parent: Vec<_> = dom_tree
+        .0
         .iter()
         .filter_map(|(n, n_node)| n_node.parent.map(|n_parent| (*n, n_parent)))
         .collect();
     for (child, parent) in child_parent {
-        dom_tree.get_mut(&parent).unwrap().children.push(child);
+        dom_tree.0.get_mut(&parent).unwrap().children.push(child);
     }
 
     Ok(Box::new(dom_tree))
 }
 
-pub const DOMFRONTS_NAME: &str = "dominance_frontiers";
+impl DomTree {
+    /// Does `dominator` dominate `dominatee`?
+    pub fn dominates(&self, dominator: Block, dominatee: Block) -> bool {
+        let mut node_opt = Some(dominatee);
+        while let Some(node) = node_opt {
+            if node == dominator {
+                return true;
+            }
+            node_opt = self.0[&node].parent;
+        }
+        false
+    }
+
+    /// Get an iterator over the children nodes
+    pub fn children(&self, node: Block) -> impl Iterator<Item = Block> + '_ {
+        self.0[&node].children.iter().cloned()
+    }
+
+    /// Get i'th child of a given node
+    pub fn child(&self, node: Block, i: usize) -> Option<Block> {
+        self.0[&node].children.get(i).cloned()
+    }
+}
+
+pub const DOM_FRONTS_NAME: &str = "dominance-frontiers";
 
 pub fn create_dom_fronts_pass() -> Pass {
     Pass {
-        name: DOMFRONTS_NAME,
-        descr: "Dominator frontiers computation",
+        name: DOM_FRONTS_NAME,
+        descr: "Dominance frontiers computation",
         deps: vec![DOMINATORS_NAME],
         runner: ScopedPass::FunctionPass(PassMutability::Analysis(compute_dom_fronts)),
     }
@@ -215,23 +243,23 @@ fn compute_dom_fronts(
 ) -> Result<AnalysisResult, IrError> {
     let dom_tree: &DomTree = analyses.get_analysis_result(function);
     let mut res = DomFronts::default();
-    for (b, _) in dom_tree.iter() {
-        res.insert(*b, FxHashSet::default());
+    for (b, _) in dom_tree.0.iter() {
+        res.insert(*b, IndexSet::default());
     }
 
     // for all nodes, b
-    for (b, _) in dom_tree.iter() {
+    for (b, _) in dom_tree.0.iter() {
         // if the number of predecessors of b >= 2
         if b.num_predecessors(context) > 1 {
             // unwrap() is safe as b is not "entry", and hence must have idom.
-            let b_idom = dom_tree[b].parent.unwrap();
+            let b_idom = dom_tree.0[b].parent.unwrap();
             // for all (reachable) predecessors, p, of b
-            for p in b.pred_iter(context).filter(|p| dom_tree.contains_key(p)) {
+            for p in b.pred_iter(context).filter(|&p| dom_tree.0.contains_key(p)) {
                 let mut runner = *p;
                 while runner != b_idom {
                     // add b to runner’s dominance frontier set
                     res.get_mut(&runner).unwrap().insert(*b);
-                    runner = dom_tree[&runner].parent.unwrap();
+                    runner = dom_tree.0[&runner].parent.unwrap();
                 }
             }
         }
@@ -242,7 +270,7 @@ fn compute_dom_fronts(
 /// Print dominator tree in the graphviz dot format.
 pub fn print_dot(context: &Context, func_name: &str, dom_tree: &DomTree) -> String {
     let mut res = format!("digraph {func_name} {{\n");
-    for (b, idom) in dom_tree.iter() {
+    for (b, idom) in dom_tree.0.iter() {
         if let Some(idom) = idom.parent {
             let _ = writeln!(
                 res,

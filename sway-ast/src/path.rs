@@ -30,7 +30,7 @@ impl Spanned for PathExpr {
             Some((_, path_expr_segment)) => path_expr_segment.span(),
             None => self.prefix.span(),
         };
-        Span::join(start, end)
+        Span::join(start, &end)
     }
 }
 
@@ -51,7 +51,7 @@ impl Spanned for PathExprSegment {
     fn span(&self) -> Span {
         let start = self.name.span();
         match &self.generics_opt {
-            Some((_, generic_args)) => Span::join(start, generic_args.span()),
+            Some((_, generic_args)) => Span::join(start, &generic_args.span()),
             None => start,
         }
     }
@@ -72,6 +72,14 @@ impl PathType {
             .last()
             .unwrap_or(&self.prefix)
     }
+
+    pub fn last_segment_mut(&mut self) -> &mut PathTypeSegment {
+        self.suffix
+            .iter_mut()
+            .map(|s| &mut s.1)
+            .last()
+            .unwrap_or(&mut self.prefix)
+    }
 }
 
 impl Spanned for PathType {
@@ -87,7 +95,7 @@ impl Spanned for PathType {
             Some((_, path_type_segment)) => path_type_segment.span(),
             None => self.prefix.span(),
         };
-        Span::join(start, end)
+        Span::join(start, &end)
     }
 }
 
@@ -101,7 +109,7 @@ impl Spanned for PathTypeSegment {
     fn span(&self) -> Span {
         let start = self.name.span();
         match &self.generics_opt {
-            Some((_, generic_args)) => Span::join(start, generic_args.span()),
+            Some((_, generic_args)) => Span::join(start, &generic_args.span()),
             None => start,
         }
     }
@@ -110,5 +118,5 @@ impl Spanned for PathTypeSegment {
 #[derive(Clone, Debug, Serialize)]
 pub struct QualifiedPathRoot {
     pub ty: Box<Ty>,
-    pub as_trait: Option<(AsToken, Box<PathType>)>,
+    pub as_trait: (AsToken, Box<PathType>),
 }

@@ -1,28 +1,25 @@
-use anyhow::anyhow;
 use clap::Parser;
+use forc_util::bytecode::parse_bytecode_to_instructions;
 use forc_util::ForcResult;
-use std::fs::{self, File};
-use std::io::Read;
 use term_table::row::Row;
 use term_table::table_cell::{Alignment, TableCell};
 use tracing::info;
 
+forc_util::cli_examples! {
+    crate::cli::Opt {
+        [Parse bytecode => "forc parse-bytecode <PATH>"]
+    }
+}
+
 /// Parse bytecode file into a debug format.
 #[derive(Debug, Parser)]
+#[clap(bin_name = "forc parse-bytecode", version, after_help = help())]
 pub(crate) struct Command {
     file_path: String,
 }
 
 pub(crate) fn exec(command: Command) -> ForcResult<()> {
-    let mut f = File::open(&command.file_path)
-        .map_err(|_| anyhow!("{}: file not found", command.file_path))?;
-    let metadata = fs::metadata(&command.file_path)
-        .map_err(|_| anyhow!("{}: file not found", command.file_path))?;
-    let mut buffer = vec![0; metadata.len() as usize];
-    f.read_exact(&mut buffer).expect("buffer overflow");
-
-    let instructions = fuel_asm::from_bytes(buffer.iter().cloned())
-        .zip(buffer.chunks(fuel_asm::Instruction::SIZE));
+    let instructions = parse_bytecode_to_instructions(&command.file_path)?;
 
     let mut table = term_table::Table::new();
     table.separate_rows = false;
@@ -52,10 +49,21 @@ pub(crate) fn exec(command: Command) -> ForcResult<()> {
                     parsed_raw
                 )
             }
+            Err(fuel_asm::InvalidOpcode) if word_ix == 4 || word_ix == 5 => {
+                let parsed_raw = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                format!(
+                    "configurables offset {} ({})",
+                    if word_ix == 4 { "lo" } else { "hi" },
+                    parsed_raw
+                )
+            }
             Ok(_) | Err(fuel_asm::InvalidOpcode) => "".into(),
         };
         table.add_row(Row::new(vec![
-            TableCell::new_with_alignment(word_ix, 1, Alignment::Right),
+            TableCell::builder(word_ix)
+                .col_span(1)
+                .alignment(Alignment::Right)
+                .build(),
             TableCell::new(word_ix * 4),
             TableCell::new(match result {
                 Ok(inst) => format!("{inst:?}"),

@@ -1,13 +1,24 @@
+use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
+use sway_types::{BaseIdent, Ident, Span};
 
-use sway_types::{Ident, Span};
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct AsmOp {
     pub(crate) op_name: Ident,
     pub(crate) op_args: Vec<Ident>,
     pub(crate) span: Span,
     pub(crate) immediate: Option<Ident>,
+}
+
+impl AsmOp {
+    pub fn retd(ptr: BaseIdent, len: BaseIdent) -> Self {
+        AsmOp {
+            op_name: Ident::new_no_span("retd".to_string()),
+            op_args: vec![ptr, len],
+            span: Span::dummy(),
+            immediate: None,
+        }
+    }
 }
 
 impl Hash for AsmOp {
@@ -32,7 +43,7 @@ impl PartialEq for AsmOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AsmRegister {
     pub(crate) name: String,
 }

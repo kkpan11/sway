@@ -1,8 +1,16 @@
-use crate::core::token::{self, Token, TypedAstToken};
-use dashmap::DashMap;
+use crate::core::token::{self, Token, TokenIdent, TypedAstToken};
+use dashmap::{
+    mapref::{
+        multiple::RefMulti,
+        one::{Ref, RefMut},
+    },
+    try_result::TryResult,
+    DashMap,
+};
 use lsp_types::{Position, Url};
-use sway_core::{language::ty, type_system::TypeId, Engines};
-use sway_types::{Ident, SourceEngine, Span, Spanned};
+use std::{path::PathBuf, thread, time::Duration};
+use sway_core::{engine_threading::SpannedWithEngines, language::ty, type_system::TypeId, Engines};
+use sway_types::Ident;
 
 // Re-export the TokenMapExt trait.
 pub use crate::core::token_map_ext::TokenMapExt;
@@ -11,35 +19,67 @@ pub use crate::core::token_map_ext::TokenMapExt;
 /// It stores all of the tokens that have been parsed and typechecked by the sway compiler.
 ///
 /// The TokenMap is a wrapper around a [DashMap], which is a concurrent HashMap.
-#[derive(Debug)]
-pub struct TokenMap(DashMap<(Ident, Span), Token>);
+#[derive(Debug, Default)]
+pub struct TokenMap(DashMap<TokenIdent, Token>);
 
-impl TokenMap {
+impl<'a> TokenMap {
     /// Create a new token map.
     pub fn new() -> TokenMap {
-        TokenMap(DashMap::new())
+        TokenMap(DashMap::with_capacity(2048))
     }
 
-    /// Create a custom iterator for the TokenMap.
-    ///
-    /// The iterator returns ([Ident], [Token]) pairs.
-    pub fn iter(&self) -> TokenMapIter {
-        TokenMapIter {
-            inner_iter: self.0.iter(),
+    /// Attempts to get a mutable reference to a token with retries on lock.
+    /// Retries up to 14 times with increasing backoff (1ns, 10ns, 100ns, 500ns, 1µs, 10µs, 100µs, 1ms, 10ms, 50ms, 100ms, 200ms, 500ms, 1s).
+    pub fn try_get_mut_with_retry(
+        &'a self,
+        ident: &TokenIdent,
+    ) -> Option<RefMut<'a, TokenIdent, Token>> {
+        const MAX_RETRIES: usize = 14;
+        let backoff_times = [
+            1,
+            10,
+            100,
+            500,
+            1_000,
+            10_000,
+            100_000,
+            1_000_000,
+            10_000_000,
+            50_000_000,
+            100_000_000,
+            200_000_000,
+            500_000_000,
+            1_000_000_000,
+        ]; // Backoff times in nanoseconds
+        for sleep in backoff_times.iter().take(MAX_RETRIES) {
+            match self.try_get_mut(ident) {
+                TryResult::Present(token) => return Some(token),
+                TryResult::Absent => return None,
+                TryResult::Locked => {
+                    // Wait for the specified backoff time before retrying
+                    let backoff_time = Duration::from_nanos(*sleep);
+                    thread::sleep(backoff_time);
+                }
+            }
         }
+        tracing::error!(
+            "Failed to get token after {} retries: {:#?}",
+            MAX_RETRIES,
+            ident
+        );
+        None // Return None if all retries are exhausted
     }
 
     /// Return an Iterator of tokens belonging to the provided [Url].
     pub fn tokens_for_file<'s>(
         &'s self,
-        source_engine: &'s SourceEngine,
         uri: &'s Url,
-    ) -> impl 's + Iterator<Item = (Ident, Token)> {
-        self.iter().flat_map(|(ident, token)| {
-            ident.span().source_id().and_then(|source_id| {
-                let path = source_engine.get_path(source_id);
+    ) -> impl Iterator<Item = RefMulti<'s, TokenIdent, Token>> + 's {
+        self.iter().filter_map(move |entry| {
+            let ident_path = entry.key().path.clone();
+            ident_path.as_ref().and_then(|path| {
                 if path.to_str() == Some(uri.path()) {
-                    Some((ident.clone(), token.clone()))
+                    Some(entry)
                 } else {
                     None
                 }
@@ -47,19 +87,39 @@ impl TokenMap {
         })
     }
 
-    /// Given a cursor [Position], return the [Ident] of a token in the
+    /// Return an Iterator of tokens matching the given name.
+    pub fn tokens_for_name<'s>(
+        &'s self,
+        name: &'s String,
+    ) -> impl Iterator<Item = RefMulti<'s, TokenIdent, Token>> + 's {
+        self.iter().filter_map(move |entry| {
+            let ident = entry.key();
+            if &ident.name == name {
+                Some(entry)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Given a cursor [Position], return the [TokenIdent] of a token in the
     /// Iterator if one exists at that position.
-    pub fn idents_at_position<I>(&self, cursor_position: Position, tokens: I) -> Vec<Ident>
+    pub fn idents_at_position<'s, I>(
+        &'s self,
+        cursor_position: Position,
+        tokens: I,
+    ) -> Vec<TokenIdent>
     where
-        I: Iterator<Item = (Ident, Token)>,
+        I: Iterator<Item = RefMulti<'s, TokenIdent, Token>>,
     {
         tokens
-            .filter_map(|(ident, _)| {
-                let range = token::get_range_from_span(&ident.span());
-                if cursor_position >= range.start && cursor_position <= range.end {
-                    return Some(ident);
+            .filter_map(|entry| {
+                let ident = entry.key();
+                if cursor_position >= ident.range.start && cursor_position <= ident.range.end {
+                    Some(ident.clone())
+                } else {
+                    None
                 }
-                None
             })
             .collect()
     }
@@ -67,17 +127,18 @@ impl TokenMap {
     /// Returns the first parent declaration found at the given cursor position.
     ///
     /// For example, if the cursor is inside a function body, this function returns the function declaration.
-    pub fn parent_decl_at_position(
-        &self,
-        source_engine: &SourceEngine,
-        uri: &Url,
+    pub fn parent_decl_at_position<'s>(
+        &'s self,
+        engines: &'s Engines,
+        uri: &'s Url,
         position: Position,
-    ) -> Option<(Ident, Token)> {
-        self.tokens_at_position(source_engine, uri, position, None)
-            .iter()
-            .find_map(|(ident, token)| {
-                if let Some(TypedAstToken::TypedDeclaration(_)) = token.typed {
-                    Some((ident.clone(), token.clone()))
+    ) -> Option<RefMulti<'s, TokenIdent, Token>> {
+        self.tokens_at_position(engines, uri, position, None)
+            .into_iter()
+            .find_map(|entry| {
+                let (_, token) = entry.pair();
+                if let Some(TypedAstToken::TypedDeclaration(_)) = &token.as_typed() {
+                    Some(entry)
                 } else {
                     None
                 }
@@ -85,23 +146,15 @@ impl TokenMap {
     }
 
     /// Returns the first collected tokens that is at the cursor position.
-    pub fn token_at_position(
-        &self,
-        source_engine: &SourceEngine,
-        uri: &Url,
+    pub fn token_at_position<'s>(
+        &'s self,
+        uri: &'s Url,
         position: Position,
-    ) -> Option<(Ident, Token)> {
-        let tokens = self.tokens_for_file(source_engine, uri);
+    ) -> Option<Ref<'s, TokenIdent, Token>> {
+        let tokens = self.tokens_for_file(uri);
         self.idents_at_position(position, tokens)
             .first()
-            .and_then(|ident| {
-                self.try_get(&token::to_ident_key(ident))
-                    .try_unwrap()
-                    .map(|item| {
-                        let ((ident, _), token) = item.pair();
-                        (ident.clone(), token.clone())
-                    })
-            })
+            .and_then(|ident| self.try_get(ident).try_unwrap())
     }
 
     /// Returns all collected tokens that are at the given [Position] in the file.
@@ -111,44 +164,40 @@ impl TokenMap {
     /// just the spans of the token idents. For example, if we want to find out what function declaration
     /// the cursor is inside of, we need to search the body of the function declaration, not just the ident
     /// of the function declaration (the function name).
-    pub fn tokens_at_position(
-        &self,
-        source_engine: &SourceEngine,
-        uri: &Url,
+    pub fn tokens_at_position<'s>(
+        &'s self,
+        engines: &'s Engines,
+        uri: &'s Url,
         position: Position,
         functions_only: Option<bool>,
-    ) -> Vec<(Ident, Token)> {
-        self.tokens_for_file(source_engine, uri)
-            .filter_map(|(ident, token)| {
-                let span = match token.typed {
+    ) -> Vec<RefMulti<'s, TokenIdent, Token>> {
+        let source_engine = engines.se();
+        self.tokens_for_file(uri)
+            .filter_map(move |entry| {
+                let (ident, token) = entry.pair();
+                let token_ident = match &token.as_typed() {
                     Some(TypedAstToken::TypedFunctionDeclaration(decl))
                         if functions_only == Some(true) =>
                     {
-                        decl.span()
+                        TokenIdent::new(&Ident::new(decl.span.clone()), source_engine)
                     }
-                    Some(TypedAstToken::TypedDeclaration(decl)) => decl.span(),
-                    _ => ident.span(),
+                    Some(TypedAstToken::TypedDeclaration(decl)) => {
+                        TokenIdent::new(&Ident::new(decl.span(engines)), source_engine)
+                    }
+                    _ => ident.clone(),
                 };
-                let range = token::get_range_from_span(&span);
-                if position >= range.start && position <= range.end {
-                    return self
-                        .try_get(&token::to_ident_key(&ident))
-                        .try_unwrap()
-                        .map(|item| {
-                            let ((ident, _), token) = item.pair();
-                            (ident.clone(), token.clone())
-                        });
-                }
-                None
-            })
-            .filter_map(|(ident, token)| {
-                if functions_only == Some(true) {
-                    if let Some(TypedAstToken::TypedFunctionDeclaration(_)) = token.typed {
-                        return Some((ident, token));
+                if position >= token_ident.range.start && position <= token_ident.range.end {
+                    if functions_only == Some(true) {
+                        if let Some(TypedAstToken::TypedFunctionDeclaration(_)) = &token.as_typed()
+                        {
+                            return Some(entry);
+                        }
+                        return None;
                     }
-                    return None;
+                    Some(entry)
+                } else {
+                    None
                 }
-                Some((ident, token))
             })
             .collect()
     }
@@ -163,9 +212,9 @@ impl TokenMap {
         type_id: &TypeId,
     ) -> Option<ty::TyDecl> {
         token::ident_of_type_id(engines, type_id)
-            .and_then(|decl_ident| self.try_get(&token::to_ident_key(&decl_ident)).try_unwrap())
+            .and_then(|decl_ident| self.try_get(&decl_ident).try_unwrap())
             .map(|item| item.value().clone())
-            .and_then(|token| token.typed)
+            .and_then(|token| token.as_typed().cloned())
             .and_then(|typed_token| match typed_token {
                 TypedAstToken::TypedDeclaration(dec) => Some(dec),
                 _ => None,
@@ -182,37 +231,22 @@ impl TokenMap {
         self.declaration_of_type_id(engines, type_id)
             .and_then(|decl| match decl {
                 ty::TyDecl::StructDecl(ty::StructDecl { decl_id, .. }) => {
-                    Some(engines.de().get_struct(&decl_id))
+                    Some((*engines.de().get_struct(&decl_id)).clone())
                 }
                 _ => None,
             })
     }
-}
 
-impl std::ops::Deref for TokenMap {
-    type Target = DashMap<(Ident, Span), Token>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    /// Remove all tokens for the given file from the token map.
+    pub fn remove_tokens_for_file(&self, path_to_remove: &PathBuf) {
+        self.0
+            .retain(|key, _value| (key.path.as_ref() != Some(path_to_remove)));
     }
 }
 
-/// A custom iterator for [TokenMap] that yields [Ident] and [Token] pairs.
-///
-/// This iterator skips the [Span] information when iterating over the items in the [TokenMap].
-pub struct TokenMapIter<'s> {
-    inner_iter: dashmap::iter::Iter<'s, (Ident, Span), Token>,
-}
-
-impl<'s> Iterator for TokenMapIter<'s> {
-    type Item = (Ident, Token);
-
-    /// Returns the next (Ident, Token) pair in the [TokenMap], skipping the [Span].
-    ///
-    /// If there are no more items, returns `None`.
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner_iter.next().map(|item| {
-            let ((ident, _), token) = item.pair();
-            (ident.clone(), token.clone())
-        })
+impl std::ops::Deref for TokenMap {
+    type Target = DashMap<TokenIdent, Token>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

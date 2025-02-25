@@ -3,36 +3,32 @@ use fuel_vm::fuel_tx;
 use fuel_vm::fuel_tx::{Address, AssetId, Output};
 use fuels::{
     accounts::wallet::{Wallet, WalletUnlocked},
-    core::codec::ABIEncoder,
+    core::codec::{ABIEncoder, EncoderConfig},
     prelude::*,
-    test_helpers::Config,
-    types::{
-        input::Input,
-        transaction_builders::{ScriptTransactionBuilder, TransactionBuilder},
-        unresolved_bytes::UnresolvedBytes,
-        Token,
-    },
+    types::{input::Input, transaction_builders::ScriptTransactionBuilder, Token},
 };
 use std::str::FromStr;
 
 async fn setup() -> (Vec<u8>, Address, WalletUnlocked, u64, AssetId) {
     let predicate_code =
-        std::fs::read("test_projects/predicate_data_struct/out/debug/predicate_data_struct.bin")
+        std::fs::read("test_projects/predicate_data_struct/out/release/predicate_data_struct.bin")
             .unwrap();
-    let config = Config {
-        utxo_validation: true,
-        ..Config::local_node()
-    };
-    let predicate_address =
-        fuel_tx::Input::predicate_owner(&predicate_code, &config.chain_conf.transaction_parameters.chain_id);
+    let predicate_address = fuel_tx::Input::predicate_owner(&predicate_code);
 
-    let wallets =
-        launch_custom_provider_and_get_wallets(WalletsConfig::default(), Some(config), None).await;
-
+    let mut node_config = NodeConfig::default();
+    node_config.starting_gas_price = 0;
+    let mut wallets = launch_custom_provider_and_get_wallets(
+        WalletsConfig::new(Some(1), None, None),
+        Some(node_config),
+        None,
+    )
+    .await
+    .unwrap();
+    let wallet = wallets.pop().unwrap();
     (
         predicate_code,
         predicate_address,
-        wallets[0].clone(),
+        wallet,
         1000,
         AssetId::default(),
     )
@@ -53,26 +49,19 @@ async fn create_predicate(
         .await
         .unwrap();
 
+    let provider = wallet.provider().unwrap();
     let output_coin = Output::coin(predicate_address, amount_to_predicate, asset_id);
     let output_change = Output::change(wallet.address().into(), 0, asset_id);
     let mut tx = ScriptTransactionBuilder::prepare_transfer(
         wallet_coins,
         vec![output_coin, output_change],
-        TxParameters::default()
-            .set_gas_price(1)
-            .set_gas_limit(1_000_000),
+        Default::default(),
     )
-    .set_script(op::ret(RegId::ONE).to_bytes().to_vec())
-    .build()
-    .unwrap();
+    .with_script(op::ret(RegId::ONE).to_bytes().to_vec());
 
-    wallet.sign_transaction(&mut tx).unwrap();
-    wallet
-        .provider()
-        .unwrap()
-        .send_transaction(&tx)
-        .await
-        .unwrap();
+    tx.add_signer(wallet.clone()).unwrap();
+    let tx = tx.build(provider).await.unwrap();
+    provider.send_transaction(tx).await.unwrap();
 }
 
 async fn submit_to_predicate(
@@ -82,21 +71,17 @@ async fn submit_to_predicate(
     amount_to_predicate: u64,
     asset_id: AssetId,
     receiver_address: Address,
-    predicate_data: UnresolvedBytes,
+    predicate_data: Vec<u8>,
 ) {
     let filter = ResourceFilter {
         from: predicate_address.into(),
-        asset_id,
+        asset_id: Some(asset_id),
         amount: amount_to_predicate,
         ..Default::default()
     };
+    let provider = wallet.provider().unwrap();
 
-    let utxo_predicate_hash = wallet
-        .provider()
-        .unwrap()
-        .get_spendable_resources(filter)
-        .await
-        .unwrap();
+    let utxo_predicate_hash = provider.get_spendable_resources(filter).await.unwrap();
 
     let mut inputs = vec![];
     let mut total_amount_in_predicate = 0;
@@ -113,18 +98,16 @@ async fn submit_to_predicate(
     let output_coin = Output::coin(receiver_address, total_amount_in_predicate, asset_id);
     let output_change = Output::change(predicate_address, 0, asset_id);
 
-    let params = wallet.provider().unwrap().consensus_parameters();
-    let mut new_tx = ScriptTransactionBuilder::prepare_transfer(
+    let new_tx = ScriptTransactionBuilder::prepare_transfer(
         inputs,
         vec![output_coin, output_change],
-        TxParameters::default().set_gas_limit(1_000_000),
+        Default::default(),
     )
-    .set_consensus_parameters(params)
-    .build()
+    .build(provider)
+    .await
     .unwrap();
-    new_tx.estimate_predicates(&params).unwrap();
 
-    let _call_result = wallet.provider().unwrap().send_transaction(&new_tx).await;
+    let _call_result = provider.send_transaction(new_tx).await;
 }
 
 async fn get_balance(wallet: &Wallet, address: Address, asset_id: AssetId) -> u64 {
@@ -141,12 +124,13 @@ struct Validation {
     total_complete: u64,
 }
 
-fn encode_struct(predicate_struct: Validation) -> UnresolvedBytes {
+fn encode_struct(predicate_struct: Validation) -> Vec<u8> {
     let has_account = Token::Bool(predicate_struct.has_account);
     let total_complete = Token::U64(predicate_struct.total_complete);
     let token_struct: Vec<Token> = vec![has_account, total_complete];
-    let predicate_data = ABIEncoder::encode(&token_struct).unwrap();
-    predicate_data
+    ABIEncoder::new(EncoderConfig::default())
+        .encode(&token_struct)
+        .unwrap()
 }
 
 #[tokio::test]

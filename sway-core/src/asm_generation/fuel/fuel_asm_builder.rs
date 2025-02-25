@@ -1,23 +1,30 @@
+use super::{
+    data_section::EntryName,
+    globals_section::GlobalsSection,
+    programs::{AbstractEntry, AbstractProgram},
+};
 use crate::{
     asm_generation::{
-        asm_builder::{AsmBuilder, AsmBuilderResult},
-        from_ir::{ir_type_size_in_bytes, StateAccessType, Storage},
+        asm_builder::AsmBuilder,
+        from_ir::{StateAccessType, Storage},
         fuel::{
             abstract_instruction_set::AbstractInstructionSet,
             compiler_constants,
             data_section::{DataId, DataSection, Entry},
             register_sequencer::RegisterSequencer,
         },
-        ProgramKind,
+        FinalizedAsm, ProgramKind,
     },
     asm_lang::{
         virtual_register::*, Label, Op, VirtualImmediate06, VirtualImmediate12, VirtualImmediate18,
-        VirtualOp, WideCmp,
+        VirtualOp, WideCmp, WideOperations,
     },
     decl_engine::DeclRefFunction,
     metadata::MetadataManager,
+    BuildConfig,
 };
 
+use fuel_vm::fuel_asm::Imm12;
 use sway_error::{
     error::CompileError,
     handler::{ErrorEmitted, Handler},
@@ -35,6 +42,12 @@ pub struct FuelAsmBuilder<'ir, 'eng> {
 
     // Data section is used by the rest of code gen to layout const memory.
     pub(super) data_section: DataSection,
+
+    // Globals will be allocated at SSP uninitialized (they will not be zeroed)
+    pub(super) globals_section: GlobalsSection,
+
+    // Maps configurable name to data id, only used by encoding v0
+    pub(super) configurable_v0_data_id: HashMap<String, DataId>,
 
     // Register sequencer dishes out new registers and labels.
     pub(super) reg_seqr: RegisterSequencer,
@@ -58,8 +71,8 @@ pub struct FuelAsmBuilder<'ir, 'eng> {
     // will usually have 0 or 1 entry.
     pub(super) return_ctxs: Vec<(Label, VirtualRegister)>,
 
-    // Stack size and base register for locals.
-    pub(super) locals_ctxs: Vec<(u64, VirtualRegister)>,
+    // Stack size and base register for locals and num_extra_args in any call in the function.
+    pub(super) locals_ctxs: Vec<(u64, VirtualRegister, u64)>,
 
     // IR context we're compiling.
     pub(super) context: &'ir Context<'eng>,
@@ -74,23 +87,101 @@ pub struct FuelAsmBuilder<'ir, 'eng> {
 
     // In progress VM bytecode ops.
     pub(super) cur_bytecode: Vec<Op>,
+
+    // Instructions that will be appended after globals allocation, but before the entry function is called.
+    pub(super) before_entries: Vec<Op>,
 }
 
-pub type FuelAsmBuilderResult = (
-    DataSection,
-    RegisterSequencer,
-    Vec<(
-        Function,
-        Label,
-        AbstractInstructionSet,
-        Option<DeclRefFunction>,
-    )>,
-    Vec<AbstractInstructionSet>,
-);
-
-impl<'ir, 'eng> AsmBuilder for FuelAsmBuilder<'ir, 'eng> {
+impl AsmBuilder for FuelAsmBuilder<'_, '_> {
     fn func_to_labels(&mut self, func: &Function) -> (Label, Label) {
         self.func_to_labels(func)
+    }
+
+    fn compile_configurable(&mut self, config: &ConfigContent) {
+        match config {
+            ConfigContent::V0 { name, constant, .. } => {
+                let entry = Entry::from_constant(
+                    self.context,
+                    constant.get_content(self.context),
+                    EntryName::Configurable(name.clone()),
+                    None,
+                );
+                let dataid = self.data_section.insert_data_value(entry);
+                self.configurable_v0_data_id.insert(name.clone(), dataid);
+            }
+            ConfigContent::V1 {
+                name,
+                ty,
+                encoded_bytes,
+                decode_fn,
+                ..
+            } => {
+                let size_in_bytes = ty.size(self.context).in_bytes();
+
+                self.globals_section.insert(name, size_in_bytes);
+                let global = self.globals_section.get_by_name(name).unwrap();
+
+                let (decode_fn_label, _) = self.func_label_map.get(&decode_fn.get()).unwrap();
+                let dataid = self.data_section.insert_data_value(Entry::new_byte_array(
+                    encoded_bytes.clone(),
+                    EntryName::Configurable(name.clone()),
+                    None,
+                ));
+
+                self.before_entries.push(Op {
+                    opcode: Either::Left(VirtualOp::AddrDataId(
+                        VirtualRegister::Constant(ConstantRegister::FuncArg0),
+                        dataid,
+                    )),
+                    comment: format!("get pointer to configurable {} default value", name),
+                    owning_span: None,
+                });
+
+                self.before_entries.push(Op {
+                    opcode: Either::Left(VirtualOp::ADDI(
+                        VirtualRegister::Constant(ConstantRegister::FuncArg1),
+                        VirtualRegister::Constant(ConstantRegister::Zero),
+                        VirtualImmediate12::new_unchecked(
+                            encoded_bytes.len() as u64,
+                            "Error representing encoded_bytes length as 12-bit immediate",
+                        ),
+                    )),
+                    comment: format!("get length of configurable {} default value", name),
+                    owning_span: None,
+                });
+
+                self.before_entries.push(Op {
+                    opcode: Either::Left(VirtualOp::ADDI(
+                        VirtualRegister::Constant(ConstantRegister::FuncArg2),
+                        VirtualRegister::Constant(ConstantRegister::StackStartPointer),
+                        VirtualImmediate12::new_unchecked(
+                            global.offset_in_bytes,
+                            "Error representing global offset as 12-bit immediate",
+                        ),
+                    )),
+                    comment: format!("get pointer to configurable {} stack address", name),
+                    owning_span: None,
+                });
+
+                // Set a new return address.
+                let ret_label = self.reg_seqr.get_label();
+                self.before_entries.push(Op::save_ret_addr(
+                    VirtualRegister::Constant(ConstantRegister::CallReturnAddress),
+                    ret_label,
+                    "set new return address",
+                    None,
+                ));
+
+                // call decode
+                self.before_entries.push(Op {
+                    opcode: Either::Right(crate::asm_lang::ControlFlowOp::Call(*decode_fn_label)),
+                    comment: format!("decode configurable {}", name),
+                    owning_span: None,
+                });
+
+                self.before_entries.push(Op::unowned_jump_label(ret_label));
+            }
+        }
     }
 
     fn compile_function(
@@ -101,8 +192,103 @@ impl<'ir, 'eng> AsmBuilder for FuelAsmBuilder<'ir, 'eng> {
         self.compile_function(handler, function)
     }
 
-    fn finalize(&self) -> AsmBuilderResult {
-        self.finalize()
+    fn finalize(
+        self,
+        handler: &Handler,
+        build_config: Option<&BuildConfig>,
+        fallback_fn: Option<Label>,
+    ) -> Result<FinalizedAsm, ErrorEmitted> {
+        let FuelAsmBuilder {
+            program_kind,
+            data_section,
+            globals_section,
+            reg_seqr,
+            context,
+            entries,
+            non_entries,
+            before_entries: before_entry,
+            ..
+        } = self;
+
+        let entries = entries
+            .clone()
+            .into_iter()
+            .map(|(f, l, ops, test_decl_ref)| (f, l, AbstractInstructionSet { ops }, test_decl_ref))
+            .collect::<Vec<_>>();
+
+        let non_entries = non_entries
+            .clone()
+            .into_iter()
+            .map(|ops| AbstractInstructionSet { ops })
+            .collect::<Vec<_>>();
+
+        let entries = entries
+            .into_iter()
+            .map(|(func, label, ops, test_decl_ref)| {
+                let selector = func.get_selector(context);
+                let name = func.get_name(context).to_string();
+                AbstractEntry {
+                    test_decl_ref,
+                    selector,
+                    label,
+                    ops,
+                    name,
+                }
+            })
+            .collect();
+
+        let before_entry = AbstractInstructionSet { ops: before_entry };
+
+        let virtual_abstract_program = AbstractProgram::new(
+            program_kind,
+            data_section,
+            globals_section,
+            before_entry,
+            entries,
+            non_entries,
+            reg_seqr,
+            context.experimental,
+        );
+
+        // Compiled dependencies will not have any content and we
+        // do not want to display their empty ASM structures.
+        // If printing ASM is requested, we want to emit the
+        // actual ASMs generated for the whole program.
+        let program_has_content = !virtual_abstract_program.is_empty();
+
+        if build_config
+            .map(|cfg| cfg.print_asm.virtual_abstract && program_has_content)
+            .unwrap_or(false)
+        {
+            println!(";; ASM: Virtual abstract program");
+            println!("{virtual_abstract_program}\n");
+        }
+
+        let allocated_program = virtual_abstract_program
+            .into_allocated_program(fallback_fn)
+            .map_err(|e| handler.emit_err(e))?;
+
+        if build_config
+            .map(|cfg| cfg.print_asm.allocated_abstract && program_has_content)
+            .unwrap_or(false)
+        {
+            println!(";; ASM: Allocated abstract program");
+            println!("{allocated_program}");
+        }
+
+        let final_program = allocated_program
+            .into_final_program()
+            .map_err(|e| handler.emit_err(e))?;
+
+        if build_config
+            .map(|cfg| cfg.print_asm.r#final && program_has_content)
+            .unwrap_or(false)
+        {
+            println!(";; ASM: Final program");
+            println!("{final_program}");
+        }
+
+        Ok(final_program.finalize())
     }
 }
 
@@ -116,6 +302,8 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         FuelAsmBuilder {
             program_kind,
             data_section,
+            globals_section: GlobalsSection::default(),
+            configurable_v0_data_id: HashMap::default(),
             reg_seqr,
             func_label_map: HashMap::new(),
             block_label_map: HashMap::new(),
@@ -129,26 +317,8 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             entries: Vec::new(),
             non_entries: Vec::new(),
             cur_bytecode: Vec::new(),
+            before_entries: vec![],
         }
-    }
-
-    pub fn finalize(&self) -> AsmBuilderResult {
-        AsmBuilderResult::Fuel((
-            self.data_section.clone(),
-            self.reg_seqr,
-            self.entries
-                .clone()
-                .into_iter()
-                .map(|(f, l, ops, test_decl_ref)| {
-                    (f, l, AbstractInstructionSet { ops }, test_decl_ref)
-                })
-                .collect(),
-            self.non_entries
-                .clone()
-                .into_iter()
-                .map(|ops| AbstractInstructionSet { ops })
-                .collect(),
-        ))
     }
 
     pub(super) fn compile_block(
@@ -171,7 +341,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 self.cur_bytecode.push(Op::register_move(
                     arg_reg.clone(),
                     phi_reg.clone(),
-                    "parameter from branch to block argument",
+                    "move parameter from branch to block argument",
                     None,
                 ));
             }
@@ -191,7 +361,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
     ) -> Result<(), ErrorEmitted> {
         let Some(instruction) = instr_val.get_instruction(self.context) else {
             return Err(handler.emit_err(CompileError::Internal(
-                "Value not an instruction.",
+                "Value is not an instruction.",
                 self.md_mgr
                     .val_to_span(self.context, *instr_val)
                     .unwrap_or_else(Span::dummy),
@@ -201,36 +371,36 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         // The only instruction whose compilation returns a Result itself is AsmBlock, which
         // we special-case here.  Ideally, the ASM block verification would happen much sooner,
         // perhaps during parsing.  https://github.com/FuelLabs/sway/issues/801
-        if let Instruction::AsmBlock(asm, args) = instruction {
+        if let InstOp::AsmBlock(asm, args) = &instruction.op {
             self.compile_asm_block(handler, instr_val, asm, args)
         } else {
             // These matches all return `Result<(), CompileError>`.
-            match instruction {
-                Instruction::AsmBlock(..) => unreachable!("Handled immediately above."),
-                Instruction::BitCast(val, ty) => self.compile_bitcast(instr_val, val, ty),
-                Instruction::UnaryOp { op, arg } => self.compile_unary_op(instr_val, op, arg),
-                Instruction::BinaryOp { op, arg1, arg2 } => {
+            match &instruction.op {
+                InstOp::AsmBlock(..) => unreachable!("Handled immediately above."),
+                InstOp::BitCast(val, ty) => self.compile_bitcast(instr_val, val, ty),
+                InstOp::UnaryOp { op, arg } => self.compile_unary_op(instr_val, op, arg),
+                InstOp::BinaryOp { op, arg1, arg2 } => {
                     self.compile_binary_op(instr_val, op, arg1, arg2)
                 }
-                Instruction::Branch(to_block) => self.compile_branch(to_block),
-                Instruction::Call(func, args) => self.compile_call(instr_val, func, args),
-                Instruction::CastPtr(val, _ty) => self.compile_no_op_move(instr_val, val),
-                Instruction::Cmp(pred, lhs_value, rhs_value) => {
+                InstOp::Branch(to_block) => self.compile_branch(to_block),
+                InstOp::Call(func, args) => self.compile_call(instr_val, func, args),
+                InstOp::CastPtr(val, _ty) => self.compile_no_op_move(instr_val, val),
+                InstOp::Cmp(pred, lhs_value, rhs_value) => {
                     self.compile_cmp(instr_val, pred, lhs_value, rhs_value)
                 }
-                Instruction::ConditionalBranch {
+                InstOp::ConditionalBranch {
                     cond_value,
                     true_block,
                     false_block,
                 } => self.compile_conditional_branch(cond_value, true_block, false_block),
-                Instruction::ContractCall {
+                InstOp::ContractCall {
                     params,
                     coins,
                     asset_id,
                     gas,
                     ..
                 } => self.compile_contract_call(instr_val, params, coins, asset_id, gas),
-                Instruction::FuelVm(fuel_vm_instr) => match fuel_vm_instr {
+                InstOp::FuelVm(fuel_vm_instr) => match fuel_vm_instr {
                     FuelVmInstruction::Gtf { index, tx_field_id } => {
                         self.compile_gtf(instr_val, index, *tx_field_id)
                     }
@@ -305,36 +475,37 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                         arg2,
                         arg3,
                     } => self.compile_wide_modular_op(instr_val, op, result, arg1, arg2, arg3),
+                    FuelVmInstruction::JmpMem => self.compile_jmp_mem(instr_val),
+                    FuelVmInstruction::Retd { ptr, len } => self.compile_retd(instr_val, ptr, len),
                 },
-                Instruction::GetElemPtr {
+                InstOp::GetElemPtr {
                     base,
                     elem_ptr_ty,
                     indices,
                 } => self.compile_get_elem_ptr(instr_val, base, elem_ptr_ty, indices),
-                Instruction::GetLocal(local_var) => self.compile_get_local(instr_val, local_var),
-                Instruction::IntToPtr(val, _) => self.compile_no_op_move(instr_val, val),
-                Instruction::Load(src_val) => self.compile_load(instr_val, src_val),
-                Instruction::MemCopyBytes {
+                InstOp::GetLocal(local_var) => self.compile_get_local(instr_val, local_var),
+                InstOp::GetConfig(_, name) => self.compile_get_config(instr_val, name),
+                InstOp::IntToPtr(val, _) => self.compile_no_op_move(instr_val, val),
+                InstOp::Load(src_val) => self.compile_load(instr_val, src_val),
+                InstOp::MemCopyBytes {
                     dst_val_ptr,
                     src_val_ptr,
                     byte_len,
                 } => self.compile_mem_copy_bytes(instr_val, dst_val_ptr, src_val_ptr, *byte_len),
-                Instruction::MemCopyVal {
+                InstOp::MemCopyVal {
                     dst_val_ptr,
                     src_val_ptr,
                 } => self.compile_mem_copy_val(instr_val, dst_val_ptr, src_val_ptr),
-                Instruction::Nop => Ok(()),
-                Instruction::PtrToInt(ptr_val, _int_ty) => {
-                    self.compile_no_op_move(instr_val, ptr_val)
-                }
-                Instruction::Ret(ret_val, ty) => {
+                InstOp::Nop => Ok(()),
+                InstOp::PtrToInt(ptr_val, _int_ty) => self.compile_no_op_move(instr_val, ptr_val),
+                InstOp::Ret(ret_val, ty) => {
                     if func_is_entry {
                         self.compile_ret_from_entry(instr_val, ret_val, ty)
                     } else {
                         self.compile_ret_from_call(instr_val, ret_val)
                     }
                 }
-                Instruction::Store {
+                InstOp::Store {
                     dst_val_ptr,
                     stored_val,
                 } => self.compile_store(instr_val, dst_val_ptr, stored_val),
@@ -379,7 +550,9 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                                     const_copy.clone(),
                                     init_val_reg,
                                 )),
-                                comment: "copy const asm init to GP reg".into(),
+                                comment:
+                                    "copy ASM block argument's constant initial value to register"
+                                        .into(),
                                 owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
                             });
                             const_copy
@@ -399,7 +572,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
         // For each opcode in the asm expression, attempt to parse it into an opcode and
         // replace references to the above registers with the newly allocated ones.
-        let asm_block = asm.get_content(self.context);
+        let asm_block = asm;
         for op in &asm_block.body {
             let replaced_registers = op
                 .args
@@ -432,7 +605,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 .unwrap_or_else(Span::dummy);
             let opcode = Op::parse_opcode(
                 handler,
-                &op.name,
+                &op.op_name,
                 &replaced_registers,
                 &op.immediate,
                 op_span.clone(),
@@ -440,15 +613,16 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
             inline_ops.push(Op {
                 opcode: either::Either::Left(opcode),
-                comment: "asm block".into(),
+                comment: op_span.as_str().into(),
                 owning_span: Some(op_span),
             });
         }
 
-        // Now, load the designated asm return register into the desired return register, but only
-        // if it was named.
-        if let Some(ret_reg_name) = &asm_block.return_name {
-            // Lookup and replace the return register.
+        // ASM block always returns a value. The return value is either the one contained in
+        // the return register specified at the end of the ASM block, or it is unit, `()`, in
+        // the case of an ASM block without the return register specified.
+        let (ret_reg, comment) = if let Some(ret_reg_name) = &asm_block.return_name {
+            // If the return register is specified, lookup it by name.
             let ret_reg = match realize_register(ret_reg_name.as_str()) {
                 Some(reg) => reg,
                 None => {
@@ -462,14 +636,40 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     }));
                 }
             };
-            let instr_reg = self.reg_seqr.next();
-            inline_ops.push(Op {
-                opcode: Either::Left(VirtualOp::MOVE(instr_reg.clone(), ret_reg)),
-                comment: "return value from inline asm".into(),
-                owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
-            });
-            self.reg_map.insert(*instr_val, instr_reg);
-        }
+
+            (
+                ret_reg,
+                format!(
+                    "return value from ASM block with return register {}",
+                    ret_reg_name
+                ),
+            )
+        } else {
+            // If the return register is not specified, the return value is unit, `()`, and we
+            // move constant register $zero to the final instruction register.
+            if !asm_block.return_type.is_unit(self.context) {
+                return Err(handler.emit_err(CompileError::InternalOwned(
+                    format!("Return type of an ASM block without return register must be unit, but it was {}.", asm_block.return_type.as_string(self.context)),
+                    self.md_mgr
+                        .val_to_span(self.context, *instr_val)
+                        .unwrap_or_else(Span::dummy),
+                )));
+            }
+
+            (
+                VirtualRegister::Constant(ConstantRegister::Zero),
+                "return unit value from ASM block without return register".into(),
+            )
+        };
+
+        // Move the return register to the instruction register.
+        let instr_reg = self.reg_seqr.next();
+        inline_ops.push(Op {
+            opcode: Either::Left(VirtualOp::MOVE(instr_reg.clone(), ret_reg)),
+            comment,
+            owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
+        });
+        self.reg_map.insert(*instr_val, instr_reg);
 
         self.cur_bytecode.append(&mut inline_ops);
 
@@ -484,7 +684,8 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
     ) -> Result<(), CompileError> {
         let val_reg = self.value_to_register(bitcast_val)?;
         let reg = if to_type.is_bool(self.context) {
-            // This may not be necessary if we just treat a non-zero value as 'true'.
+            // We treat only one as `true`, and not every non-zero value.
+            // So, every non-zero value must be converted to one.
             let res_reg = self.reg_seqr.next();
             self.cur_bytecode.push(Op {
                 opcode: Either::Left(VirtualOp::EQ(
@@ -492,22 +693,27 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     val_reg,
                     VirtualRegister::Constant(ConstantRegister::Zero),
                 )),
-                comment: "convert to inversed boolean".into(),
+                comment: "[bitcast to bool]: convert value to inverted boolean".into(),
                 owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
             });
             self.cur_bytecode.push(Op {
                 opcode: Either::Left(VirtualOp::XORI(
                     res_reg.clone(),
                     res_reg.clone(),
-                    VirtualImmediate12 { value: 1 },
+                    VirtualImmediate12::new_unchecked(
+                        1,
+                        "Error representing 1 as 12-bit immediate",
+                    ),
                 )),
-                comment: "invert boolean".into(),
+                comment: "[bitcast to bool]: invert inverted boolean".into(),
                 owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
             });
             res_reg
+        } else if to_type.is_unit(self.context) {
+            // Unit is represented as zero.
+            VirtualRegister::Constant(ConstantRegister::Zero)
         } else {
-            // This is a no-op, although strictly speaking Unit should probably be compiled as
-            // a zero.
+            // For all other values, bitcast is a no-op.
             val_reg
         };
         self.reg_map.insert(*instr_val, reg);
@@ -580,13 +786,43 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 result_reg,
                 val1_reg,
                 val2_reg,
-                VirtualImmediate06::wide_op(crate::asm_lang::WideOperations::Add, true),
+                VirtualImmediate06::wide_op(WideOperations::Add, true),
             ),
             BinaryOpKind::Sub => VirtualOp::WQOP(
                 result_reg,
                 val1_reg,
                 val2_reg,
-                VirtualImmediate06::wide_op(crate::asm_lang::WideOperations::Sub, true),
+                VirtualImmediate06::wide_op(WideOperations::Sub, true),
+            ),
+            BinaryOpKind::And => VirtualOp::WQOP(
+                result_reg,
+                val1_reg,
+                val2_reg,
+                VirtualImmediate06::wide_op(WideOperations::And, true),
+            ),
+            BinaryOpKind::Or => VirtualOp::WQOP(
+                result_reg,
+                val1_reg,
+                val2_reg,
+                VirtualImmediate06::wide_op(WideOperations::Or, true),
+            ),
+            BinaryOpKind::Xor => VirtualOp::WQOP(
+                result_reg,
+                val1_reg,
+                val2_reg,
+                VirtualImmediate06::wide_op(WideOperations::Xor, true),
+            ),
+            BinaryOpKind::Lsh => VirtualOp::WQOP(
+                result_reg,
+                val1_reg,
+                val2_reg,
+                VirtualImmediate06::wide_op(WideOperations::Lsh, false),
+            ),
+            BinaryOpKind::Rsh => VirtualOp::WQOP(
+                result_reg,
+                val1_reg,
+                val2_reg,
+                VirtualImmediate06::wide_op(WideOperations::Rsh, false),
             ),
             BinaryOpKind::Mul => VirtualOp::WQML(
                 result_reg,
@@ -640,6 +876,24 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         Ok(())
     }
 
+    fn compile_retd(
+        &mut self,
+        instr_val: &Value,
+        ptr: &Value,
+        len: &Value,
+    ) -> Result<(), CompileError> {
+        let ptr = self.value_to_register(ptr)?;
+        let len = self.value_to_register(len)?;
+
+        self.cur_bytecode.push(Op {
+            opcode: Either::Left(VirtualOp::RETD(ptr, len)),
+            comment: String::new(),
+            owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
+        });
+
+        Ok(())
+    }
+
     fn compile_wide_cmp_op(
         &mut self,
         instr_val: &Value,
@@ -658,7 +912,18 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 val2_reg,
                 VirtualImmediate06::wide_cmp(WideCmp::Equality, true),
             ),
-            _ => todo!(),
+            Predicate::LessThan => VirtualOp::WQCM(
+                res_reg.clone(),
+                val1_reg,
+                val2_reg,
+                VirtualImmediate06::wide_cmp(WideCmp::LessThan, true),
+            ),
+            Predicate::GreaterThan => VirtualOp::WQCM(
+                res_reg.clone(),
+                val1_reg,
+                val2_reg,
+                VirtualImmediate06::wide_cmp(WideCmp::GreaterThan, true),
+            ),
         };
 
         self.cur_bytecode.push(Op {
@@ -796,7 +1061,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 self.cur_bytecode.push(Op::register_move(
                     phi_reg.clone(),
                     local_reg,
-                    "parameter from branch to block argument",
+                    "move parameter from branch to block argument",
                     None,
                 ));
             }
@@ -829,13 +1094,13 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
         });
 
-        // now, move the return value of the contract call to the return register.
+        // Now, move the return value of the contract call to the return register.
         // TODO validate RETL matches the expected type (this is a comment from the old codegen)
         let instr_reg = self.reg_seqr.next();
         self.cur_bytecode.push(Op::register_move(
             instr_reg.clone(),
             VirtualRegister::Constant(ConstantRegister::ReturnValue),
-            "save call result",
+            "save external contract call result",
             None,
         ));
         self.reg_map.insert(*instr_val, instr_reg);
@@ -865,7 +1130,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             idx_val
                 .get_constant(self.context)
                 .and_then(|idx_const| {
-                    if let ConstantValue::Uint(idx) = idx_const.value {
+                    if let ConstantValue::Uint(idx) = idx_const.get_content(self.context).value {
                         Some(idx as usize)
                     } else {
                         None
@@ -873,7 +1138,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 })
                 .ok_or_else(|| {
                     CompileError::Internal(
-                        "Failed to convert struct index from constant to integer.",
+                        "Failed to convert struct or union index from constant to integer.",
                         owning_span.as_ref().cloned().unwrap_or_else(Span::dummy),
                     )
                 })
@@ -901,28 +1166,18 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 if elem_ty.is_struct(self.context) {
                     // For structs the index must be a const uint.
                     unwrap_constant_uint(idx_val).map(|idx| {
-                        let field_types = elem_ty.get_field_types(self.context);
-                        let field_type = field_types[idx];
-                        let field_offs_in_bytes = field_types
-                            .iter()
-                            .take(idx)
-                            .map(|field_ty| ir_type_size_in_bytes(self.context, field_ty))
-                            .sum::<u64>();
+                        let (field_offs_in_bytes, field_type) = elem_ty
+                            .get_struct_field_offset_and_type(self.context, idx as u64)
+                            .expect("Element is a struct.");
                         (reg, offs + field_offs_in_bytes, field_type)
                     })
                 } else if elem_ty.is_union(self.context) {
                     // For unions the index must also be a const uint.
                     unwrap_constant_uint(idx_val).map(|idx| {
-                        let field_type = elem_ty.get_field_types(self.context)[idx];
-                        let union_size_in_bytes = ir_type_size_in_bytes(self.context, &elem_ty);
-                        let field_size_in_bytes = ir_type_size_in_bytes(self.context, &field_type);
-
-                        // The union fields are at offset (union_size - variant_size) due to left padding.
-                        (
-                            reg,
-                            offs + union_size_in_bytes - field_size_in_bytes,
-                            field_type,
-                        )
+                        let (field_offs_in_bytes, field_type) = elem_ty
+                            .get_union_field_offset_and_type(self.context, idx as u64)
+                            .expect("Element is a union.");
+                        (reg, offs + field_offs_in_bytes, field_type)
                     })
                 } else if elem_ty.is_array(self.context) {
                     // For arrays the index is a value.  We need to fetch it and add it to
@@ -930,17 +1185,17 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     let array_elem_ty =
                         elem_ty.get_array_elem_type(self.context).ok_or_else(|| {
                             CompileError::Internal(
-                                "Failed to get elem type for known array",
+                                "Failed to get elem type for known array.",
                                 owning_span.clone().unwrap_or_else(Span::dummy),
                             )
                         })?;
-                    let array_elem_size = ir_type_size_in_bytes(self.context, &array_elem_ty);
+                    let array_elem_size = array_elem_ty.size(self.context).in_bytes();
                     let size_reg = self.reg_seqr.next();
                     self.immediate_to_reg(
                         array_elem_size,
                         size_reg.clone(),
                         None,
-                        "get size of element",
+                        "get array element size",
                         owning_span.clone(),
                     );
 
@@ -962,18 +1217,11 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                             reg,
                             offset_reg.clone(),
                         )),
-                        comment: "add to array base".into(),
+                        comment: "add array element offset to array base".into(),
                         owning_span: owning_span.clone(),
                     });
-                    let member_type =
-                        elem_ty.get_array_elem_type(self.context).ok_or_else(|| {
-                            CompileError::Internal(
-                                "Can't get array elem type for GEP.",
-                                sway_types::span::Span::dummy(),
-                            )
-                        })?;
 
-                    Ok((offset_reg, offs, member_type))
+                    Ok((offset_reg, offs, array_elem_ty))
                 } else {
                     Err(CompileError::Internal(
                         "Cannot get element offset in non-aggregate.",
@@ -992,7 +1240,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 const_offs,
                 instr_reg.clone(),
                 Some(&base_reg),
-                "get offset to element",
+                "get offset to aggregate element",
                 owning_span.clone(),
             );
             self.reg_map.insert(*instr_val, instr_reg);
@@ -1035,7 +1283,10 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                             opcode: Either::Left(VirtualOp::MULI(
                                 instr_reg.clone(),
                                 instr_reg.clone(),
-                                VirtualImmediate12 { value: 8u16 },
+                                VirtualImmediate12::new_unchecked(
+                                    8,
+                                    "Error representing 8 as 12-bit immediate",
+                                ),
                             )),
                             comment: "get byte offset to local from base".into(),
                             owning_span: owning_span.clone(),
@@ -1065,7 +1316,18 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             Some(Storage::Data(data_id)) => {
                 let instr_reg = self.reg_seqr.next();
                 self.cur_bytecode.push(Op {
-                    opcode: Either::Left(VirtualOp::LWDataId(instr_reg.clone(), data_id.clone())),
+                    opcode: Either::Left(VirtualOp::LoadDataId(instr_reg.clone(), data_id.clone())),
+                    comment: "get local constant".into(),
+                    owning_span,
+                });
+                self.reg_map.insert(*instr_val, instr_reg);
+
+                Ok(())
+            }
+            Some(Storage::Const(c)) => {
+                let instr_reg = self.reg_seqr.next();
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::MOVI(instr_reg.clone(), c.clone())),
                     comment: "get local constant".into(),
                     owning_span,
                 });
@@ -1082,6 +1344,41 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         }
     }
 
+    fn compile_get_config(&mut self, addr_val: &Value, name: &String) -> Result<(), CompileError> {
+        let addr_reg = self.reg_seqr.next();
+
+        // if configurable is at the global_section, it is v1
+        if let Some(g) = self.globals_section.get_by_name(name) {
+            self.cur_bytecode.push(Op {
+                opcode: either::Either::Left(VirtualOp::ADDI(
+                    addr_reg.clone(),
+                    VirtualRegister::Constant(ConstantRegister::StackStartPointer),
+                    VirtualImmediate12::new_unchecked(
+                        g.offset_in_bytes,
+                        "offset must fit in 12 bits",
+                    ),
+                )),
+                comment: format!("get address of configurable {}", name),
+                owning_span: self.md_mgr.val_to_span(self.context, *addr_val),
+            });
+            self.reg_map.insert(*addr_val, addr_reg);
+        } else {
+            // Otherwise it is a configurable with encoding v0 and must be at configurable_v0_data_id
+            let dataid = self.configurable_v0_data_id.get(name).unwrap();
+            self.cur_bytecode.push(Op {
+                opcode: either::Either::Left(VirtualOp::AddrDataId(
+                    addr_reg.clone(),
+                    dataid.clone(),
+                )),
+                comment: format!("get address of configurable {}", name),
+                owning_span: self.md_mgr.val_to_span(self.context, *addr_val),
+            });
+            self.reg_map.insert(*addr_val, addr_reg);
+        }
+
+        Ok(())
+    }
+
     fn compile_gtf(
         &mut self,
         instr_val: &Value,
@@ -1094,9 +1391,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             opcode: either::Either::Left(VirtualOp::GTF(
                 instr_reg.clone(),
                 index_reg,
-                VirtualImmediate12 {
-                    value: tx_field_id as u16,
-                },
+                VirtualImmediate12::new_unchecked(tx_field_id, "tx_field_id must fit in 12 bits"),
             )),
             comment: "get transaction field".into(),
             owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
@@ -1107,32 +1402,54 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
     fn compile_load(&mut self, instr_val: &Value, src_val: &Value) -> Result<(), CompileError> {
         let owning_span = self.md_mgr.val_to_span(self.context, *instr_val);
-        if src_val
+        let src_ty = src_val
             .get_type(self.context)
             .and_then(|src_ty| src_ty.get_pointee_type(self.context))
-            .map_or(true, |inner_ty| !self.is_copy_type(&inner_ty))
-        {
-            Err(CompileError::Internal(
-                "Attempt to load from non-copy type.",
-                owning_span.unwrap_or_else(Span::dummy),
-            ))
-        } else {
-            let src_reg = self.value_to_register(src_val)?;
-            let instr_reg = self.reg_seqr.next();
+            .filter(|inner_ty| self.is_copy_type(inner_ty))
+            .ok_or_else(|| {
+                CompileError::Internal(
+                    "Attempt to load from non-copy type.",
+                    owning_span.clone().unwrap_or_else(Span::dummy),
+                )
+            })?;
+        let byte_len = src_ty.size(self.context).in_bytes();
 
-            self.cur_bytecode.push(Op {
-                opcode: Either::Left(VirtualOp::LW(
-                    instr_reg.clone(),
-                    src_reg,
-                    VirtualImmediate12 { value: 0 },
-                )),
-                comment: "load value".into(),
-                owning_span,
-            });
+        let src_reg = self.value_to_register(src_val)?;
+        let instr_reg = self.reg_seqr.next();
 
-            self.reg_map.insert(*instr_val, instr_reg);
-            Ok(())
+        match byte_len {
+            1 => {
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::LB(
+                        instr_reg.clone(),
+                        src_reg,
+                        VirtualImmediate12::new_unchecked(0, "Zero must fit in 12 bits"),
+                    )),
+                    comment: "load byte".into(),
+                    owning_span,
+                });
+            }
+            8.. => {
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::LW(
+                        instr_reg.clone(),
+                        src_reg,
+                        VirtualImmediate12::new_unchecked(0, "Zero must fit in 12 bits"),
+                    )),
+                    comment: "load word".into(),
+                    owning_span,
+                });
+            }
+            _ => {
+                return Err(CompileError::Internal(
+                    "Attempt to load {byte_len} bytes sized value.",
+                    owning_span.unwrap_or_else(Span::dummy),
+                ));
+            }
         }
+
+        self.reg_map.insert(*instr_val, instr_reg);
+        Ok(())
     }
 
     fn compile_mem_copy_bytes(
@@ -1152,23 +1469,38 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         let dst_reg = self.value_to_register(dst_val_ptr)?;
         let src_reg = self.value_to_register(src_val_ptr)?;
 
-        let len_reg = self.reg_seqr.next();
-        self.cur_bytecode.push(Op {
-            opcode: Either::Left(VirtualOp::MOVI(
-                len_reg.clone(),
-                VirtualImmediate18 {
-                    value: byte_len as u32,
-                },
-            )),
-            comment: "get length for mcp".into(),
-            owning_span: owning_span.clone(),
-        });
+        if byte_len <= u64::from(Imm12::MAX.to_u16()) {
+            // Can be done using a single MCPI instruction.
+            self.cur_bytecode.push(Op {
+                opcode: Either::Left(VirtualOp::MCPI(
+                    dst_reg,
+                    src_reg,
+                    VirtualImmediate12::new_unchecked(byte_len, "argument size checked above"),
+                )),
+                comment: "copy memory".into(),
+                owning_span,
+            });
+        } else {
+            // Too many bytes for MCPI, so we need to use a separate register to hold the length.
+            let len_reg = self.reg_seqr.next();
+            self.cur_bytecode.push(Op {
+                opcode: Either::Left(VirtualOp::MOVI(
+                    len_reg.clone(),
+                    VirtualImmediate18::new_unchecked(
+                        byte_len,
+                        "cannot fit byte length in 18 bits",
+                    ),
+                )),
+                comment: "get data length for memory copy".into(),
+                owning_span: owning_span.clone(),
+            });
 
-        self.cur_bytecode.push(Op {
-            opcode: Either::Left(VirtualOp::MCP(dst_reg, src_reg, len_reg)),
-            comment: "copy memory with mem_copy".into(),
-            owning_span,
-        });
+            self.cur_bytecode.push(Op {
+                opcode: Either::Left(VirtualOp::MCP(dst_reg, src_reg, len_reg)),
+                comment: "copy memory".into(),
+                owning_span,
+            });
+        }
 
         Ok(())
     }
@@ -1190,7 +1522,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                         .unwrap_or_else(Span::dummy),
                 )
             })?;
-        let byte_len = ir_type_size_in_bytes(self.context, &dst_ty);
+        let byte_len = dst_ty.size(self.context).in_bytes();
         self.compile_mem_copy_bytes(instr_val, dst_val_ptr, src_val_ptr, byte_len)
     }
 
@@ -1214,33 +1546,70 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     VirtualRegister::Constant(ConstantRegister::Zero),
                     VirtualRegister::Constant(ConstantRegister::Zero),
                 )),
-                comment: "".into(),
+                comment: "log non-pointer value".into(),
             });
         } else {
             // If the type is a pointer then we use LOGD to log the data. First put the size into
             // the data section, then add a LW to get it, then add a LOGD which uses it.
             let log_ty = log_ty.get_pointee_type(self.context).unwrap();
-            let size_in_bytes = ir_type_size_in_bytes(self.context, &log_ty);
 
-            let size_reg = self.reg_seqr.next();
-            self.immediate_to_reg(
-                size_in_bytes,
-                size_reg.clone(),
-                None,
-                "loading size for LOGD",
-                owning_span.clone(),
-            );
+            // Slices arrive here as "ptr slice" because they are demoted. (see fn log_demotion)
+            let is_slice = log_ty.is_slice(self.context);
 
-            self.cur_bytecode.push(Op {
-                owning_span,
-                opcode: Either::Left(VirtualOp::LOGD(
-                    VirtualRegister::Constant(ConstantRegister::Zero),
-                    log_id_reg,
-                    log_val_reg,
-                    size_reg,
-                )),
-                comment: "".into(),
-            });
+            if is_slice {
+                let ptr_reg = self.reg_seqr.next();
+                let size_reg = self.reg_seqr.next();
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::LW(
+                        ptr_reg.clone(),
+                        log_val_reg.clone(),
+                        VirtualImmediate12::new_unchecked(0, "zero must fit in 12 bits"),
+                    )),
+                    owning_span: owning_span.clone(),
+                    comment: "load slice pointer for logging data".into(),
+                });
+                self.cur_bytecode.push(Op {
+                    opcode: Either::Left(VirtualOp::LW(
+                        size_reg.clone(),
+                        log_val_reg.clone(),
+                        VirtualImmediate12::new_unchecked(1, "one must fit in 12 bits"),
+                    )),
+                    owning_span: owning_span.clone(),
+                    comment: "load slice size for logging data".into(),
+                });
+                self.cur_bytecode.push(Op {
+                    owning_span,
+                    opcode: Either::Left(VirtualOp::LOGD(
+                        VirtualRegister::Constant(ConstantRegister::Zero),
+                        log_id_reg,
+                        ptr_reg,
+                        size_reg,
+                    )),
+                    comment: "log slice".into(),
+                });
+            } else {
+                let size_in_bytes = log_ty.size(self.context).in_bytes();
+
+                let size_reg = self.reg_seqr.next();
+                self.immediate_to_reg(
+                    size_in_bytes,
+                    size_reg.clone(),
+                    None,
+                    "load data size for logging data",
+                    owning_span.clone(),
+                );
+
+                self.cur_bytecode.push(Op {
+                    owning_span: owning_span.clone(),
+                    opcode: Either::Left(VirtualOp::LOGD(
+                        VirtualRegister::Constant(ConstantRegister::Zero),
+                        log_id_reg.clone(),
+                        log_val_reg.clone(),
+                        size_reg,
+                    )),
+                    comment: "log data".into(),
+                });
+            }
         }
 
         Ok(())
@@ -1268,7 +1637,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     sway_ir::Register::Flag => ConstantRegister::Flags,
                 }),
             )),
-            comment: "move register into abi function".to_owned(),
+            comment: "read special register".to_owned(),
             owning_span: self.md_mgr.val_to_span(self.context, *instr_val),
         });
 
@@ -1291,7 +1660,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     ConstantRegister::Zero,
                 ))),
                 owning_span,
-                comment: "returning unit as zero".into(),
+                comment: "return unit as zero".into(),
             });
         } else {
             let ret_reg = self.value_to_register(ret_val)?;
@@ -1314,7 +1683,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                         opcode: Either::Left(VirtualOp::LW(
                             size_reg.clone(),
                             ret_reg.clone(),
-                            VirtualImmediate12 { value: 1 },
+                            VirtualImmediate12::new_unchecked(1, "one must fit in 12 bits"),
                         )),
                         owning_span: owning_span.clone(),
                         comment: "load size of returned slice".into(),
@@ -1323,21 +1692,22 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                         opcode: Either::Left(VirtualOp::LW(
                             ret_reg.clone(),
                             ret_reg.clone(),
-                            VirtualImmediate12 { value: 0 },
+                            VirtualImmediate12::new_unchecked(0, "zero must fit in 12 bits"),
                         )),
                         owning_span: owning_span.clone(),
-                        comment: "load ptr of returned slice".into(),
+                        comment: "load pointer to returned slice".into(),
                     });
                 } else {
-                    let size_in_bytes = ir_type_size_in_bytes(
-                        self.context,
-                        &ret_type.get_pointee_type(self.context).unwrap_or(ret_type),
-                    );
+                    let size_in_bytes = ret_type
+                        .get_pointee_type(self.context)
+                        .unwrap_or(ret_type)
+                        .size(self.context)
+                        .in_bytes();
                     self.immediate_to_reg(
                         size_in_bytes,
                         size_reg.clone(),
                         None,
-                        "get size of returned ref",
+                        "get size of type returned by pointer",
                         owning_span.clone(),
                     );
                 }
@@ -1364,6 +1734,49 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             owning_span,
             opcode: Either::Left(VirtualOp::RVRT(revert_reg)),
             comment: "".into(),
+        });
+
+        Ok(())
+    }
+
+    fn compile_jmp_mem(&mut self, instr_val: &Value) -> Result<(), CompileError> {
+        let owning_span = self.md_mgr.val_to_span(self.context, *instr_val);
+        let target_reg = self.reg_seqr.next();
+        let is_target_reg = self.reg_seqr.next();
+        let by4_reg = self.reg_seqr.next();
+
+        self.cur_bytecode.push(Op {
+            owning_span: owning_span.clone(),
+            opcode: Either::Left(VirtualOp::LW(
+                target_reg.clone(),
+                VirtualRegister::Constant(ConstantRegister::HeapPointer),
+                VirtualImmediate12::new(0, Span::dummy()).unwrap(),
+            )),
+            comment: "[jump]: load word from MEM[$hp]".into(),
+        });
+        self.cur_bytecode.push(Op {
+            owning_span: owning_span.clone(),
+            opcode: Either::Left(VirtualOp::SUB(
+                is_target_reg.clone(),
+                target_reg,
+                VirtualRegister::Constant(ConstantRegister::InstructionStart),
+            )),
+            comment: "[jump]: subtract instructions start ($is) since jmp adds it back".into(),
+        });
+        self.cur_bytecode.push(Op {
+            owning_span: owning_span.clone(),
+            opcode: Either::Left(VirtualOp::DIVI(
+                by4_reg.clone(),
+                is_target_reg.clone(),
+                VirtualImmediate12::new(4, Span::dummy()).unwrap(),
+            )),
+            comment: "[jump]: divide by 4 since jmp multiplies by 4".into(),
+        });
+
+        self.cur_bytecode.push(Op {
+            owning_span,
+            opcode: Either::Left(VirtualOp::JMP(by4_reg)),
+            comment: "[jump]: jump to computed value".into(),
         });
 
         Ok(())
@@ -1431,7 +1844,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 was_slot_set_reg.clone(),
                 number_of_slots_reg,
             )),
-            comment: "clear a sequence of storage slots".into(),
+            comment: "clear sequence of storage slots".into(),
             owning_span,
         });
 
@@ -1455,7 +1868,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         if !val
             .get_type(self.context)
             .and_then(|val_ty| key.get_type(self.context).map(|key_ty| (val_ty, key_ty)))
-            .map_or(false, |(val_ty, key_ty)| {
+            .is_some_and(|(val_ty, key_ty)| {
                 val_ty.is_ptr(self.context) && key_ty.is_ptr(self.context)
             })
         {
@@ -1485,7 +1898,13 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     number_of_slots_reg,
                 ),
             }),
-            comment: "access a sequence of storage slots".into(),
+            comment: format!(
+                "{} sequence of storage slots",
+                match access_type {
+                    StateAccessType::Read => "read",
+                    StateAccessType::Write => "write",
+                }
+            ),
             owning_span,
         });
 
@@ -1518,7 +1937,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
         self.cur_bytecode.push(Op {
             opcode: Either::Left(VirtualOp::SRW(load_reg.clone(), was_slot_set_reg, key_reg)),
-            comment: "single word state access".into(),
+            comment: "read single word from contract state".into(),
             owning_span,
         });
 
@@ -1539,7 +1958,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         if !store_val
             .get_type(self.context)
             .and_then(|val_ty| key.get_type(self.context).map(|key_ty| (val_ty, key_ty)))
-            .map_or(false, |(val_ty, key_ty)| {
+            .is_some_and(|(val_ty, key_ty)| {
                 val_ty.is_uint64(self.context) && key_ty.is_ptr(self.context)
             })
         {
@@ -1555,7 +1974,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
         self.cur_bytecode.push(Op {
             opcode: Either::Left(VirtualOp::SWW(key_reg, was_slot_set_reg.clone(), store_reg)),
-            comment: "single word state access".into(),
+            comment: "write single word to contract state".into(),
             owning_span,
         });
 
@@ -1571,35 +1990,52 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         stored_val: &Value,
     ) -> Result<(), CompileError> {
         let owning_span = self.md_mgr.val_to_span(self.context, *instr_val);
+
         if stored_val
             .get_type(self.context)
             .map_or(true, |ty| !self.is_copy_type(&ty))
         {
-            // NOTE: Very hacky special case here which must be fixed.  We've been given a
-            // configurable constant which doesn't have a pointer type and shouldn't still be using
-            // `store`.
-            if stored_val.is_configurable(self.context) {
-                // So we know it's not a copy type so we actually need a MCP.
-                self.compile_mem_copy_val(instr_val, dst_val, stored_val)
-            } else {
-                Err(CompileError::Internal(
-                    "Attempt to store a non-copy type.",
-                    owning_span.unwrap_or_else(Span::dummy),
-                ))
-            }
+            Err(CompileError::Internal(
+                "Attempt to store a non-copy type.",
+                owning_span.unwrap_or_else(Span::dummy),
+            ))
         } else {
+            let stored_ty = stored_val.get_type(self.context).unwrap();
+            let byte_len = stored_ty.size(self.context).in_bytes();
+
             let dst_reg = self.value_to_register(dst_val)?;
             let val_reg = self.value_to_register(stored_val)?;
 
-            self.cur_bytecode.push(Op {
-                opcode: Either::Left(VirtualOp::SW(
-                    dst_reg,
-                    val_reg,
-                    VirtualImmediate12 { value: 0 },
-                )),
-                comment: "store value".into(),
-                owning_span,
-            });
+            match byte_len {
+                1 => {
+                    self.cur_bytecode.push(Op {
+                        opcode: Either::Left(VirtualOp::SB(
+                            dst_reg,
+                            val_reg,
+                            VirtualImmediate12::new_unchecked(0, "Zero must fit in 12 bits"),
+                        )),
+                        comment: "store byte".into(),
+                        owning_span,
+                    });
+                }
+                8.. => {
+                    self.cur_bytecode.push(Op {
+                        opcode: Either::Left(VirtualOp::SW(
+                            dst_reg,
+                            val_reg,
+                            VirtualImmediate12::new_unchecked(0, "Zero must fit in 12 bits"),
+                        )),
+                        comment: "store word".into(),
+                        owning_span,
+                    });
+                }
+                _ => {
+                    return Err(CompileError::Internal(
+                        "Attempt to load {byte_len} bytes sized value.",
+                        owning_span.unwrap_or_else(Span::dummy),
+                    ));
+                }
+            }
 
             Ok(())
         }
@@ -1619,9 +2055,15 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
 
     // ---------------------------------------------------------------------------------------------
 
-    // XXX reassess all the places we use this
+    // TODO-IG: Reassess all the places we use `is_copy_type`.
     pub(crate) fn is_copy_type(&self, ty: &Type) -> bool {
-        ty.is_unit(self.context) || ty.is_bool(self.context) || ty.is_uint(self.context)
+        ty.is_unit(self.context)
+            || ty.is_never(self.context)
+            || ty.is_bool(self.context)
+            || ty
+                .get_uint_width(self.context)
+                .map(|x| x < 256)
+                .unwrap_or(false)
     }
 
     fn initialise_constant(
@@ -1630,7 +2072,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         config_name: Option<String>,
         span: Option<Span>,
     ) -> (VirtualRegister, Option<DataId>) {
-        match &constant.value {
+        match &constant.get_content(self.context).value {
             // Use cheaper $zero or $one registers if possible.
             ConstantValue::Unit | ConstantValue::Bool(false) | ConstantValue::Uint(0)
                 if config_name.is_none() =>
@@ -1638,20 +2080,33 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                 (VirtualRegister::Constant(ConstantRegister::Zero), None)
             }
 
-            ConstantValue::Bool(true) | ConstantValue::Uint(1) if config_name.is_none() => {
+            ConstantValue::Uint(1) | ConstantValue::Bool(true) if config_name.is_none() => {
                 (VirtualRegister::Constant(ConstantRegister::One), None)
             }
 
             _otherwise => {
                 // Get the constant into the namespace.
-                let entry = Entry::from_constant(self.context, constant, config_name);
+                let config_name = if let Some(name) = config_name {
+                    EntryName::Configurable(name)
+                } else {
+                    EntryName::NonConfigurable
+                };
+                let entry = Entry::from_constant(
+                    self.context,
+                    constant.get_content(self.context),
+                    config_name,
+                    None,
+                );
                 let data_id = self.data_section.insert_data_value(entry);
 
                 // Allocate a register for it, and a load instruction.
                 let reg = self.reg_seqr.next();
                 self.cur_bytecode.push(Op {
-                    opcode: either::Either::Left(VirtualOp::LWDataId(reg.clone(), data_id.clone())),
-                    comment: "literal instantiation".into(),
+                    opcode: either::Either::Left(VirtualOp::LoadDataId(
+                        reg.clone(),
+                        data_id.clone(),
+                    )),
+                    comment: "load constant from data section".into(),
                     owning_span: span,
                 });
                 (reg, Some(data_id))
@@ -1663,7 +2118,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         //
         // Actually, no, don't.  It's possible for constant values to be
         // reused in the IR, especially with transforms which copy blocks
-        // around, like inlining.  The `LW`/`LWDataId` instruction above
+        // around, like inlining.  The `LW`/`LoadDataId` instruction above
         // initialises that constant value but it may be in a conditional
         // block and not actually get evaluated for every possible
         // execution. So using the register later on by pulling it from
@@ -1675,7 +2130,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
         // to determine when it may be initialised and/or reused.
     }
 
-    // Get the reg corresponding to `value`. Returns an ICE if the value is not in reg_map or is
+    // Get the reg corresponding to `value`. Returns an ICE if the value is not in `reg_map` or is
     // not a constant.
     pub(super) fn value_to_register(
         &mut self,
@@ -1687,30 +2142,33 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             .or_else(|| {
                 value.get_constant(self.context).map(|constant| {
                     let span = self.md_mgr.val_to_span(self.context, *value);
-                    self.initialise_constant(constant, None, span).0
-                })
-            })
-            .or_else(|| {
-                value.get_configurable(self.context).map(|constant| {
-                    let span = self.md_mgr.val_to_span(self.context, *value);
-                    let config_name = self
-                        .md_mgr
-                        .md_to_config_const_name(self.context, value.get_metadata(self.context))
-                        .unwrap()
-                        .to_string();
-
-                    let initialized =
-                        self.initialise_constant(constant, Some(config_name.clone()), span);
-                    if let Some(data_id) = initialized.1 {
-                        self.data_section.config_map.insert(config_name, data_id.0);
+                    match constant.get_content(self.context).value {
+                        // If it's a small enough constant, just initialize using an IMM value.
+                        // (exceptions for zero and one as they have special registers).
+                        ConstantValue::Uint(c)
+                            if c <= compiler_constants::EIGHTEEN_BITS && !(c == 0 || c == 1) =>
+                        {
+                            let imm = VirtualImmediate18::new_unchecked(
+                                c,
+                                "Cannot happen, we just checked",
+                            );
+                            let reg = self.reg_seqr.next();
+                            self.cur_bytecode.push(Op {
+                                opcode: Either::Left(VirtualOp::MOVI(reg.clone(), imm)),
+                                comment: "initialize constant into register".into(),
+                                owning_span: None,
+                            });
+                            reg
+                        }
+                        _ => self.initialise_constant(constant, None, span).0,
                     }
-                    initialized.0
                 })
             })
             .ok_or_else(|| {
+                let span = self.md_mgr.val_to_span(self.context, *value);
                 CompileError::Internal(
                     "An attempt to get register for unknown Value.",
-                    Span::dummy(),
+                    span.unwrap_or(Span::dummy()),
                 )
             })
     }
@@ -1734,7 +2192,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
                     reg,
                     #[allow(clippy::unnecessary_unwrap)]
                     base.unwrap().clone(),
-                    VirtualImmediate12 { value: imm as u16 },
+                    VirtualImmediate12::new_unchecked(imm, "immediate must fit in 12 bits"),
                 )),
                 comment: comment.into(),
                 owning_span: span,
@@ -1744,7 +2202,7 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             self.cur_bytecode.push(Op {
                 opcode: Either::Left(VirtualOp::MOVI(
                     reg.clone(),
-                    VirtualImmediate18 { value: imm as u32 },
+                    VirtualImmediate18::new_unchecked(imm, "immediate must fit in 12 bits"),
                 )),
                 comment: comment.clone(),
                 owning_span: span.clone(),
@@ -1758,11 +2216,13 @@ impl<'ir, 'eng> FuelAsmBuilder<'ir, 'eng> {
             }
         } else {
             let comment = comment.into();
-            let data_id = self
-                .data_section
-                .insert_data_value(Entry::new_word(imm, None, None));
+            let data_id = self.data_section.insert_data_value(Entry::new_word(
+                imm,
+                EntryName::NonConfigurable,
+                None,
+            ));
             self.cur_bytecode.push(Op {
-                opcode: Either::Left(VirtualOp::LWDataId(reg.clone(), data_id)),
+                opcode: Either::Left(VirtualOp::LoadDataId(reg.clone(), data_id)),
                 owning_span: span.clone(),
                 comment: comment.clone(),
             });

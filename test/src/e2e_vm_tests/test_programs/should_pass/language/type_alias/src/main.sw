@@ -3,7 +3,7 @@ script;
 mod lib;
 
 struct MyType {
-    x: std::contract_id::AssetId,
+    x: std::alias::SubId,
 }
 type MyTypeAlias1 = MyType;
 type MyTypeAlias2 = MyTypeAlias1;
@@ -35,38 +35,41 @@ impl MyTypeAlias3 {
     }
 }
 
+#[cfg(experimental_partial_eq = false)]
 impl core::ops::Eq for MyTypeAlias2 {
     fn eq(self, other: Self) -> bool {
         self.x == other.x
     }
 }
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::PartialEq for MyTypeAlias2 {
+    fn eq(self, other: Self) -> bool {
+        self.x == other.x
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::Eq for MyTypeAlias2 {}
 
 struct GenericStruct<T> {
     x: T,
 }
 
-fn foo(x: AssetId) -> AssetId {
-    AssetId::from(x.value)
+fn foo(x: SubId) -> SubId {
+    x
 }
 
 fn struct_tests() { /* Structs */
-    let x = AssetId {
-        value: 0x0000000000000000000000000000000000000000000000000000000000000001,
-    };
-    let y: AssetId = x;
-    let z = AssetId::from(0x0000000000000000000000000000000000000000000000000000000000000001);
+    let x = 0x0000000000000000000000000000000000000000000000000000000000000001;
+    let y: SubId = x;
+    let z: SubId = 0x0000000000000000000000000000000000000000000000000000000000000001;
     let _ = foo(x);
     let t = MyTypeAlias2 {
-        x: std::contract_id::AssetId {
-            value: 0x0000000000000000000000000000000000000000000000000000000000000001,
-        },
+        x: 0x0000000000000000000000000000000000000000000000000000000000000001,
     };
     let t2 = MyTypeAlias3 {
-        x: AssetId {
-            value: 0x0000000000000000000000000000000000000000000000000000000000000001,
-        },
+        x: 0x0000000000000000000000000000000000000000000000000000000000000001,
     };
-    assert(x == z && t.x.value == y.value && t.x.value == t2.x.value && z.value == y.value);
+    assert(x == z && t.x == y && t.x == t2.x && z == y);
 
     assert(t.bar0() == 0 && t.bar1() == 1 && t.bar2() == 2 && t.bar3() == 3);
     assert(t2.bar0() == 0 && t2.bar1() == 1 && t2.bar2() == 2 && t2.bar3() == 3);
@@ -98,7 +101,7 @@ fn noop2(x: lib::MyIdentity2) -> Identity {
 }
 
 enum MyEnumType {
-    X: std::contract_id::AssetId,
+    X: std::alias::SubId,
 }
 type MyEnumTypeAlias1 = MyEnumType;
 type MyEnumTypeAlias2 = MyEnumTypeAlias1;
@@ -128,6 +131,7 @@ impl MyEnumTypeAlias3 {
     }
 }
 
+#[cfg(experimental_partial_eq = false)]
 impl core::ops::Eq for MyEnumTypeAlias2 {
     fn eq(self, other: Self) -> bool {
         match (self, other) {
@@ -135,33 +139,41 @@ impl core::ops::Eq for MyEnumTypeAlias2 {
         }
     }
 }
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::PartialEq for MyEnumTypeAlias2 {
+    fn eq(self, other: Self) -> bool {
+        match (self, other) {
+            (MyEnumType::X(value1), MyEnumType::X(value2)) => value1 == value2,
+        }
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::Eq for MyEnumTypeAlias2 {}
 
 fn enum_tests() {
-    let x = ContractId {
-        value: 0x0000000000000000000000000000000000000000000000000000000000000001,
-    };
-    let z = AssetId::from(0x0000000000000000000000000000000000000000000000000000000000000001);
+    let x = ContractId::from(0x0000000000000000000000000000000000000000000000000000000000000001);
+    let z: SubId = 0x0000000000000000000000000000000000000000000000000000000000000001;
     let o = Some(x);
-    if let Some(AssetId { value }) = o {
-        assert(value == z.value);
+    if let Some(value) = o {
+        assert(value.bits() == z);
     }
 
     let value = match o {
-        Some(value) => value.value,
+        Some(value) => value.bits(),
         None => revert(42),
     };
 
     let id1 = lib::MyIdentity::ContractId(x);
     let id2 = lib::MyIdentity::ContractId(x);
     match id1 {
-        lib::MyIdentity::ContractId(AssetId { value }) => assert(value == 0x0000000000000000000000000000000000000000000000000000000000000001),
+        lib::MyIdentity::ContractId(id) => assert(id.bits() == 0x0000000000000000000000000000000000000000000000000000000000000001),
         _ => revert(42),
     }
     assert(id1 == id2); // test trait `Eq`
     let id3 = lib::MyIdentity::Address(Address::from(0x1111111111111111111111111111111111111111111111111111111111111111));
     let id4 = lib::MyIdentity::Address(Address::from(0x1111111111111111111111111111111111111111111111111111111111111111));
     match id3 {
-        lib::MyIdentity::Address(Address { value }) => assert(value == 0x1111111111111111111111111111111111111111111111111111111111111111),
+        lib::MyIdentity::Address(id) => assert(id.bits() == 0x1111111111111111111111111111111111111111111111111111111111111111),
         _ => revert(42),
     }
     assert(id3 == id4);

@@ -1,6 +1,5 @@
 use crate::{
-    comments::{rewrite_with_comments, write_comments},
-    config::items::ItemBraceStyle,
+    comments::{has_comments_in_formatter, rewrite_with_comments, write_comments},
     formatter::{
         shape::{ExprKind, LineStyle},
         *,
@@ -12,8 +11,10 @@ use crate::{
 };
 use std::fmt::Write;
 use sway_ast::{
-    keywords::{MutToken, RefToken, SelfToken, Token},
-    FnArg, FnArgs, FnSignature, ItemFn,
+    keywords::{
+        ColonToken, FnToken, Keyword, MutToken, RefToken, RightArrowToken, SelfToken, Token,
+    },
+    CommaToken, FnArg, FnArgs, FnSignature, ItemFn, PubToken,
 };
 use sway_types::{ast::Delimiter, Spanned};
 
@@ -38,7 +39,7 @@ impl Format for ItemFn {
                 let body = self.body.get();
                 if !body.statements.is_empty() || body.final_expr_opt.is_some() {
                     Self::open_curly_brace(formatted_code, formatter)?;
-                    formatter.shape.block_indent(&formatter.config);
+                    formatter.indent();
                     body.format(formatted_code, formatter)?;
 
                     if let Some(final_expr_opt) = body.final_expr_opt.as_ref() {
@@ -51,11 +52,11 @@ impl Format for ItemFn {
 
                     Self::close_curly_brace(formatted_code, formatter)?;
                 } else {
+                    let range = self.span().into();
                     Self::open_curly_brace(formatted_code, formatter)?;
-                    formatter.shape.block_indent(&formatter.config);
-                    let comments = write_comments(formatted_code, self.span().into(), formatter)?;
-                    if !comments {
-                        formatter.shape.block_unindent(&formatter.config);
+                    if has_comments_in_formatter(formatter, &range) {
+                        formatter.indent();
+                        write_comments(formatted_code, range, formatter)?;
                     }
                     Self::close_curly_brace(formatted_code, formatter)?;
                 }
@@ -81,25 +82,15 @@ impl CurlyBrace for ItemFn {
         line: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        let brace_style = formatter.config.items.item_brace_style;
         let open_brace = Delimiter::Brace.as_open_char();
-        match brace_style {
-            ItemBraceStyle::AlwaysNextLine => {
-                // Add openning brace to the next line.
-                writeln!(line, "\n{open_brace}")?;
+        match formatter.shape.code_line.has_where_clause {
+            true => {
+                let indent_str = formatter.indent_to_str()?;
+                write!(line, "{indent_str}{open_brace}")?;
+                formatter.shape.code_line.update_where_clause(false);
             }
-            ItemBraceStyle::SameLineWhere => match formatter.shape.code_line.has_where_clause {
-                true => {
-                    write!(line, "{open_brace}")?;
-                    formatter.shape.code_line.update_where_clause(false);
-                }
-                false => {
-                    write!(line, " {open_brace}")?;
-                }
-            },
-            _ => {
-                // TODO: implement PreferSameLine
-                writeln!(line, " {open_brace}")?;
+            false => {
+                write!(line, " {open_brace}")?;
             }
         }
 
@@ -109,12 +100,12 @@ impl CurlyBrace for ItemFn {
         line: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        // If shape is becoming left-most alligned or - indent just have the defualt shape
-        formatter.shape.block_unindent(&formatter.config);
+        // If shape is becoming left-most aligned or - indent just have the default shape
+        formatter.unindent();
         write!(
             line,
             "{}{}",
-            formatter.shape.indent.to_string(&formatter.config)?,
+            formatter.indent_to_str()?,
             Delimiter::Brace.as_close_char()
         )?;
 
@@ -129,7 +120,9 @@ impl Format for FnSignature {
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         formatter.shape.code_line.has_where_clause = formatter.with_shape(
-            formatter.shape,
+            formatter
+                .shape
+                .with_code_line_from(LineStyle::Normal, ExprKind::Function),
             |formatter| -> Result<bool, FormatterError> {
                 let mut fn_sig = FormattedCode::new();
                 let mut fn_args = FormattedCode::new();
@@ -161,11 +154,11 @@ fn format_fn_sig(
     formatter: &mut Formatter,
 ) -> Result<(), FormatterError> {
     // `pub `
-    if let Some(visibility_token) = &fn_sig.visibility {
-        write!(formatted_code, "{} ", visibility_token.span().as_str())?;
+    if fn_sig.visibility.is_some() {
+        write!(formatted_code, "{} ", PubToken::AS_STR)?;
     }
     // `fn ` + name
-    write!(formatted_code, "{} ", fn_sig.fn_token.span().as_str())?;
+    write!(formatted_code, "{} ", FnToken::AS_STR)?;
     fn_sig.name.format(formatted_code, formatter)?;
     // `<T>`
     if let Some(generics) = &fn_sig.generics {
@@ -178,12 +171,8 @@ fn format_fn_sig(
     // `)`
     FnSignature::close_parenthesis(formatted_code, formatter)?;
     // `return_type_opt`
-    if let Some((right_arrow, ty)) = &fn_sig.return_type_opt {
-        write!(
-            formatted_code,
-            " {} ",
-            right_arrow.ident().as_str() // `->`
-        )?;
+    if let Some((_right_arrow, ty)) = &fn_sig.return_type_opt {
+        write!(formatted_code, " {} ", RightArrowToken::AS_STR)?;
         ty.format(formatted_code, formatter)?; // `Ty`
     }
     // `WhereClause`
@@ -204,15 +193,12 @@ fn format_fn_args(
     match fn_args {
         FnArgs::Static(args) => match formatter.shape.code_line.line_style {
             LineStyle::Multiline => {
-                if !args.value_separator_pairs.is_empty() || args.final_value_opt.is_some() {
-                    formatter.shape.block_indent(&formatter.config);
+                formatter.shape.code_line.update_expr_new_line(true);
+                if !args.is_empty() {
+                    formatter.indent();
                     args.format(formatted_code, formatter)?;
-                    formatter.shape.block_unindent(&formatter.config);
-                    write!(
-                        formatted_code,
-                        "{}",
-                        formatter.shape.indent.to_string(&formatter.config)?
-                    )?;
+                    formatter.unindent();
+                    write!(formatted_code, "{}", formatter.indent_to_str()?)?;
                 }
             }
             _ => args.format(formatted_code, formatter)?,
@@ -225,17 +211,14 @@ fn format_fn_args(
         } => {
             match formatter.shape.code_line.line_style {
                 LineStyle::Multiline => {
-                    formatter.shape.block_indent(&formatter.config);
-                    write!(
-                        formatted_code,
-                        "\n{}",
-                        formatter.shape.indent.to_string(&formatter.config)?
-                    )?;
+                    formatter.shape.code_line.update_expr_new_line(true);
+                    formatter.indent();
+                    write!(formatted_code, "\n{}", formatter.indent_to_str()?)?;
                     format_self(self_token, ref_self, mutable_self, formatted_code)?;
                     // `args_opt`
-                    if let Some((comma, args)) = args_opt {
+                    if let Some((_comma, args)) = args_opt {
                         // `, `
-                        write!(formatted_code, "{}", comma.ident().as_str())?;
+                        write!(formatted_code, "{}", CommaToken::AS_STR)?;
                         // `Punctuated<FnArg, CommaToken>`
                         args.format(formatted_code, formatter)?;
                     }
@@ -243,9 +226,9 @@ fn format_fn_args(
                 _ => {
                     format_self(self_token, ref_self, mutable_self, formatted_code)?;
                     // `args_opt`
-                    if let Some((comma, args)) = args_opt {
+                    if let Some((_comma, args)) = args_opt {
                         // `, `
-                        write!(formatted_code, "{} ", comma.ident().as_str())?;
+                        write!(formatted_code, "{} ", CommaToken::AS_STR)?;
                         // `Punctuated<FnArg, CommaToken>`
                         args.format(formatted_code, formatter)?;
                     }
@@ -258,21 +241,21 @@ fn format_fn_args(
 }
 
 fn format_self(
-    self_token: &SelfToken,
+    _self_token: &SelfToken,
     ref_self: &Option<RefToken>,
     mutable_self: &Option<MutToken>,
     formatted_code: &mut FormattedCode,
 ) -> Result<(), FormatterError> {
     // `ref `
-    if let Some(ref_token) = ref_self {
-        write!(formatted_code, "{} ", ref_token.span().as_str())?;
+    if ref_self.is_some() {
+        write!(formatted_code, "{} ", RefToken::AS_STR)?;
     }
     // `mut `
-    if let Some(mut_token) = mutable_self {
-        write!(formatted_code, "{} ", mut_token.span().as_str())?;
+    if mutable_self.is_some() {
+        write!(formatted_code, "{} ", MutToken::AS_STR)?;
     }
     // `self`
-    write!(formatted_code, "{}", self_token.span().as_str())?;
+    write!(formatted_code, "{}", SelfToken::AS_STR)?;
 
     Ok(())
 }
@@ -304,7 +287,7 @@ impl Format for FnArg {
     ) -> Result<(), FormatterError> {
         self.pattern.format(formatted_code, formatter)?;
         // `: `
-        write!(formatted_code, "{} ", self.colon_token.span().as_str())?;
+        write!(formatted_code, "{} ", ColonToken::AS_STR)?;
 
         write_comments(
             formatted_code,

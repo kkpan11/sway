@@ -1,15 +1,14 @@
 use crate::{type_system::*, Engines};
-
-use sway_error::error::CompileError;
-use sway_types::{integer_bits::IntegerBits, span, u256::U256};
-
+use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     hash::{Hash, Hasher},
     num::{IntErrorKind, ParseIntError},
 };
+use sway_error::error::CompileError;
+use sway_types::{integer_bits::IntegerBits, span, u256::U256};
 
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub enum Literal {
     U8(u8),
     U16(u16),
@@ -20,6 +19,19 @@ pub enum Literal {
     Numeric(u64),
     Boolean(bool),
     B256([u8; 32]),
+}
+
+impl Literal {
+    pub fn cast_value_to_u64(&self) -> Option<u64> {
+        match self {
+            Literal::U8(v) => Some(*v as u64),
+            Literal::U16(v) => Some(*v as u64),
+            Literal::U32(v) => Some(*v as u64),
+            Literal::U64(v) => Some(*v),
+            Literal::Numeric(v) => Some(*v),
+            _ => None,
+        }
+    }
 }
 
 impl Hash for Literal {
@@ -133,7 +145,7 @@ impl Literal {
 
     pub(crate) fn to_typeinfo(&self) -> TypeInfo {
         match self {
-            Literal::String(s) => TypeInfo::Str(Length::new(s.as_str().len(), s.clone())),
+            Literal::String(_) => TypeInfo::StringSlice,
             Literal::Numeric(_) => TypeInfo::Numeric,
             Literal::U8(_) => TypeInfo::UnsignedInteger(IntegerBits::Eight),
             Literal::U16(_) => TypeInfo::UnsignedInteger(IntegerBits::Sixteen),

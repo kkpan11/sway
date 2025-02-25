@@ -172,14 +172,14 @@ quux();\n    }\n\n\n}"
 fmt_test_expr!(  match_branch_kind_tuple_long
 "match (foo, bar) {
     (
-        VeryLongFoo::SomeLongFoo(some_foo),
-        VeryLongBar::SomeLongBar(some_bar),
+        SomeVeryVeryLongFoo::SomeLongFoo(some_foo),
+        SomeVeryVeryLongBar::SomeLongBar(some_bar),
     ) => {
         foo();
     }
     (
-        VeryLongFoo::OtherLongFoo(other_foo),
-        VeryLongBar::OtherLongBar(other_bar),
+        SomeVeryVeryLongFoo::OtherLongFoo(other_foo),
+        SomeVeryVeryLongBar::OtherLongBar(other_bar),
     ) => {
         bar();
     }
@@ -190,12 +190,12 @@ fmt_test_expr!(  match_branch_kind_tuple_long
             intermediate_whitespace
 "match (foo, bar) {
     (
-        VeryLongFoo::SomeLongFoo(some_foo), \n  \n VeryLongBar::SomeLongBar(some_bar)) => \n 
+        SomeVeryVeryLongFoo::SomeLongFoo(some_foo), \n  \n SomeVeryVeryLongBar::SomeLongBar(some_bar)) => \n 
     \n{
     \n
         foo();
     }
-    (VeryLongFoo::OtherLongFoo(other_foo), VeryLongBar::OtherLongBar(other_bar) \n ) => {
+    (SomeVeryVeryLongFoo::OtherLongFoo(other_foo), SomeVeryVeryLongBar::OtherLongBar(other_bar) \n ) => {
         bar();
     \n
     }
@@ -245,4 +245,32 @@ fmt_test_expr!(  nested_array
         0x0000000000000000000000000000000000000000000000000000000000 ,
      ] ,
   ]"
+);
+
+fmt_test_expr!(basic_while_loop
+"while i == true {
+    let i = 42;
+}",
+intermediate_whitespace
+"while i==true{
+let i = 42;
+}");
+
+fmt_test_expr!(scoped_block
+"{
+    let i = 42;
+}",
+intermediate_whitespace
+"{
+let i = 42;
+}");
+
+fmt_test_expr!(basic_for_loop
+"for iter in [0, 1, 7, 8, 15] {
+    let i = 42;
+}",
+intermediate_whitespace
+"for iter in [0, 1, 7, 8, 15]{
+let i = 42;
+}"
 );

@@ -1,8 +1,9 @@
+//! Creation of HTML anchors for types that can be linked.
 use crate::{doc::module::ModuleInfo, RenderPlan};
 use anyhow::{anyhow, Result};
 use horrorshow::{box_html, RenderBox};
 use sway_core::{AbiName, TypeInfo};
-use sway_types::Spanned;
+use sway_types::{Named, Spanned};
 
 /// Handles types & nested types that should have links
 /// eg. (`[]` represent types with links).
@@ -22,24 +23,37 @@ pub(crate) fn render_type_anchor(
     match type_info {
         TypeInfo::Array(ty_arg, len) => {
             let inner = render_type_anchor(
-                render_plan.engines.te().get(ty_arg.type_id),
+                (*render_plan.engines.te().get(ty_arg.type_id)).clone(),
+                render_plan,
+                current_module_info,
+            )?;
+            let len_string = format!("{:?}", render_plan.engines.help_out(len));
+            Ok(box_html! {
+                : "[";
+                : inner;
+                : format!("; {}]", len_string);
+            })
+        }
+        TypeInfo::Slice(ty_arg) => {
+            let inner = render_type_anchor(
+                (*render_plan.engines.te().get(ty_arg.type_id)).clone(),
                 render_plan,
                 current_module_info,
             )?;
             Ok(box_html! {
-                : "[";
+                : "__slice[";
                 : inner;
-                : format!("; {}]", len.val());
+                : "]";
             })
         }
         TypeInfo::Tuple(ty_args) => {
             let mut rendered_args: Vec<_> = Vec::new();
             for ty_arg in ty_args {
                 rendered_args.push(render_type_anchor(
-                    render_plan.engines.te().get(ty_arg.type_id),
+                    (*render_plan.engines.te().get(ty_arg.type_id)).clone(),
                     render_plan,
                     current_module_info,
-                )?)
+                )?);
             }
             Ok(box_html! {
                 : "(";
@@ -49,36 +63,38 @@ pub(crate) fn render_type_anchor(
                 : ")";
             })
         }
-        TypeInfo::Enum(decl_ref) => {
-            let enum_decl = render_plan.engines.de().get_enum(&decl_ref);
+        TypeInfo::Enum(decl_id) => {
+            let enum_decl = render_plan.engines.de().get_enum(&decl_id);
             if !render_plan.document_private_items && enum_decl.visibility.is_private() {
                 Ok(box_html! {
-                    : decl_ref.name().clone().as_str();
+                    : enum_decl.name().clone().as_str();
                 })
             } else {
-                let module_info = ModuleInfo::from_call_path(enum_decl.call_path);
-                let file_name = format!("enum.{}.html", decl_ref.name().clone().as_str());
-                let href = module_info.file_path_from_location(&file_name, current_module_info)?;
+                let module_info = ModuleInfo::from_call_path(&enum_decl.call_path);
+                let file_name = format!("enum.{}.html", enum_decl.name().clone().as_str());
+                let href =
+                    module_info.file_path_from_location(&file_name, current_module_info, false)?;
                 Ok(box_html! {
                     a(class="enum", href=href) {
-                        : decl_ref.name().clone().as_str();
+                        : enum_decl.name().clone().as_str();
                     }
                 })
             }
         }
-        TypeInfo::Struct(decl_ref) => {
-            let struct_decl = render_plan.engines.de().get_struct(&decl_ref);
+        TypeInfo::Struct(decl_id) => {
+            let struct_decl = render_plan.engines.de().get_struct(&decl_id);
             if !render_plan.document_private_items && struct_decl.visibility.is_private() {
                 Ok(box_html! {
-                    : decl_ref.name().clone().as_str();
+                    : struct_decl.name().clone().as_str();
                 })
             } else {
-                let module_info = ModuleInfo::from_call_path(struct_decl.call_path);
-                let file_name = format!("struct.{}.html", decl_ref.name().clone().as_str());
-                let href = module_info.file_path_from_location(&file_name, current_module_info)?;
+                let module_info = ModuleInfo::from_call_path(&struct_decl.call_path);
+                let file_name = format!("struct.{}.html", struct_decl.name().clone().as_str());
+                let href =
+                    module_info.file_path_from_location(&file_name, current_module_info, false)?;
                 Ok(box_html! {
                     a(class="struct", href=href) {
-                        : decl_ref.name().clone().as_str();
+                        : struct_decl.name().clone().as_str();
                     }
                 })
             }
@@ -86,7 +102,7 @@ pub(crate) fn render_type_anchor(
         TypeInfo::UnknownGeneric { name, .. } => Ok(box_html! {
             : name.as_str();
         }),
-        TypeInfo::Str(len) => Ok(box_html! {
+        TypeInfo::StringArray(len) => Ok(box_html! {
             : len.span().as_str();
         }),
         TypeInfo::UnsignedInteger(int_bits) => {
@@ -115,11 +131,11 @@ pub(crate) fn render_type_anchor(
                 Err(anyhow!("Deferred AbiName is unhandled"))
             }
         }
-        TypeInfo::Custom { call_path, .. } => Ok(box_html! {
-            : call_path.suffix.as_str();
-        }),
-        TypeInfo::SelfType => Ok(box_html! {
-            : "Self";
+        TypeInfo::Custom {
+            qualified_call_path,
+            ..
+        } => Ok(box_html! {
+            : qualified_call_path.call_path.suffix.as_str();
         }),
         TypeInfo::B256 => Ok(box_html! {
             : "b256";

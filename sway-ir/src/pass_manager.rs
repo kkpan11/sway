@@ -1,17 +1,21 @@
 use crate::{
-    create_arg_demotion_pass, create_const_combine_pass, create_const_demotion_pass,
-    create_dce_pass, create_dom_fronts_pass, create_dominators_pass, create_escaped_symbols_pass,
-    create_func_dce_pass, create_inline_in_main_pass, create_inline_in_module_pass,
-    create_mem2reg_pass, create_memcpyopt_pass, create_misc_demotion_pass,
+    create_arg_demotion_pass, create_ccp_pass, create_const_demotion_pass,
+    create_const_folding_pass, create_cse_pass, create_dce_pass, create_dom_fronts_pass,
+    create_dominators_pass, create_escaped_symbols_pass, create_fn_dce_pass,
+    create_fn_dedup_debug_profile_pass, create_fn_dedup_release_profile_pass,
+    create_fn_inline_pass, create_mem2reg_pass, create_memcpyopt_pass, create_misc_demotion_pass,
     create_module_printer_pass, create_module_verifier_pass, create_postorder_pass,
-    create_ret_demotion_pass, create_simplify_cfg_pass, Context, Function, IrError, Module,
-    CONSTCOMBINE_NAME, DCE_NAME, FUNC_DCE_NAME, INLINE_MODULE_NAME, MEM2REG_NAME, SIMPLIFYCFG_NAME,
+    create_ret_demotion_pass, create_simplify_cfg_pass, create_sroa_pass, Context, Function,
+    IrError, Module, ARG_DEMOTION_NAME, CCP_NAME, CONST_DEMOTION_NAME, CONST_FOLDING_NAME,
+    CSE_NAME, DCE_NAME, FN_DCE_NAME, FN_DEDUP_DEBUG_PROFILE_NAME, FN_DEDUP_RELEASE_PROFILE_NAME,
+    FN_INLINE_NAME, MEM2REG_NAME, MEMCPYOPT_NAME, MISC_DEMOTION_NAME, RET_DEMOTION_NAME,
+    SIMPLIFY_CFG_NAME, SROA_NAME,
 };
 use downcast_rs::{impl_downcast, Downcast};
 use rustc_hash::FxHashMap;
 use std::{
     any::{type_name, TypeId},
-    collections::hash_map,
+    collections::{hash_map, HashSet},
 };
 
 /// Result of an analysis. Specific result must be downcasted to.
@@ -21,15 +25,15 @@ pub type AnalysisResult = Box<dyn AnalysisResultT>;
 
 /// Program scope over which a pass executes.
 pub trait PassScope {
-    fn get_arena_idx(&self) -> generational_arena::Index;
+    fn get_arena_idx(&self) -> slotmap::DefaultKey;
 }
 impl PassScope for Module {
-    fn get_arena_idx(&self) -> generational_arena::Index {
+    fn get_arena_idx(&self) -> slotmap::DefaultKey {
         self.0
     }
 }
 impl PassScope for Function {
-    fn get_arena_idx(&self) -> generational_arena::Index {
+    fn get_arena_idx(&self) -> slotmap::DefaultKey {
         self.0
     }
 }
@@ -57,7 +61,6 @@ pub struct Pass {
     /// Other passes that this pass depends on.
     pub deps: Vec<&'static str>,
     /// The executor.
-    ///
     pub runner: ScopedPass,
 }
 
@@ -76,7 +79,7 @@ impl Pass {
 #[derive(Default)]
 pub struct AnalysisResults {
     // Hash from (AnalysisResultT, (PassScope, Scope Identity)) to an actual result.
-    results: FxHashMap<(TypeId, (TypeId, generational_arena::Index)), AnalysisResult>,
+    results: FxHashMap<(TypeId, (TypeId, slotmap::DefaultKey)), AnalysisResult>,
     name_typeid_map: FxHashMap<&'static str, TypeId>,
 }
 
@@ -140,6 +143,20 @@ impl AnalysisResults {
     }
 }
 
+/// Options for printing [Pass]es in case of running them with printing requested.
+///
+/// Note that states of IR can always be printed by injecting the module printer pass
+/// and just running the passes. That approach however offers less control over the
+/// printing. E.g., requiring the printing to happen only if the previous passes
+/// modified the IR cannot be done by simply injecting a module printer.
+#[derive(Debug)]
+pub struct PrintPassesOpts {
+    pub initial: bool,
+    pub r#final: bool,
+    pub modified_only: bool,
+    pub passes: HashSet<String>,
+}
+
 #[derive(Default)]
 pub struct PassManager {
     passes: FxHashMap<&'static str, Pass>,
@@ -147,6 +164,23 @@ pub struct PassManager {
 }
 
 impl PassManager {
+    pub const OPTIMIZATION_PASSES: [&'static str; 14] = [
+        FN_INLINE_NAME,
+        SIMPLIFY_CFG_NAME,
+        SROA_NAME,
+        DCE_NAME,
+        FN_DCE_NAME,
+        FN_DEDUP_RELEASE_PROFILE_NAME,
+        FN_DEDUP_DEBUG_PROFILE_NAME,
+        MEM2REG_NAME,
+        MEMCPYOPT_NAME,
+        CONST_FOLDING_NAME,
+        ARG_DEMOTION_NAME,
+        CONST_DEMOTION_NAME,
+        RET_DEMOTION_NAME,
+        MISC_DEMOTION_NAME,
+    ];
+
     /// Register a pass. Should be called only once for each pass.
     pub fn register(&mut self, pass: Pass) -> &'static str {
         for dep in &pass.deps {
@@ -231,12 +265,64 @@ impl PassManager {
         Ok(modified)
     }
 
-    /// Run the passes specified in `config`.
+    /// Run the `passes` and return true if the `passes` modify the initial `ir`.
     pub fn run(&mut self, ir: &mut Context, passes: &PassGroup) -> Result<bool, IrError> {
         let mut modified = false;
         for pass in passes.flatten_pass_group() {
             modified |= self.actually_run(ir, pass)?;
         }
+        Ok(modified)
+    }
+
+    /// Run the `passes` and return true if the `passes` modify the initial `ir`.
+    /// The IR states are printed according to the printing options provided in `print_opts`.
+    pub fn run_with_print(
+        &mut self,
+        ir: &mut Context,
+        passes: &PassGroup,
+        print_opts: &PrintPassesOpts,
+    ) -> Result<bool, IrError> {
+        // Empty IRs are result of compiling dependencies. We don't want to print those.
+        fn ir_is_empty(ir: &Context) -> bool {
+            ir.functions.is_empty()
+                && ir.blocks.is_empty()
+                && ir.values.is_empty()
+                && ir.local_vars.is_empty()
+        }
+
+        fn print_ir_after_pass(ir: &Context, pass: &Pass) {
+            if !ir_is_empty(ir) {
+                println!("// IR: [{}] {}", pass.name, pass.descr);
+                println!("{ir}");
+            }
+        }
+
+        fn print_initial_or_final_ir(ir: &Context, initial_or_final: &'static str) {
+            if !ir_is_empty(ir) {
+                println!("// IR: {initial_or_final}");
+                println!("{ir}");
+            }
+        }
+
+        if print_opts.initial {
+            print_initial_or_final_ir(ir, "Initial");
+        }
+
+        let mut modified = false;
+        for pass in passes.flatten_pass_group() {
+            let modified_in_pass = self.actually_run(ir, pass)?;
+
+            if print_opts.passes.contains(pass) && (!print_opts.modified_only || modified_in_pass) {
+                print_ir_after_pass(ir, self.lookup_registered_pass(pass).unwrap());
+            }
+
+            modified |= modified_in_pass;
+        }
+
+        if print_opts.r#final {
+            print_initial_or_final_ir(ir, "Final");
+        }
+
         Ok(modified)
     }
 
@@ -305,13 +391,17 @@ pub fn register_known_passes(pm: &mut PassManager) {
     pm.register(create_module_printer_pass());
     pm.register(create_module_verifier_pass());
     // Optimization passes.
+    pm.register(create_fn_dedup_release_profile_pass());
+    pm.register(create_fn_dedup_debug_profile_pass());
     pm.register(create_mem2reg_pass());
-    pm.register(create_inline_in_module_pass());
-    pm.register(create_inline_in_main_pass());
-    pm.register(create_const_combine_pass());
+    pm.register(create_sroa_pass());
+    pm.register(create_fn_inline_pass());
+    pm.register(create_const_folding_pass());
+    pm.register(create_ccp_pass());
     pm.register(create_simplify_cfg_pass());
-    pm.register(create_func_dce_pass());
+    pm.register(create_fn_dce_pass());
     pm.register(create_dce_pass());
+    pm.register(create_cse_pass());
     pm.register(create_arg_demotion_pass());
     pm.register(create_const_demotion_pass());
     pm.register(create_ret_demotion_pass());
@@ -320,26 +410,44 @@ pub fn register_known_passes(pm: &mut PassManager) {
 }
 
 pub fn create_o1_pass_group() -> PassGroup {
-    // Create a configuration to specify which passes we want to run now.
+    // Create a create_ccp_passo specify which passes we want to run now.
     let mut o1 = PassGroup::default();
     // Configure to run our passes.
     o1.append_pass(MEM2REG_NAME);
-    o1.append_pass(INLINE_MODULE_NAME);
-    o1.append_pass(CONSTCOMBINE_NAME);
-    o1.append_pass(SIMPLIFYCFG_NAME);
-    o1.append_pass(CONSTCOMBINE_NAME);
-    o1.append_pass(SIMPLIFYCFG_NAME);
-    o1.append_pass(FUNC_DCE_NAME);
+    o1.append_pass(FN_DEDUP_RELEASE_PROFILE_NAME);
+    o1.append_pass(FN_INLINE_NAME);
+    o1.append_pass(SIMPLIFY_CFG_NAME);
+    o1.append_pass(FN_DCE_NAME);
+    o1.append_pass(FN_INLINE_NAME);
+    o1.append_pass(CCP_NAME);
+    o1.append_pass(CONST_FOLDING_NAME);
+    o1.append_pass(SIMPLIFY_CFG_NAME);
+    o1.append_pass(CSE_NAME);
+    o1.append_pass(CONST_FOLDING_NAME);
+    o1.append_pass(SIMPLIFY_CFG_NAME);
+    o1.append_pass(FN_DCE_NAME);
     o1.append_pass(DCE_NAME);
+    o1.append_pass(FN_DEDUP_RELEASE_PROFILE_NAME);
 
     o1
 }
 
-/// Utility to insert a pass after every pass in the given group
+/// Utility to insert a pass after every pass in the given group `pg`.
+/// It preserves the `pg` group's structure. This means if `pg` has subgroups
+/// and those have subgroups, the resulting [PassGroup] will have the
+/// same subgroups, but with the `pass` inserted after every pass in every
+/// subgroup, as well as all passes outside of any groups.
 pub fn insert_after_each(pg: PassGroup, pass: &'static str) -> PassGroup {
-    PassGroup(
+    fn insert_after_each_rec(pg: PassGroup, pass: &'static str) -> Vec<PassOrGroup> {
         pg.0.into_iter()
-            .flat_map(|p_o_g| vec![p_o_g, PassOrGroup::Pass(pass)])
-            .collect(),
-    )
+            .flat_map(|p_o_g| match p_o_g {
+                PassOrGroup::Group(group) => vec![PassOrGroup::Group(PassGroup(
+                    insert_after_each_rec(group, pass),
+                ))],
+                PassOrGroup::Pass(_) => vec![p_o_g, PassOrGroup::Pass(pass)],
+            })
+            .collect()
+    }
+
+    PassGroup(insert_after_each_rec(pg, pass))
 }

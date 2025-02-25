@@ -1,6 +1,6 @@
 use crate::{
     comments::{rewrite_with_comments, write_comments},
-    config::{items::ItemBraceStyle, user_def::FieldAlignment},
+    config::user_def::FieldAlignment,
     formatter::{
         shape::{ExprKind, LineStyle},
         *,
@@ -11,7 +11,10 @@ use crate::{
     },
 };
 use std::fmt::Write;
-use sway_ast::ItemStruct;
+use sway_ast::{
+    keywords::{ColonToken, Keyword, StructToken, Token},
+    CommaToken, ItemStruct, PubToken,
+};
 use sway_types::{ast::Delimiter, Spanned};
 
 #[cfg(test)]
@@ -31,87 +34,96 @@ impl Format for ItemStruct {
                 // Required for comment formatting
                 let start_len = formatted_code.len();
                 // If there is a visibility token add it to the formatted_code with a ` ` after it.
-                if let Some(visibility) = &self.visibility {
-                    write!(formatted_code, "{} ", visibility.span().as_str())?;
+                if self.visibility.is_some() {
+                    write!(formatted_code, "{} ", PubToken::AS_STR)?;
                 }
                 // Add struct token and name
-                write!(formatted_code, "{} ", self.struct_token.span().as_str())?;
+                write!(formatted_code, "{} ", StructToken::AS_STR)?;
                 self.name.format(formatted_code, formatter)?;
                 // Format `GenericParams`, if any
                 if let Some(generics) = &self.generics {
                     generics.format(formatted_code, formatter)?;
                 }
+                if let Some(where_clause) = &self.where_clause_opt {
+                    writeln!(formatted_code)?;
+                    where_clause.format(formatted_code, formatter)?;
+                    formatter.shape.code_line.update_where_clause(true);
+                }
 
                 let fields = self.fields.get();
 
-                // Handle openning brace
+                // Handle opening brace
                 Self::open_curly_brace(formatted_code, formatter)?;
 
-                if fields.final_value_opt.is_none() && fields.value_separator_pairs.is_empty() {
+                if fields.is_empty() {
                     write_comments(formatted_code, self.span().into(), formatter)?;
                 }
 
+                formatter.shape.code_line.update_expr_new_line(true);
+
                 // Determine alignment tactic
                 match formatter.config.structures.field_alignment {
-                    FieldAlignment::AlignFields(enum_variant_align_threshold) => {
+                    FieldAlignment::AlignFields(struct_field_align_threshold) => {
                         writeln!(formatted_code)?;
-                        let value_pairs = &fields
+                        let type_fields = &fields
                             .value_separator_pairs
                             .iter()
-                            // TODO: Handle annotations instead of stripping them
-                            .map(|(type_field, comma_token)| (&type_field.value, comma_token))
+                            // TODO: Handle annotations instead of stripping them.
+                            //       See: https://github.com/FuelLabs/sway/issues/6802
+                            .map(|(type_field, _comma_token)| &type_field.value)
                             .collect::<Vec<_>>();
-                        // In first iteration we are going to be collecting the lengths of the struct variants.
-                        let variant_length: Vec<usize> = value_pairs
+                        // In first iteration we are going to be collecting the lengths of the struct fields.
+                        // We need to include the `pub` keyword in the length, if the field is public,
+                        // together with one space character between the `pub` and the name.
+                        let fields_lengths: Vec<usize> = type_fields
                             .iter()
-                            .map(|(type_field, _)| type_field.name.as_str().len())
+                            .map(|type_field| {
+                                type_field
+                                    .visibility
+                                    .as_ref()
+                                    .map_or(0, |_pub_token| PubToken::AS_STR.len() + 1)
+                                    + type_field.name.as_str().len()
+                            })
                             .collect();
 
-                        // Find the maximum length in the variant_length vector that is still smaller than struct_field_align_threshold.
-                        let mut max_valid_variant_length = 0;
-                        variant_length.iter().for_each(|length| {
-                            if *length > max_valid_variant_length
-                                && *length < enum_variant_align_threshold
+                        // Find the maximum length that is still smaller than the align threshold.
+                        let mut max_valid_field_length = 0;
+                        fields_lengths.iter().for_each(|length| {
+                            if *length > max_valid_field_length
+                                && *length < struct_field_align_threshold
                             {
-                                max_valid_variant_length = *length;
+                                max_valid_field_length = *length;
                             }
                         });
 
-                        let value_pairs_iter = value_pairs.iter().enumerate();
-                        for (var_index, (type_field, comma_token)) in value_pairs_iter.clone() {
-                            write!(
-                                formatted_code,
-                                "{}",
-                                &formatter.shape.indent.to_string(&formatter.config)?
-                            )?;
-
+                        for (var_index, type_field) in type_fields.iter().enumerate() {
+                            write!(formatted_code, "{}", formatter.indent_to_str()?)?;
+                            // If there is a visibility token add it to the formatted_code with a ` ` after it.
+                            if type_field.visibility.is_some() {
+                                write!(formatted_code, "{} ", PubToken::AS_STR)?;
+                            }
                             // Add name
                             type_field.name.format(formatted_code, formatter)?;
-                            let current_variant_length = variant_length[var_index];
-                            if current_variant_length < max_valid_variant_length {
+                            let current_field_length = fields_lengths[var_index];
+                            if current_field_length < max_valid_field_length {
                                 // We need to add alignment between : and ty
                                 // max_valid_variant_length: the length of the variant that we are taking as a reference to align
                                 // current_variant_length: the length of the current variant that we are trying to format
                                 let mut required_alignment =
-                                    max_valid_variant_length - current_variant_length;
+                                    max_valid_field_length - current_field_length;
                                 while required_alignment != 0 {
                                     write!(formatted_code, " ")?;
                                     required_alignment -= 1;
                                 }
                             }
                             // Add `:`, ty & `CommaToken`
-                            write!(
-                                formatted_code,
-                                " {} ",
-                                type_field.colon_token.span().as_str(),
-                            )?;
+                            write!(formatted_code, " {} ", ColonToken::AS_STR)?;
                             type_field.ty.format(formatted_code, formatter)?;
-                            writeln!(formatted_code, "{}", comma_token.span().as_str())?;
+                            writeln!(formatted_code, "{}", CommaToken::AS_STR)?;
                         }
                         if let Some(final_value) = &fields.final_value_opt {
-                            // TODO: Handle annotation
-                            let final_value = &final_value.value;
-                            write!(formatted_code, "{}", final_value.span().as_str())?;
+                            final_value.format(formatted_code, formatter)?;
+                            writeln!(formatted_code)?;
                         }
                     }
                     FieldAlignment::Off => {
@@ -141,16 +153,15 @@ impl CurlyBrace for ItemStruct {
         line: &mut String,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        formatter.shape.block_indent(&formatter.config);
-        let brace_style = formatter.config.items.item_brace_style;
-        match brace_style {
-            ItemBraceStyle::AlwaysNextLine => {
-                // Add openning brace to the next line.
-                write!(line, "\n{}", Delimiter::Brace.as_open_char())?;
+        formatter.indent();
+        let open_brace = Delimiter::Brace.as_open_char();
+        match formatter.shape.code_line.has_where_clause {
+            true => {
+                write!(line, "{open_brace}")?;
+                formatter.shape.code_line.update_where_clause(false);
             }
-            _ => {
-                // Add opening brace to the same line
-                write!(line, " {}", Delimiter::Brace.as_open_char())?;
+            false => {
+                write!(line, " {open_brace}")?;
             }
         }
 
@@ -161,12 +172,12 @@ impl CurlyBrace for ItemStruct {
         line: &mut String,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        // If shape is becoming left-most alligned or - indent just have the defualt shape
-        formatter.shape.block_unindent(&formatter.config);
+        // If shape is becoming left-most aligned or - indent just have the default shape
+        formatter.unindent();
         write!(
             line,
             "{}{}",
-            formatter.shape.indent.to_string(&formatter.config)?,
+            formatter.indent_to_str()?,
             Delimiter::Brace.as_close_char()
         )?;
 

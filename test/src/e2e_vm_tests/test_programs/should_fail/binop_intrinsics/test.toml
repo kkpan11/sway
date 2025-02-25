@@ -11,21 +11,21 @@ category = "fail"
 # check: $()__add("Hello", 22);
 # nextln: $()Mismatched types
 # nextln: $()expected: numeric
-# nextln: $()found:    str[5].
+# nextln: $()found:    str.
 # nextln: $()help: Incorrect argument type
 
 # check: $()error
 # check: $()__add("Hello", "Hello")
 # nextln: $()Mismatched types
 # nextln: $()expected: numeric
-# nextln: $()found:    str[5].
+# nextln: $()found:    str.
 # nextln: $()help: Incorrect argument type
 
 # check: $()error
 # check: $()__add("Hello", "Hello")
 # nextln: $()Mismatched types
 # nextln: $()expected: numeric
-# nextln: $()found:    str[5].
+# nextln: $()found:    str.
 # nextln: $()help: Incorrect argument type
 
 # check: $()error
@@ -56,13 +56,13 @@ category = "fail"
 # check: $()error
 # check: $()__rsh("Hello", 1)
 # nextln: $()Mismatched types
-# nextln: $()expected: numeric
-# nextln: $()found:    str[5].
+# nextln: $()expected: numeric or b256
+# nextln: $()found:    str.
 # nextln: $()help: Incorrect argument type
 
 # check: $()error
 # check: $()__rsh(1, "Hello")
 # nextln: $()Mismatched types
 # nextln: $()expected: numeric
-# nextln: $()found:    str[5].
+# nextln: $()found:    str.
 # nextln: $()help: Incorrect argument type

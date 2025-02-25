@@ -14,6 +14,7 @@ pub mod path;
 mod reg;
 
 use self::git::Url;
+use crate::manifest::GenericManifestFile;
 use crate::{
     manifest::{self, MemberManifestFiles, PackageManifestFile},
     pkg::{ManifestMap, PinnedId},
@@ -297,7 +298,7 @@ impl Pinned {
 
     /// If the source is associated with a specific semver version, emit it.
     ///
-    /// Used soley for the package lock file.
+    /// Used solely for the package lock file.
     pub fn semver(&self) -> Option<semver::Version> {
         match self {
             Self::Registry(reg) => Some(reg.source.version.clone()),
@@ -360,7 +361,7 @@ impl fmt::Display for Pinned {
     }
 }
 
-impl<'a> fmt::Display for DisplayCompiling<'a, Pinned> {
+impl fmt::Display for DisplayCompiling<'_, Pinned> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.source {
             Pinned::Member(_) => self.manifest_dir.display().fmt(f),

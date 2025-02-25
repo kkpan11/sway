@@ -4,9 +4,10 @@ use std::{
 };
 
 use anyhow::anyhow;
+use sway_features::ExperimentalFeatures;
 use sway_ir::{
-    insert_after_each, register_known_passes, PassGroup, PassManager, MODULEPRINTER_NAME,
-    MODULEVERIFIER_NAME,
+    insert_after_each, register_known_passes, PassGroup, PassManager, MODULE_PRINTER_NAME,
+    MODULE_VERIFIER_NAME,
 };
 use sway_types::SourceEngine;
 
@@ -26,7 +27,8 @@ fn main() -> Result<(), anyhow::Error> {
     let source_engine = SourceEngine::default();
 
     // Parse it. XXX Improve this error message too.
-    let mut ir = sway_ir::parser::parse(&input_str, &source_engine)?;
+    let mut ir =
+        sway_ir::parser::parse(&input_str, &source_engine, ExperimentalFeatures::default())?;
 
     // Perform optimisation passes in order.
     let mut passes = PassGroup::default();
@@ -34,10 +36,10 @@ fn main() -> Result<(), anyhow::Error> {
         passes.append_pass(pass);
     }
     if config.print_after_each {
-        passes = insert_after_each(passes, MODULEPRINTER_NAME);
+        passes = insert_after_each(passes, MODULE_PRINTER_NAME);
     }
     if config.verify_after_each {
-        passes = insert_after_each(passes, MODULEVERIFIER_NAME);
+        passes = insert_after_each(passes, MODULE_VERIFIER_NAME);
     }
     pass_mgr.run(&mut ir, &passes)?;
 
@@ -101,7 +103,7 @@ struct ConfigBuilder<'a, I: Iterator<Item = String>> {
     pass_mgr: &'a PassManager,
 }
 
-impl<'a, I: Iterator<Item = String>> ConfigBuilder<'a, I> {
+impl<I: Iterator<Item = String>> ConfigBuilder<'_, I> {
     fn build(pass_mgr: &PassManager, mut rest: I) -> Result<Config, anyhow::Error> {
         rest.next(); // Skip the first arg which is the binary name.
         let next = rest.next();

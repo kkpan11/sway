@@ -1,6 +1,6 @@
 [package]
 name = "sway-types"
-version = "0.43.2"
+version.workspace = true
 description = "Sway core types."
 authors.workspace = true
 edition.workspace = true
@@ -9,13 +9,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fuel-asm = { workspace = true }
-fuel-crypto = { workspace = true }
-fuel-tx = { workspace = true }
-lazy_static = "1.4"
-num-bigint = "0.4.3"
-serde = { version = "1.0", features = ["derive"] }
-thiserror = "1"
+bytecount.workspace = true
+fuel-asm.workspace = true
+fuel-crypto.workspace = true
+fuel-tx.workspace = true
+indexmap.workspace = true
+lazy_static.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+serde = { workspace = true, features = ["derive", "std", "rc"] }
+sway-utils.workspace = true
+thiserror.workspace = true
 
 [features]
 no-span-debug = []
+
+[lints.clippy]
+iter_over_hash_type = "deny"

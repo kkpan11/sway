@@ -21,11 +21,19 @@ const M_Z = 41;
 use lib::L_Y;
 use lib::L_Z;
 
+use lib::L_Z as L_Z_ALIAS;
+
+struct StructWithConstNames {
+    M_X: u64,
+    L_Y: u64,
+    L_Z_ALIAS: u64,
+}
+
 fn main() {
     // local const shadowing a module const
     const M_Y = 5;
     {
-        const M_Y = 55; // no error message here
+        const M_Y = 55;
     }
 
     // local const shadowing a const imported in module
@@ -35,7 +43,7 @@ fn main() {
     const F_X = 7;
     const F_X = 8;
     {
-        const F_X = 81; // no error message here
+        const F_X = 81;
     }
 
     {
@@ -96,6 +104,19 @@ fn main() {
     // const shadowing a locally imported const
     use lib::L_M;
     const L_M = 15;
+
+    let s = StructWithConstNames {
+        M_X,
+        L_Y,
+        L_Z_ALIAS,
+    };
+
+    // pattern variables shadowing different types of consts
+    let _ = match s {
+        StructWithConstNames { M_X, L_Y, L_Z_ALIAS } => {
+            42
+        },
+    };
 }
 
 use lib::L_N;

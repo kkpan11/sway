@@ -15,14 +15,14 @@ struct ItemDetails {
 }
 
 enum SaleError {
-    NotEnoughInventory: str[3], 
+    NotEnoughInventory: str, 
 }
 
 fn main() -> u64 {
     let x = Result::Ok::<u64, SaleError>(5u64);
-    let mut _y = Result::Err::<u64, SaleError>(SaleError::NotEnoughInventory("foo"));
+    let mut y = Result::Err::<u64, SaleError>(SaleError::NotEnoughInventory("foo"));
     // should be the same type
-    _y = x;
+    y = x;
     5
 }
 

@@ -2,13 +2,18 @@ script;
 
 use contract_with_type_aliases_abi::*;
 
-fn main() {
-    let caller = abi(MyContract, 0xbd6247bd39fdb5659cfe97f377ab76bc408f79d916846e8f572067eae863686c);
+#[cfg(experimental_new_encoding = false)]
+const CONTRACT_ID = 0x0cbeb6efe3104b460be769bdc4ea101ebf16ccc16f2d7b667ec3e1c7f5ce35b5;
+#[cfg(experimental_new_encoding = true)]
+const CONTRACT_ID = 0xb0899ebf2030d48330436b8025b9ca15243ac985f54024ea00d64d961b67482a; // AUTO-CONTRACT-ID ../../test_contracts/contract_with_type_aliases --release
 
-    let x = AssetId::from(0x0101010101010101010101010101010101010101010101010101010101010101);
+fn main() {
+    let caller = abi(MyContract, CONTRACT_ID);
+
+    let x: b256 = 0x0101010101010101010101010101010101010101010101010101010101010101;
 
     let y = [
-        contract_with_type_aliases_abi::IdentityAlias::ContractId(x),
+        contract_with_type_aliases_abi::IdentityAlias::ContractId(ContractId::from(x)),
         contract_with_type_aliases_abi::IdentityAlias::Address(Address::from(0x0202020202020202020202020202020202020202020202020202020202020202)),
     ];
 
@@ -18,7 +23,7 @@ fn main() {
 
     let u = (x, x);
 
-    let s = "fuelfuel0";
+    let s = __to_str_array("fuelfuel0");
 
     let (x_result, y_result, z_result, w_result, u_result, s_result) = caller.foo(x, y, z, w, u, s);
 

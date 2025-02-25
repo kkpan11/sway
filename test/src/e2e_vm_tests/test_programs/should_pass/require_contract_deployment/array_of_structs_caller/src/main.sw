@@ -1,10 +1,20 @@
 script;
 
 use array_of_structs_abi::{Id, TestContract, Wrapper};
-use std::hash::sha256;
+use std::hash::*;
+
+#[cfg(experimental_new_encoding = false)]
+const CONTRACT_ID = 0x14ed3cd06c2947248f69d54bfa681fe40d26267be84df7e19e253622b7921bbe;
+#[cfg(experimental_new_encoding = true)]
+const CONTRACT_ID = 0xa633ec45709f127e752efd9a657c8fc1bbaa6232d793c82deff1e9a9b91885de; // AUTO-CONTRACT-ID ../../test_contracts/array_of_structs_contract --release
+
+fn get_address() -> Option<std::address::Address> {
+    Some(CONTRACT_ID.into())
+}
 
 fn main() -> u64 {
-    let addr = abi(TestContract, 0x8be98f018738eb6e554372cc3e57c24475662e6eeff9781be50b146c41e72d05);
+    // Test address being a complex expression
+    let addr = abi(TestContract, get_address().unwrap().into());
 
     let input = [Wrapper {
         id: Id {
@@ -25,8 +35,12 @@ fn main() -> u64 {
     let result = addr.return_element_of_array_of_structs(input);
     assert(result.id.number == 42);
 
-    let result = addr.return_element_of_array_of_strings([ "111", "222", "333"]);
-    assert(sha256("111") == sha256(result));
+    let result = addr.return_element_of_array_of_strings([ 
+        __to_str_array("111"), 
+        __to_str_array("222"), 
+        __to_str_array("333")
+    ]);
+    assert(sha256("111") == sha256_str_array(result));
 
     1
 }

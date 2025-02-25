@@ -2,20 +2,129 @@
 library;
 
 use ::assert::assert;
-use ::convert::From;
-use ::flags::{disable_panic_on_overflow, set_flags};
+use ::convert::{From, Into};
+use ::flags::{
+    disable_panic_on_overflow,
+    panic_on_overflow_enabled,
+    panic_on_unsafe_math_enabled,
+    set_flags,
+};
+use ::registers::{flags, overflow};
 use ::math::*;
 use ::result::Result::{self, *};
+use ::option::Option::{self, None, Some};
 
 /// The 128-bit unsigned integer type.
+///
+/// # Additional Information
+///
 /// Represented as two 64-bit components: `(upper, lower)`, where `value = (upper << 64) + lower`.
 pub struct U128 {
+    /// The most significant 64 bits of the `U128`.
     upper: u64,
+    /// The least significant 64 bits of the `U128`.
     lower: u64,
 }
 
-/// The error type used for `u128` type errors.
+impl From<u8> for U128 {
+    /// Converts a `u8` to a `U128`.
+    ///
+    /// # Returns
+    ///
+    /// * [U128] - The `U128` representation of the `u8` value.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let u128_value = U128::from(0u8);
+    /// }
+    /// ```
+    fn from(val: u8) -> Self {
+        Self {
+            upper: 0,
+            lower: val.as_u64(),
+        }
+    }
+}
+
+impl From<u16> for U128 {
+    /// Converts a `u16` to a `U128`.
+    ///
+    /// # Returns
+    ///
+    /// * [U128] - The `U128` representation of the `u16` value.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let u128_value = U128::from(0u16);
+    /// }
+    /// ```
+    fn from(val: u16) -> Self {
+        Self {
+            upper: 0,
+            lower: val.as_u64(),
+        }
+    }
+}
+
+impl From<u32> for U128 {
+    /// Converts a `u32` to a `U128`.
+    ///
+    /// # Returns
+    ///
+    /// * [U128] - The `U128` representation of the `u32` value.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let u128_value = U128::from(0u32);
+    /// }
+    /// ```
+    fn from(val: u32) -> Self {
+        Self {
+            upper: 0,
+            lower: val.as_u64(),
+        }
+    }
+}
+
+impl From<u64> for U128 {
+    /// Converts a `u64` to a `U128`.
+    ///
+    /// # Returns
+    ///
+    /// * [U128] - The `U128` representation of the `u64` value.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let u128_value = U128::from(0u64);
+    /// }
+    /// ```
+    fn from(val: u64) -> Self {
+        Self {
+            upper: 0,
+            lower: val,
+        }
+    }
+}
+
+/// The error type used for `U128` type errors.
 pub enum U128Error {
+    /// This error occurs when a `U128` is attempted to be downcast to a `u64` and the conversion would result in a loss of precision.
     LossOfPrecision: (),
 }
 
@@ -26,17 +135,29 @@ impl From<(u64, u64)> for U128 {
             lower: components.1,
         }
     }
+}
 
-    fn into(self) -> (u64, u64) {
-        (self.upper, self.lower)
+// NOTE: To import, use the glob operator i.e. `use std::u128::*;`
+impl From<U128> for (u64, u64) {
+    fn from(val: U128) -> (u64, u64) {
+        (val.upper, val.lower)
     }
 }
 
+#[cfg(experimental_partial_eq = false)]
 impl core::ops::Eq for U128 {
     fn eq(self, other: Self) -> bool {
         self.lower == other.lower && self.upper == other.upper
     }
 }
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::PartialEq for U128 {
+    fn eq(self, other: Self) -> bool {
+        self.lower == other.lower && self.upper == other.upper
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::Eq for U128 {}
 
 impl core::ops::Ord for U128 {
     fn gt(self, other: Self) -> bool {
@@ -48,10 +169,36 @@ impl core::ops::Ord for U128 {
     }
 }
 
-// TODO this doesn't work?
-// impl core::ops::OrdEq for U128 {
-// }
+impl core::ops::OrdEq for U128 {}
+
 impl u64 {
+    /// Performs addition between two `u64` values, returning a `U128`.
+    ///
+    /// # Additional Information
+    ///
+    /// Allows for addition between two `u64` values that would otherwise overflow.
+    ///
+    /// # Arguments
+    ///
+    /// * `right`: [u64] - The right-hand side of the addition.
+    ///
+    /// # Returns
+    ///
+    /// * [U128] - The result of the addition.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let x = u64::max();
+    ///     let y = u64::max();
+    ///     let z = x.overflowing_add(y);
+    ///
+    ///     assert(z == U128::from(1, 18446744073709551614));
+    /// }
+    /// ```
     pub fn overflowing_add(self, right: Self) -> U128 {
         let prior_flags = disable_panic_on_overflow();
 
@@ -61,22 +208,44 @@ impl u64 {
         };
 
         asm(sum, overflow, left: self, right: right, result_ptr: result) {
-            // Add left and right.
             add sum left right;
-            // Immediately copy the overflow of the addition from `$of` into
-            // `overflow` so that it's not lost.
             move overflow of;
-            // Store the overflow into the first word of result.
             sw result_ptr overflow i0;
-            // Store the sum into the second word of result.
             sw result_ptr sum i1;
         };
-        
+
         set_flags(prior_flags);
 
         result
     }
 
+    /// Performs multiplication between two `u64` values, returning a `U128`.
+    ///
+    /// # Additional Information
+    ///
+    /// Allows for multiplication between two `u64` values that would otherwise overflow.
+    ///
+    /// # Arguments
+    ///
+    /// * `right`: [u64] - The right-hand side of the multiplication.
+    ///
+    /// # Returns
+    ///
+    /// * [U128] - The result of the multiplication.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let x = u64::max();
+    ///     let y = u64::max();
+    ///     let z = x.overflowing_mul(y);
+    ///
+    ///     assert(z == U128::from(18446744073709551615, 1));
+    /// }
+    /// ```
     pub fn overflowing_mul(self, right: Self) -> U128 {
         let prior_flags = disable_panic_on_overflow();
 
@@ -84,19 +253,20 @@ impl u64 {
             upper: 0,
             lower: 0,
         };
-        
-        asm(product, overflow, left: self, right: right, result_ptr: result) {
-            // Multiply left and right.
+
+        asm(
+            product,
+            overflow,
+            left: self,
+            right: right,
+            result_ptr: result,
+        ) {
             mul product left right;
-            // Immediately copy the overflow of the multiplication from `$of` into
-            // `overflow` so that it's not lost.
             move overflow of;
-            // Store the overflow into the first word of result.
             sw result_ptr overflow i0;
-            // Store the product into the second word of result.
             sw result_ptr product i1;
         };
-        
+
         set_flags(prior_flags);
 
         result
@@ -106,15 +276,21 @@ impl u64 {
 impl U128 {
     /// Initializes a new, zeroed `U128`.
     ///
-    /// ### Examples
+    /// # Returns
+    ///
+    /// * [U128] - A new, zero value `U128`.
+    ///
+    /// # Examples
     ///
     /// ```sway
     /// use std::u128::U128;
     ///
-    /// let new_u128 = U128::new();
-    /// let zero_u128 = U128 { upper: 0, lower: 0 };
+    /// fn foo() {
+    ///     let new_u128 = U128::new();
+    ///     let zero_u128 = U128::from(0, 0);
     ///
-    /// assert(new_u128 == zero_u128);
+    ///     assert(new_u128 == zero_u128);
+    /// }
     /// ```
     pub fn new() -> Self {
         Self {
@@ -123,23 +299,33 @@ impl U128 {
         }
     }
 
+    // TODO: Rename to `try_as_u64` to be consistent with all other downcasts
     /// Safely downcast to `u64` without loss of precision.
-    /// Returns `Err` if the `number > u64::max()`.
     ///
-    /// ### Examples
+    /// # Additional Information
+    ///
+    /// If the `U128` is larger than `u64::max()`, an error is returned.
+    ///
+    /// # Returns
+    ///
+    /// * [Result<u64, U128Error>] - The result of the downcast.
+    ///
+    /// # Examples
     ///
     /// ```sway
     /// use std::u128::{U128, U128Error};
     ///
-    /// let zero_u128 = U128 { upper: 0, lower: 0 };
-    /// let zero_u64 = zero_u128.as_u64().unwrap();
+    /// fn foo() {
+    ///     let zero_u128 = U128::from(0, 0);
+    ///     let zero_u64 = zero_u128.as_u64().unwrap();
     ///
-    /// assert(zero_u64 == 0);
+    ///     assert(zero_u64 == 0);
     ///
-    /// let max_u128 = U128::max();
-    /// let result = max_u128.as_u64();
+    ///     let max_u128 = U128::max();
+    ///     let result = max_u128.as_u64();
     ///
-    /// assert(result.is_err()));
+    ///     assert(result.is_err()));
+    /// }
     /// ```
     pub fn as_u64(self) -> Result<u64, U128Error> {
         match self.upper {
@@ -148,18 +334,44 @@ impl U128 {
         }
     }
 
-    /// The smallest value that can be represented by this integer type.
-    /// Initializes a new, zeroed `U128`.
+    /// Upcasts a `U128` to a `u256`.
     ///
-    /// ### Examples
+    /// # Returns
+    ///
+    /// * [u256] - The `u256` representation of the `U128` value.
+    ///
+    /// # Examples
     ///
     /// ```sway
     /// use std::u128::U128;
     ///
-    /// let min_u128 = U128::min();
-    /// let zero_u128 = U128 { upper: 0, lower: 0 };
+    /// fn foo() {
+    ///     let u128_value = U128::from(0u64);
+    ///     let u256_value = u128_value.as_u256();
+    /// }
+    pub fn as_u256(self) -> u256 {
+        asm(nums: (0, 0, self.upper, self.lower)) {
+            nums: u256
+        }
+    }
+
+    /// The smallest value that can be represented by this integer type.
     ///
-    /// assert(min_u128 == zero_u128);
+    /// # Returns
+    ///
+    /// * [U128] - The smallest value that can be represented by this integer type, `0`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let min_u128 = U128::min();
+    ///     let zero_u128 = U128::from(0, 0);
+    ///
+    ///     assert(min_u128 == zero_u128);
+    /// }
     /// ```
     pub fn min() -> Self {
         Self {
@@ -169,17 +381,22 @@ impl U128 {
     }
 
     /// The largest value that can be represented by this type,
-    /// `2<sup>128</sup> - 1`.
     ///
-    /// ### Examples
+    /// # Returns
+    ///
+    /// * [U128] - The largest value that can be represented by this type, `2<sup>128</sup> - 1`.
+    ///
+    /// # Examples
     ///
     /// ```sway
     /// use std::u128::U128;
     ///
-    /// let max_u128 = U128::max();
-    /// let maxed_u128 = U128 { upper: u64::max(), lower: u64::max() };
+    /// fn foo() {
+    ///     let max_u128 = U128::max();
+    ///     let maxed_u128 = U128::from(u64::max(), u64::max());
     ///
-    /// assert(max_u128 == maxed_u128);
+    ///     assert(max_u128 == maxed_u128);
+    /// }
     /// ```
     pub fn max() -> Self {
         Self {
@@ -190,17 +407,108 @@ impl U128 {
 
     /// The size of this type in bits.
     ///
-    /// ### Examples
+    /// # Returns
+    ///
+    /// * [u32] - The size of this type in bits, `128`.
+    ///
+    /// # Examples
     ///
     /// ```sway
     /// use std::u128::U128;
     ///
-    /// let bits = U128::bits();
+    /// fn foo() {
+    ///     let bits = U128::bits();
     ///
-    /// assert(bits == 128);
+    ///     assert(bits == 128);
+    /// }
     /// ```
     pub fn bits() -> u32 {
         128
+    }
+
+    /// Returns the underlying upper u64 representing the most significant 64 bits of the `U128`.
+    ///
+    /// # Returns
+    ///
+    /// * [u64] - The most significant 64 bits of the `U128`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let maxed_u128 = U128::from(u64::max(), u64::min());
+    ///
+    ///     assert(maxed_u128.upper() == u64::max());
+    /// }
+    /// ```
+    pub fn upper(self) -> u64 {
+        self.upper
+    }
+
+    /// Returns the underlying lower u64 representing the least significant 64 bits of the `U128`.
+    ///
+    /// # Returns
+    ///
+    /// * [u64] - The least significant 64 bits of the `U128`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let maxed_u128 = U128::from(u64::max(), u64::min());
+    ///
+    ///     assert(maxed_u128.lower() == u64::min());
+    /// }
+    /// ```
+    pub fn lower(self) -> u64 {
+        self.lower
+    }
+
+    /// Returns the zero value for the `U128` type.
+    ///
+    /// # Returns
+    ///
+    /// * [U128] -> The zero value for the `U128` type.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let zero_u128 = U128::zero();
+    ///     assert(zero_u128 == U128::from((0, 0)));
+    /// }
+    /// ```
+    pub fn zero() -> Self {
+        Self {
+            upper: 0,
+            lower: 0,
+        }
+    }
+
+    /// Returns whether a `U128` is set to zero.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] -> True if the `U128` is zero, otherwise false.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::u128::U128;
+    ///
+    /// fn foo() {
+    ///     let zero_u128 = u128::zero();
+    ///     assert(zero_u128.is_zero());
+    /// }
+    /// ```
+    pub fn is_zero(self) -> bool {
+        self.upper == 0 && self.lower == 0
     }
 }
 
@@ -276,12 +584,15 @@ impl core::ops::Not for U128 {
 }
 
 impl core::ops::Add for U128 {
-    /// Add a `U128` to a `U128`. Panics on overflow.
+    /// Add a `U128` to a `U128`. Reverts on overflow.
     fn add(self, other: Self) -> Self {
         let mut upper_128 = self.upper.overflowing_add(other.upper);
 
-        // If the upper overflows, then the number cannot fit in 128 bits, so panic.
-        assert(upper_128.upper == 0);
+        if panic_on_overflow_enabled() {
+            // If the upper overflows, then the number cannot fit in 128 bits, so panic.
+            assert(upper_128.upper == 0);
+        }
+
         let lower_128 = self.lower.overflowing_add(other.lower);
 
         // If overflow has occurred in the lower component addition, carry.
@@ -290,8 +601,10 @@ impl core::ops::Add for U128 {
             upper_128 = upper_128.lower.overflowing_add(lower_128.upper);
         }
 
-        // If overflow has occurred in the upper component addition, panic.
-        assert(upper_128.upper == 0);
+        if panic_on_overflow_enabled() {
+            // If overflow has occurred in the upper component addition, panic.
+            assert(upper_128.upper == 0);
+        }
 
         Self {
             upper: upper_128.lower,
@@ -301,10 +614,13 @@ impl core::ops::Add for U128 {
 }
 
 impl core::ops::Subtract for U128 {
-    /// Subtract a `U128` from a `U128`. Panics of overflow.
+    /// Subtract a `U128` from a `U128`. Reverts on underflow.
     fn subtract(self, other: Self) -> Self {
-        // If trying to subtract a larger number, panic.
-        assert(!(self < other));
+        // panic_on_overflow_enabled is also for underflow
+        if panic_on_overflow_enabled() {
+            // If trying to subtract a larger number, panic.
+            assert(!(self < other));
+        }
 
         let mut upper = self.upper - other.upper;
         let mut lower = 0;
@@ -321,12 +637,14 @@ impl core::ops::Subtract for U128 {
     }
 }
 impl core::ops::Multiply for U128 {
-    /// Multiply a `U128` with a `U128`. Panics of overflow.
+    /// Multiply a `U128` with a `U128`. Reverts of overflow.
     fn multiply(self, other: Self) -> Self {
         // in case both of the `U128` upper parts are bigger than zero,
         // it automatically means overflow, as any `U128` value
         // is upper part multiplied by 2 ^ 64 + lower part
-        assert(self.upper == 0 || other.upper == 0);
+        if panic_on_unsafe_math_enabled() {
+            assert(self.upper == 0 || other.upper == 0);
+        }
 
         let mut result = self.lower.overflowing_mul(other.lower);
         if self.upper == 0 {
@@ -342,11 +660,17 @@ impl core::ops::Multiply for U128 {
 }
 
 impl core::ops::Divide for U128 {
-    /// Divide a `U128` by a `U128`. Panics if divisor is zero.
+    /// Divide a `U128` by a `U128`. Reverts if divisor is zero.
     fn divide(self, divisor: Self) -> Self {
         let zero = Self::from((0, 0));
 
-        assert(divisor != zero);
+        if panic_on_unsafe_math_enabled() {
+            assert(divisor != zero);
+        } else {
+            if divisor == zero {
+                return zero;
+            }
+        }
 
         if self.upper == 0 && divisor.upper == 0 {
             return Self::from((0, self.lower / divisor.lower));
@@ -359,8 +683,7 @@ impl core::ops::Divide for U128 {
             quotient <<= 1;
             remainder <<= 1;
             remainder.lower = remainder.lower | (self >> i).lower & 1;
-            // TODO use >= once OrdEq can be implemented.
-            if remainder > divisor || remainder == divisor {
+            if remainder >= divisor {
                 remainder -= divisor;
                 quotient.lower = quotient.lower | 1;
             }
@@ -376,38 +699,98 @@ impl core::ops::Divide for U128 {
     }
 }
 
+impl core::ops::Mod for U128 {
+    fn modulo(self, other: Self) -> Self {
+        assert(other != Self::zero());
+
+        // a mod b = a - b * (a / b)
+        let quotient = self / other;
+        let product = quotient * other;
+        self - product
+    }
+}
+
+fn u64_checked_add(a: u64, b: u64) -> Option<u64> {
+    let of = asm(a: a, b: b, res) {
+        add res a b;
+        of: u64
+    };
+
+    if of != 0 {
+        return None;
+    }
+
+    Some(a + b)
+}
+
+fn u128_checked_mul(a: U128, b: U128) -> Option<U128> {
+    // in case both of the `U128` upper parts are bigger than zero,
+    // it automatically means overflow, as any `U128` value
+    // is upper part multiplied by 2 ^ 64 + lower part
+    if a.upper != 0 || b.upper != 0 {
+        return None
+    }
+
+    let mut result = a.lower.overflowing_mul(b.lower);
+
+    if a.upper == 0 {
+        match u64_checked_add(result.upper, a.lower * b.upper) {
+            None => return None,
+            Some(v) => {
+                result.upper = v
+            }
+        }
+    } else if b.upper == 0 {
+        match u64_checked_add(result.upper, a.upper * b.lower) {
+            None => return None,
+            Some(v) => {
+                result.upper = v
+            }
+        }
+    }
+
+    Some(result)
+}
+
 impl Power for U128 {
-    fn pow(self, exponent: Self) -> Self {
+    fn pow(self, exponent: u32) -> Self {
         let mut value = self;
         let mut exp = exponent;
-        let one = Self::from((0, 1));
-        let zero = Self::from((0, 0));
 
-        if exp == zero {
-            return one;
+        if exp == 0 {
+            return Self::from((0, 1));
         }
 
-        if exp == one {
+        if exp == 1 {
             // Manually clone `self`. Otherwise, we may have a `MemoryOverflow`
             // issue with code that looks like: `x = x.pow(other)`
             return Self::from((self.upper, self.lower));
         }
 
-        while exp & one == zero {
-            value = value * value;
+        while exp & 1 == 0 {
+            match u128_checked_mul(value, value) {
+                None => return U128::zero(),
+                Some(v) => value = v,
+            };
             exp >>= 1;
         }
 
-        if exp == one {
+        if exp == 1 {
             return value;
         }
 
         let mut acc = value;
-        while exp > one {
+        while exp > 1 {
             exp >>= 1;
-            value = value * value;
-            if exp & one == one {
-                acc = acc * value;
+            match u128_checked_mul(value, value) {
+                None => return U128::zero(),
+                Some(v) => value = v,
+            };
+            if exp & 1 == 1 {
+                match u128_checked_mul(acc, value) {
+                    None => return U128::zero(),
+                    Some(v) => acc = v,
+                };
             }
         }
         acc
@@ -446,8 +829,14 @@ impl BinaryLogarithm for U128 {
     fn log2(self) -> Self {
         let zero = Self::from((0, 0));
         let mut res = zero;
-        // If trying to get a log2(0), panic, as infinity is not a number.
-        assert(self != zero);
+        // If panic on unsafe math is enabled, only then revert
+        if panic_on_unsafe_math_enabled() {
+            assert(self != zero);
+        } else {
+            if self == zero {
+                return zero;
+            }
+        }
         if self.upper != 0 {
             res = Self::from((0, self.upper.log(2) + 64));
         } else if self.lower != 0 {
@@ -459,8 +848,71 @@ impl BinaryLogarithm for U128 {
 
 impl Logarithm for U128 {
     fn log(self, base: Self) -> Self {
+        let flags = disable_panic_on_overflow();
+
+        // If panic on unsafe math is enabled, only then revert
+        if panic_on_unsafe_math_enabled() {
+            // Logarithm is undefined for bases less than 2
+            assert(base >= U128::from(2_u64));
+            // Logarithm is undefined for 0
+            assert(self != U128::zero());
+        } else {
+            // Logarithm is undefined for bases less than 2
+            // Logarithm is undefined for 0
+            if (base < U128::from(2_u64)) || (self == U128::zero()) {
+                set_flags(flags);
+                return U128::zero();
+            }
+        }
+
+        // Decimals rounded to 0
+        if self < base {
+            set_flags(flags);
+            return U128::zero();
+        }
+
+        // Estimating the result using change of base formula. Only an estimate because we are doing uint calculations.
         let self_log2 = self.log2();
         let base_log2 = base.log2();
-        self_log2 / base_log2
+        let mut result = (self_log2 / base_log2);
+
+        // Converting u128 to u32, this cannot fail as the result will be atmost ~128
+        let parts: (u64, u64) = result.into();
+        let res_u32 = asm(r1: parts.1) {
+            r1: u32
+        };
+
+        // Raising the base to the power of the result
+        let mut pow_res = base.pow(res_u32);
+        let mut of = overflow();
+
+        // Adjusting the result until the power is less than or equal to self
+        // If pow_res is > than self, then there is an overestimation. If there is an overflow then there is definitely an overestimation.
+        while (pow_res > self) || (of > 0) {
+            result -= U128::from(1_u64);
+
+            // Converting u128 to u32, this cannot fail as the result will be atmost ~128
+            let parts: (u64, u64) = result.into();
+            let res_u32 = asm(r1: parts.1) {
+                r1: u32
+            };
+
+            pow_res = base.pow(res_u32);
+            of = overflow();
+        };
+
+        set_flags(flags);
+
+        result
+    }
+}
+
+impl core::ops::TotalOrd for U128 {
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self > other { self } else { other }
     }
 }

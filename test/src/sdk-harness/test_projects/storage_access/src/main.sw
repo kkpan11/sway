@@ -1,5 +1,7 @@
 contract;
 
+use std::hash::*;
+
 struct M {
     u: b256,
     v: u64,
@@ -26,23 +28,50 @@ struct Simple {
     w: u64,
 }
 
+#[cfg(experimental_partial_eq = false)]
 impl core::ops::Eq for M {
     fn eq(self, other: Self) -> bool {
         self.u == other.u && self.v == other.v
     }
 }
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::PartialEq for M {
+    fn eq(self, other: Self) -> bool {
+        self.u == other.u && self.v == other.v
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::Eq for M {}
 
+#[cfg(experimental_partial_eq = false)]
 impl core::ops::Eq for T {
     fn eq(self, other: Self) -> bool {
         self.x == other.x && self.y == other.y && self.z == other.z
     }
 }
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::PartialEq for T {
+    fn eq(self, other: Self) -> bool {
+        self.x == other.x && self.y == other.y && self.z == other.z
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::Eq for T {}
 
+#[cfg(experimental_partial_eq = false)]
 impl core::ops::Eq for S {
     fn eq(self, other: Self) -> bool {
         self.a == other.a && self.b == other.b && self.c == other.c && self.d == other.d
     }
 }
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::PartialEq for S {
+    fn eq(self, other: Self) -> bool {
+        self.a == other.a && self.b == other.b && self.c == other.c && self.d == other.d
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::Eq for S {}
 
 struct S2 {
     map0: StorageMap<u64, u64>,
@@ -52,7 +81,7 @@ struct S2 {
 storage {
     x: u64 = 0,
     y: b256 = 0x0000000000000000000000000000000000000000000000000000000000000000,
-    map: StorageMap<u64, u64> = StorageMap {},
+    map: StorageMap<u64, u64> = StorageMap::<u64, u64> {},
     s: S = S {
         a: 0,
         b: 0x0000000000000000000000000000000000000000000000000000000000000000,
@@ -67,8 +96,8 @@ storage {
         d: 0x0000000000000000000000000000000000000000000000000000000000000000,
     },
     s2: S2 = S2 {
-        map0: StorageMap {},
-        map1: StorageMap {},
+        map0: StorageMap::<u64, u64> {},
+        map1: StorageMap::<u64, u64> {},
     },
     simple: Simple = Simple {
         x: 0,
@@ -106,6 +135,9 @@ abi ExperimentalStorageTest {
 
     #[storage(read, write)]
     fn map_in_struct_write(key: (u64, u64), value: (u64, u64));
+
+    #[storage(read, write)]
+    fn clears_storage_key() -> bool;
 }
 
 impl ExperimentalStorageTest for Contract {
@@ -141,19 +173,21 @@ impl ExperimentalStorageTest for Contract {
         storage.s.c.z.write(s.c.z);
         storage.s.d.write(s.d);
 
-        assert(S {
-            a: storage.s.a.read(),
-            b: storage.s.b.read(),
-            c: T {
-                x: storage.s.c.x.read(),
-                y: storage.s.c.y.read(),
-                z: M {
-                    u: storage.s.c.z.u.read(),
-                    v: storage.s.c.z.v.read(),
+        assert(
+            S {
+                a: storage.s.a.read(),
+                b: storage.s.b.read(),
+                c: T {
+                    x: storage.s.c.x.read(),
+                    y: storage.s.c.y.read(),
+                    z: M {
+                        u: storage.s.c.z.u.read(),
+                        v: storage.s.c.z.v.read(),
+                    },
                 },
-            },
-            d: storage.s.d.read(),
-        } == s);
+                d: storage.s.d.read(),
+            } == s,
+        );
 
         // Semi-granular write, granular read
         storage.s.a.write(s.a);
@@ -161,19 +195,21 @@ impl ExperimentalStorageTest for Contract {
         storage.s.c.write(s.c);
         storage.s.d.write(s.d);
 
-        assert(S {
-            a: storage.s.a.read(),
-            b: storage.s.b.read(),
-            c: T {
-                x: storage.s.c.x.read(),
-                y: storage.s.c.y.read(),
-                z: M {
-                    u: storage.s.c.z.u.read(),
-                    v: storage.s.c.z.v.read(),
+        assert(
+            S {
+                a: storage.s.a.read(),
+                b: storage.s.b.read(),
+                c: T {
+                    x: storage.s.c.x.read(),
+                    y: storage.s.c.y.read(),
+                    z: M {
+                        u: storage.s.c.z.u.read(),
+                        v: storage.s.c.z.v.read(),
+                    },
                 },
-            },
-            d: storage.s.d.read(),
-        } == s);
+                d: storage.s.d.read(),
+            } == s,
+        );
 
         storage.s.read()
     }
@@ -188,12 +224,14 @@ impl ExperimentalStorageTest for Contract {
         storage.s.c.z.write(s.c.z);
         storage.s.d.write(s.d);
 
-        assert(S {
-            a: storage.s.a.read(),
-            b: storage.s.b.read(),
-            c: storage.s.c.read(),
-            d: storage.s.d.read(),
-        } == s);
+        assert(
+            S {
+                a: storage.s.a.read(),
+                b: storage.s.b.read(),
+                c: storage.s.c.read(),
+                d: storage.s.d.read(),
+            } == s,
+        );
 
         // Coarse write and read
         storage.s.write(s);
@@ -213,15 +251,24 @@ impl ExperimentalStorageTest for Contract {
 
     #[storage(read)]
     fn map_in_struct_read(key: (u64, u64)) -> (Option<u64>, Option<u64>) {
-        (
-            storage.s2.map0.get(key.0).try_read(),
-            storage.s2.map1.get(key.1).try_read(),
-        )
+        (storage.s2.map0.get(key.0).try_read(), storage.s2.map1.get(key.1).try_read())
     }
 
     #[storage(read, write)]
     fn map_in_struct_write(key: (u64, u64), value: (u64, u64)) {
         storage.s2.map0.insert(key.0, value.0);
         storage.s2.map1.insert(key.1, value.1);
+    }
+
+    #[storage(read, write)]
+    fn clears_storage_key() -> bool {
+        let key = StorageKey::<u64>::zero();
+        key.write(42);
+
+        assert(key.read() == 42);
+        let cleared = key.clear();
+        assert(cleared);
+        assert(key.try_read().is_none());
+        cleared
     }
 }

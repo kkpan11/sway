@@ -3,10 +3,10 @@ use crate::{Parse, ParseBracket, ParseResult, ParseToEnd, Parser, ParserConsumed
 use sway_ast::brackets::{Braces, Parens, SquareBrackets};
 use sway_ast::expr::{LoopControlFlow, ReassignmentOp, ReassignmentOpVariant};
 use sway_ast::keywords::{
-    AbiToken, AddEqToken, AsmToken, CommaToken, ConfigurableToken, ConstToken, DivEqToken,
-    DoubleColonToken, EnumToken, EqToken, FalseToken, FnToken, IfToken, ImplToken, LetToken,
-    OpenAngleBracketToken, PubToken, SemicolonToken, ShlEqToken, ShrEqToken, StarEqToken,
-    StorageToken, StructToken, SubEqToken, Token, TraitToken, TrueToken, TypeToken, UseToken,
+    AbiToken, AddEqToken, AmpersandToken, AsmToken, CommaToken, ConfigurableToken, ConstToken,
+    DivEqToken, DoubleColonToken, EnumToken, EqToken, FalseToken, FnToken, IfToken, ImplToken,
+    LetToken, MutToken, OpenAngleBracketToken, PubToken, SemicolonToken, ShlEqToken, ShrEqToken,
+    StarEqToken, StorageToken, StructToken, SubEqToken, TraitToken, TrueToken, TypeToken, UseToken,
 };
 use sway_ast::literal::{LitBool, LitBoolType};
 use sway_ast::punctuated::Punctuated;
@@ -93,23 +93,28 @@ impl Parse for Expr {
 
 impl Parse for StatementLet {
     fn parse(parser: &mut Parser) -> ParseResult<Self> {
-        let let_token = parser.parse()?;
-        let pattern = parser.parse()?;
+        let let_token: LetToken = parser.parse()?;
+
+        if parser.peek::<EqToken>().is_some() {
+            return Err(parser.emit_error_with_span(
+                ParseErrorKind::ExpectedPattern,
+                let_token
+                    .span()
+                    .next_char_utf8()
+                    .unwrap_or_else(|| let_token.span()),
+            ));
+        }
+        let pattern = parser.try_parse(true)?;
+
         let ty_opt = match parser.take() {
             Some(colon_token) => Some((colon_token, parser.parse()?)),
             None => None,
         };
-        let eq_token: EqToken = parser.parse()?;
-
-        // Recover on missing expression.
-        // FIXME(Centril): We should point at right after `=`, not at it.
-        let on_err = |err| Expr::Error([eq_token.span()].into(), err);
-        let expr = parser.parse().unwrap_or_else(on_err);
+        let eq_token: EqToken = parser.try_parse(true)?;
+        let expr = parser.try_parse(true)?;
 
         // Recover on missing semicolon.
-        let semicolon_token = parser
-            .parse()
-            .unwrap_or_else(|_| SemicolonToken::new(eq_token.span()));
+        let semicolon_token = parser.try_parse(true)?;
 
         Ok(StatementLet {
             let_token,
@@ -127,19 +132,29 @@ impl ParseToEnd for CodeBlockContents {
         mut parser: Parser<'a, '_>,
     ) -> ParseResult<(CodeBlockContents, ParserConsumed<'a>)> {
         let mut statements = Vec::new();
+
         let (final_expr_opt, consumed) = loop {
             if let Some(consumed) = parser.check_empty() {
                 break (None, consumed);
             }
-            match parse_stmt(&mut parser)? {
-                StmtOrTail::Stmt(s) => statements.push(s),
-                StmtOrTail::Tail(e, c) => break (Some(e), c),
+
+            match parser.call_parsing_function_with_recovery(parse_stmt) {
+                Ok(StmtOrTail::Stmt(s)) => statements.push(s),
+                Ok(StmtOrTail::Tail(e, c)) => break (Some(e), c),
+                Err(r) => {
+                    let (spans, error) = r
+                        .recover_at_next_line_with_fallback_error(ParseErrorKind::InvalidStatement);
+                    statements.push(Statement::Error(spans, error));
+                }
             }
         };
+
         let code_block_contents = CodeBlockContents {
             statements,
             final_expr_opt,
+            span: parser.full_span().clone(),
         };
+
         Ok((code_block_contents, consumed))
     }
 }
@@ -181,8 +196,8 @@ fn parse_stmt<'a>(parser: &mut Parser<'a, '_>) -> ParseResult<StmtOrTail<'a>> {
     }
 
     // Try a `let` statement.
-    if let Some(slet) = parser.guarded_parse::<LetToken, _>()? {
-        return stmt(Statement::Let(slet));
+    if let Some(item) = parser.guarded_parse::<LetToken, StatementLet>()? {
+        return stmt(Statement::Let(item));
     }
 
     // Try an `expr;` statement.
@@ -266,15 +281,20 @@ fn take_reassignment_op(parser: &mut Parser) -> Option<ReassignmentOp> {
 
 fn parse_reassignment(parser: &mut Parser, ctx: ParseExprCtx) -> ParseResult<Expr> {
     let expr = parse_logical_or(parser, ctx)?;
+    let expr_span = expr.span();
 
     if let Some(reassignment_op) = take_reassignment_op(parser) {
         let assignable = match expr.try_into_assignable() {
             Ok(assignable) => assignable,
             Err(expr) => {
                 let span = expr.span();
-                return Err(
-                    parser.emit_error_with_span(ParseErrorKind::UnassignableExpression, span)
-                );
+                return Err(parser.emit_error_with_span(
+                    ParseErrorKind::UnassignableExpression {
+                        erroneous_expression_kind: expr.friendly_name(),
+                        erroneous_expression_span: span,
+                    },
+                    expr_span,
+                ));
             }
         };
         let expr = Box::new(parse_reassignment(parser, ctx.not_statement())?);
@@ -492,16 +512,33 @@ fn parse_mul(parser: &mut Parser, ctx: ParseExprCtx) -> ParseResult<Expr> {
 }
 
 fn parse_unary_op(parser: &mut Parser, ctx: ParseExprCtx) -> ParseResult<Expr> {
-    if let Some((ref_token, expr)) = parse_op_rhs(parser, ctx, parse_unary_op)? {
-        return Ok(Expr::Ref { ref_token, expr });
+    if let Some((ampersand_token, mut_token, expr)) = parse_referencing(parser, ctx)? {
+        return Ok(Expr::Ref {
+            ampersand_token,
+            mut_token,
+            expr,
+        });
     }
-    if let Some((deref_token, expr)) = parse_op_rhs(parser, ctx, parse_unary_op)? {
-        return Ok(Expr::Deref { deref_token, expr });
+    if let Some((star_token, expr)) = parse_op_rhs(parser, ctx, parse_unary_op)? {
+        return Ok(Expr::Deref { star_token, expr });
     }
     if let Some((bang_token, expr)) = parse_op_rhs(parser, ctx, parse_unary_op)? {
         return Ok(Expr::Not { bang_token, expr });
     }
-    parse_projection(parser, ctx)
+    return parse_projection(parser, ctx);
+
+    #[allow(clippy::type_complexity)] // Used just here for getting the three parsed elements.
+    fn parse_referencing(
+        parser: &mut Parser,
+        ctx: ParseExprCtx,
+    ) -> ParseResult<Option<(AmpersandToken, Option<MutToken>, Box<Expr>)>> {
+        if let Some(ampersand_token) = parser.take() {
+            let mut_token = parser.take::<MutToken>();
+            let expr = Box::new(parse_unary_op(parser, ctx.not_statement())?);
+            return Ok(Some((ampersand_token, mut_token, expr)));
+        }
+        Ok(None)
+    }
 }
 
 fn parse_projection(parser: &mut Parser, ctx: ParseExprCtx) -> ParseResult<Expr> {
@@ -566,6 +603,7 @@ fn parse_projection(parser: &mut Parser, ctx: ParseExprCtx) -> ParseResult<Expr>
                     span,
                     parsed,
                     ty_opt,
+                    is_generated_b256: _,
                 } = lit_int;
                 if ty_opt.is_some() {
                     return Err(
@@ -598,7 +636,7 @@ fn ensure_field_projection_no_generics(
     generic_args: &Option<(DoubleColonToken, GenericArgs)>,
 ) {
     if let Some((dct, generic_args)) = generic_args {
-        let span = Span::join(dct.span(), generic_args.span());
+        let span = Span::join(dct.span(), &generic_args.span());
         parser.emit_error_with_span(ParseErrorKind::FieldProjectionWithGenericArgs, span);
     }
 }
@@ -699,6 +737,19 @@ fn parse_atom(parser: &mut Parser, ctx: ParseExprCtx) -> ParseResult<Expr> {
         return Ok(Expr::While {
             while_token,
             condition,
+            block,
+        });
+    }
+    if let Some(for_token) = parser.take() {
+        let value_pattern = parser.parse()?;
+        let in_token = parser.parse()?;
+        let iterator = Box::new(parse_condition(parser)?);
+        let block = parser.parse()?;
+        return Ok(Expr::For {
+            for_token,
+            value_pattern,
+            in_token,
+            iterator,
             block,
         });
     }

@@ -75,7 +75,7 @@ macro_rules! fmt_test_inner {
         paste! {
             #[test]
             fn [<$scope _ $name>] () {
-                let formatted_code = crate::parse::parse_format::<$ty>($y);
+                let formatted_code = crate::parse::parse_format::<$ty>($y).unwrap();
                 let changeset = diff_lines(&formatted_code, $desired_output);
                 let count_of_updates = changeset.diff().len();
                 if count_of_updates != 0 {
@@ -119,23 +119,24 @@ macro_rules! fmt_test_inner {
 #[macro_export]
 macro_rules! assert_eq_pretty {
     ($got:expr, $expected:expr) => {
-        let got = &$got;
-        let expected = &$expected;
+        let got = &$got[..];
+        let expected = &$expected[..];
+
         if got != expected {
-            panic!(
-                "
-printed outputs differ!
-expected:
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-{}
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-got:
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-{}
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-",
-                expected, got
-            );
+            use similar::TextDiff;
+
+            let diff = TextDiff::from_lines(expected, got);
+            for op in diff.ops() {
+                for change in diff.iter_changes(op) {
+                    match change.tag() {
+                        similar::ChangeTag::Equal => print!("{}", change),
+                        similar::ChangeTag::Insert => print!("\x1b[32m+{}\x1b[0m", change), // Green for additions
+                        similar::ChangeTag::Delete => print!("\x1b[31m-{}\x1b[0m", change), // Red for deletions
+                    }
+                }
+            }
+            println!();
+            panic!("printed outputs differ!");
         }
     };
 }

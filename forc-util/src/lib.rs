@@ -1,17 +1,18 @@
 //! Utility items shared between forc crates.
-
 use annotate_snippets::{
-    display_list::{DisplayList, FormatOptions},
-    snippet::{Annotation, AnnotationType, Slice, Snippet, SourceAnnotation},
+    renderer::{AnsiColor, Style},
+    Annotation, AnnotationType, Renderer, Slice, Snippet, SourceAnnotation,
 };
-use ansi_term::Colour;
-use anyhow::{bail, Result};
-use forc_tracing::{println_red_err, println_yellow_err};
-use std::{collections::HashSet, str};
-use std::{ffi::OsStr, process::Termination};
+use anyhow::{bail, Context, Result};
+use forc_tracing::{println_action_green, println_error, println_red_err, println_yellow_err};
 use std::{
+    collections::{hash_map, HashSet},
     fmt::Display,
+    fs::File,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    process::Termination,
+    str,
 };
 use sway_core::language::parsed::TreeType;
 use sway_error::{
@@ -19,11 +20,20 @@ use sway_error::{
     error::CompileError,
     warning::CompileWarning,
 };
-use sway_types::{LineCol, SourceEngine, Span};
+use sway_types::{LineCol, LineColRange, SourceEngine, Span};
 use sway_utils::constants;
-use tracing::error;
 
+pub mod bytecode;
+pub mod fs_locking;
 pub mod restricted;
+
+#[macro_use]
+pub mod cli;
+
+pub use ansiterm;
+pub use paste;
+pub use regex::Regex;
+pub use serial_test;
 
 pub const DEFAULT_OUTPUT_DIRECTORY: &str = "out";
 pub const DEFAULT_ERROR_EXIT_CODE: u8 = 1;
@@ -106,7 +116,7 @@ impl<T> Termination for ForcCliResult<T> {
         match self.result {
             Ok(_) => DEFAULT_SUCCESS_EXIT_CODE.into(),
             Err(e) => {
-                error!("Error: {}", e);
+                println_error(&format!("{}", e));
                 e.exit_code.into()
             }
         }
@@ -145,7 +155,8 @@ pub mod tx_utils {
     pub struct Salt {
         /// Added salt used to derive the contract ID.
         ///
-        /// By default, this is `0x0000000000000000000000000000000000000000000000000000000000000000`.
+        /// By default, this is
+        /// `0x0000000000000000000000000000000000000000000000000000000000000000`.
         #[clap(long = "salt")]
         pub salt: Option<fuel_tx::Salt>,
     }
@@ -164,12 +175,16 @@ pub mod tx_utils {
                 )
             })?;
             match receipt {
-                fuel_tx::Receipt::LogData { data, .. } => {
+                fuel_tx::Receipt::LogData {
+                    data: Some(data), ..
+                } => {
                     if let Some(v) = rec_value.pointer_mut("/LogData/data") {
                         *v = hex::encode(data).into();
                     }
                 }
-                fuel_tx::Receipt::ReturnData { data, .. } => {
+                fuel_tx::Receipt::ReturnData {
+                    data: Some(data), ..
+                } => {
                     if let Some(v) = rec_value.pointer_mut("/ReturnData/data") {
                         *v = hex::encode(data).into();
                     }
@@ -183,81 +198,6 @@ pub mod tx_utils {
             Ok(serde_json::to_string(&receipt_to_json_array)?)
         }
     }
-}
-
-/// Continually go down in the file tree until a Forc manifest file is found.
-pub fn find_nested_manifest_dir(starter_path: &Path) -> Option<PathBuf> {
-    find_nested_dir_with_file(starter_path, constants::MANIFEST_FILE_NAME)
-}
-
-/// Continually go down in the file tree until a specified file is found.
-///
-/// Starts the search from child dirs of `starter_path`.
-pub fn find_nested_dir_with_file(starter_path: &Path, file_name: &str) -> Option<PathBuf> {
-    use walkdir::WalkDir;
-    let starter_dir = if starter_path.is_dir() {
-        starter_path
-    } else {
-        starter_path.parent()?
-    };
-    WalkDir::new(starter_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|entry| entry.path() != starter_dir.join(file_name))
-        .filter(|entry| entry.file_name().to_string_lossy() == file_name)
-        .map(|entry| {
-            let mut entry = entry.path().to_path_buf();
-            entry.pop();
-            entry
-        })
-        .next()
-}
-
-/// Continually go up in the file tree until a specified file is found.
-///
-/// Starts the search from `starter_path`.
-#[allow(clippy::branches_sharing_code)]
-pub fn find_parent_dir_with_file(starter_path: &Path, file_name: &str) -> Option<PathBuf> {
-    let mut path = std::fs::canonicalize(starter_path).ok()?;
-    let empty_path = PathBuf::from("/");
-    while path != empty_path {
-        path.push(file_name);
-        if path.exists() {
-            path.pop();
-            return Some(path);
-        } else {
-            path.pop();
-            path.pop();
-        }
-    }
-    None
-}
-/// Continually go up in the file tree until a Forc manifest file is found.
-pub fn find_parent_manifest_dir(starter_path: &Path) -> Option<PathBuf> {
-    find_parent_dir_with_file(starter_path, constants::MANIFEST_FILE_NAME)
-}
-
-/// Continually go up in the file tree until a Forc manifest file is found and given predicate
-/// returns true.
-pub fn find_parent_manifest_dir_with_check<F>(starter_path: &Path, f: F) -> Option<PathBuf>
-where
-    F: Fn(&Path) -> bool,
-{
-    find_parent_manifest_dir(starter_path).and_then(|manifest_dir| {
-        // If given check satisifies return current dir otherwise start searching from the parent.
-        if f(&manifest_dir) {
-            Some(manifest_dir)
-        } else if let Some(parent_dir) = manifest_dir.parent() {
-            find_parent_manifest_dir_with_check(parent_dir, f)
-        } else {
-            None
-        }
-    })
-}
-
-pub fn is_sway_file(file: &Path) -> bool {
-    let res = file.extension();
-    file.is_file() && Some(OsStr::new(constants::SWAY_EXTENSION)) == res
 }
 
 pub fn find_file_name<'sc>(manifest_dir: &Path, entry_path: &'sc Path) -> Result<&'sc Path> {
@@ -274,6 +214,11 @@ pub fn lock_path(manifest_dir: &Path) -> PathBuf {
     manifest_dir.join(constants::LOCK_FILE_NAME)
 }
 
+pub fn validate_project_name(name: &str) -> Result<()> {
+    restricted::is_valid_project_name_format(name)?;
+    validate_name(name, "project name")
+}
+
 // Using (https://github.com/rust-lang/cargo/blob/489b66f2e458404a10d7824194d3ded94bc1f4e4/src/cargo/util/toml/mod.rs +
 // https://github.com/rust-lang/cargo/blob/489b66f2e458404a10d7824194d3ded94bc1f4e4/src/cargo/ops/cargo_new.rs) for reference
 
@@ -282,17 +227,17 @@ pub fn validate_name(name: &str, use_case: &str) -> Result<()> {
     restricted::contains_invalid_char(name, use_case)?;
 
     if restricted::is_keyword(name) {
-        bail!("the name `{name}` cannot be used as a package name, it is a Sway keyword");
+        bail!("the name `{name}` cannot be used as a {use_case}, it is a Sway keyword");
     }
     if restricted::is_conflicting_artifact_name(name) {
         bail!(
-            "the name `{name}` cannot be used as a package name, \
+            "the name `{name}` cannot be used as a {use_case}, \
             it conflicts with Forc's build directory names"
         );
     }
     if name.to_lowercase() == "test" {
         bail!(
-            "the name `test` cannot be used as a project name, \
+            "the name `test` cannot be used as a {use_case}, \
             it conflicts with Sway's built-in test library"
         );
     }
@@ -339,6 +284,52 @@ pub fn git_checkouts_directory() -> PathBuf {
     user_forc_directory().join("git").join("checkouts")
 }
 
+/// Given a path to a directory we wish to lock, produce a path for an associated lock file.
+///
+/// Note that the lock file itself is simply a placeholder for co-ordinating access. As a result,
+/// we want to create the lock file if it doesn't exist, but we can never reliably remove it
+/// without risking invalidation of an existing lock. As a result, we use a dedicated, hidden
+/// directory with a lock file named after the checkout path.
+///
+/// Note: This has nothing to do with `Forc.lock` files, rather this is about fd locks for
+/// coordinating access to particular paths (e.g. git checkout directories).
+fn fd_lock_path<X: AsRef<Path>>(path: X) -> PathBuf {
+    const LOCKS_DIR_NAME: &str = ".locks";
+    const LOCK_EXT: &str = "forc-lock";
+    let file_name = hash_path(path);
+    user_forc_directory()
+        .join(LOCKS_DIR_NAME)
+        .join(file_name)
+        .with_extension(LOCK_EXT)
+}
+
+/// Hash the path to produce a file-system friendly file name.
+/// Append the file stem for improved readability.
+fn hash_path<X: AsRef<Path>>(path: X) -> String {
+    let path = path.as_ref();
+    let mut hasher = hash_map::DefaultHasher::default();
+    path.hash(&mut hasher);
+    let hash = hasher.finish();
+    let file_name = match path.file_stem().and_then(|s| s.to_str()) {
+        None => format!("{hash:X}"),
+        Some(stem) => format!("{hash:X}-{stem}"),
+    };
+    file_name
+}
+
+/// Create an advisory lock over the given path.
+///
+/// See [fd_lock_path] for details.
+pub fn path_lock<X: AsRef<Path>>(path: X) -> Result<fd_lock::RwLock<File>> {
+    let lock_path = fd_lock_path(path);
+    let lock_dir = lock_path
+        .parent()
+        .expect("lock path has no parent directory");
+    std::fs::create_dir_all(lock_dir).context("failed to create forc advisory lock directory")?;
+    let lock_file = File::create(&lock_path).context("failed to create advisory lock file")?;
+    Ok(fd_lock::RwLock::new(lock_file))
+}
+
 pub fn program_type_str(ty: &TreeType) -> &'static str {
     match ty {
         TreeType::Script {} => "script",
@@ -355,10 +346,9 @@ pub fn print_compiling(ty: Option<&TreeType>, name: &str, src: &dyn std::fmt::Di
         Some(ty) => format!("{} ", program_type_str(ty)),
         None => "".to_string(),
     };
-    tracing::info!(
-        " {} {ty}{} ({src})",
-        Colour::Green.bold().paint("Compiling"),
-        ansi_term::Style::new().bold().paint(name)
+    println_action_green(
+        "Compiling",
+        &format!("{ty}{} ({src})", ansiterm::Style::new().bold().paint(name)),
     );
 }
 
@@ -437,7 +427,28 @@ pub fn print_on_failure(
     }
 }
 
-fn format_diagnostic(diagnostic: &Diagnostic) {
+/// Creates [Renderer] for printing warnings and errors.
+///
+/// To ensure the same styling of printed warnings and errors across all the tools,
+/// always use this function to create [Renderer]s,
+pub fn create_diagnostics_renderer() -> Renderer {
+    // For the diagnostic messages we use bold and bright colors.
+    // Note that for the summaries of warnings and errors we use
+    // their regular equivalents which are defined in `forc-tracing` package.
+    Renderer::styled()
+        .warning(
+            Style::new()
+                .bold()
+                .fg_color(Some(AnsiColor::BrightYellow.into())),
+        )
+        .error(
+            Style::new()
+                .bold()
+                .fg_color(Some(AnsiColor::BrightRed.into())),
+        )
+}
+
+pub fn format_diagnostic(diagnostic: &Diagnostic) {
     /// Temporary switch for testing the feature.
     /// Keep it false until we decide to fully support the diagnostic codes.
     const SHOW_DIAGNOSTIC_CODE: bool = false;
@@ -485,15 +496,13 @@ fn format_diagnostic(diagnostic: &Diagnostic) {
         title: snippet_title,
         slices: snippet_slices,
         footer: snippet_footer,
-        opt: FormatOptions {
-            color: true,
-            ..Default::default()
-        },
     };
 
+    let renderer = create_diagnostics_renderer();
     match diagnostic.level() {
-        Level::Warning => tracing::warn!("{}\n____\n", DisplayList::from(snippet)),
-        Level::Error => tracing::error!("{}\n____\n", DisplayList::from(snippet)),
+        Level::Info => tracing::info!("{}\n____\n", renderer.render(snippet)),
+        Level::Warning => tracing::warn!("{}\n____\n", renderer.render(snippet)),
+        Level::Error => tracing::error!("{}\n____\n", renderer.render(snippet)),
     }
 
     fn format_old_style_diagnostic(issue: &Issue) {
@@ -503,7 +512,7 @@ fn format_diagnostic(diagnostic: &Diagnostic) {
             label: if issue.is_in_source() {
                 None
             } else {
-                Some(issue.friendly_text())
+                Some(issue.text())
             },
             id: None,
             annotation_type,
@@ -515,7 +524,7 @@ fn format_diagnostic(diagnostic: &Diagnostic) {
             let input = span.input();
             let mut start_pos = span.start();
             let mut end_pos = span.end();
-            let (mut start, end) = span.line_col();
+            let LineColRange { mut start, end } = span.line_col();
             let input = construct_window(&mut start, end, &mut start_pos, &mut end_pos, input);
 
             let slice = Slice {
@@ -525,7 +534,7 @@ fn format_diagnostic(diagnostic: &Diagnostic) {
                 origin: Some(issue.source_path().unwrap().as_str()),
                 fold: false,
                 annotations: vec![SourceAnnotation {
-                    label: issue.friendly_text(),
+                    label: issue.text(),
                     annotation_type,
                     range: (start_pos, end_pos),
                 }],
@@ -538,27 +547,22 @@ fn format_diagnostic(diagnostic: &Diagnostic) {
             title: snippet_title,
             footer: vec![],
             slices: snippet_slices,
-            opt: FormatOptions {
-                color: true,
-                ..Default::default()
-            },
         };
 
-        tracing::error!("{}\n____\n", DisplayList::from(snippet));
+        let renderer = create_diagnostics_renderer();
+        tracing::error!("{}\n____\n", renderer.render(snippet));
     }
 
     fn get_title_label(diagnostics: &Diagnostic, label: &mut String) {
         label.clear();
-        if diagnostics.reason().is_some() {
-            label.push_str(diagnostics.reason().unwrap().description());
-            label.push_str(". ");
+        if let Some(reason) = diagnostics.reason() {
+            label.push_str(reason.description());
         }
-        label.push_str(diagnostics.issue().friendly_text());
-        label.push('.');
     }
 
     fn diagnostic_level_to_annotation_type(level: Level) -> AnnotationType {
         match level {
+            Level::Info => AnnotationType::Info,
             Level::Warning => AnnotationType::Warning,
             Level::Error => AnnotationType::Error,
         }
@@ -581,7 +585,7 @@ fn construct_slice(labels: Vec<&Label>) -> Slice {
         "Slices can be constructed only for labels that are related to places in the same source code."
     );
 
-    let soruce_file = labels[0].source_path().map(|path| path.as_str());
+    let source_file = labels[0].source_path().map(|path| path.as_str());
     let source_code = labels[0].span().input();
 
     // Joint span of the code snippet that covers all the labels.
@@ -593,7 +597,7 @@ fn construct_slice(labels: Vec<&Label>) -> Slice {
 
     for message in labels {
         annotations.push(SourceAnnotation {
-            label: message.friendly_text(),
+            label: message.text(),
             annotation_type: label_type_to_annotation_type(message.label_type()),
             range: get_annotation_range(message.span(), source_code, shift_in_bytes),
         });
@@ -602,7 +606,7 @@ fn construct_slice(labels: Vec<&Label>) -> Slice {
     return Slice {
         source,
         line_start,
-        origin: soruce_file,
+        origin: source_file,
         fold: true,
         annotations,
     };
@@ -633,6 +637,7 @@ fn construct_slice(labels: Vec<&Label>) -> Slice {
 fn label_type_to_annotation_type(label_type: LabelType) -> AnnotationType {
     match label_type {
         LabelType::Info => AnnotationType::Info,
+        LabelType::Help => AnnotationType::Help,
         LabelType::Warning => AnnotationType::Warning,
         LabelType::Error => AnnotationType::Error,
     }
@@ -642,7 +647,7 @@ fn label_type_to_annotation_type(label_type: LabelType) -> AnnotationType {
 /// to show in the snippet.
 ///
 /// Returns the source to be shown, the line start, and the offset of the snippet in bytes relative
-/// to the begining of the input code.
+/// to the beginning of the input code.
 ///
 /// The library we use doesn't handle auto-windowing and line numbers, so we must manually
 /// calculate the line numbers and match them up with the input window. It is a bit fiddly.
@@ -650,7 +655,7 @@ fn construct_code_snippet<'a>(span: &Span, input: &'a str) -> (&'a str, usize, u
     // how many lines to prepend or append to the highlighted region in the window
     const NUM_LINES_BUFFER: usize = 2;
 
-    let (start, end) = span.line_col();
+    let LineColRange { start, end } = span.line_col();
 
     let total_lines_in_input = input.chars().filter(|x| *x == '\n').count();
     debug_assert!(end.line >= start.line);
@@ -714,43 +719,104 @@ fn construct_window<'a>(
     let total_lines_of_highlight = end.line - start.line;
     debug_assert!(total_lines_in_input >= total_lines_of_highlight);
 
-    let mut current_line = 0;
-    let mut lines_to_start_of_snippet = 0;
-    let mut calculated_start_ix = None;
-    let mut calculated_end_ix = None;
-    let mut pos = 0;
-    for character in input.chars() {
+    let mut current_line = 1usize;
+
+    let mut chars = input.char_indices().map(|(char_offset, character)| {
+        let r = (current_line, char_offset);
         if character == '\n' {
-            current_line += 1
+            current_line += 1;
         }
+        r
+    });
 
-        if current_line + NUM_LINES_BUFFER >= start.line && calculated_start_ix.is_none() {
-            calculated_start_ix = Some(pos);
-            lines_to_start_of_snippet = current_line;
-        }
+    // Find the first char of the first line
+    let first_char = chars
+        .by_ref()
+        .find(|(current_line, _)| current_line + NUM_LINES_BUFFER >= start.line);
 
-        if current_line >= end.line + NUM_LINES_BUFFER && calculated_end_ix.is_none() {
-            calculated_end_ix = Some(pos);
-        }
+    // Find the last char of the last line
+    let last_char = chars
+        .by_ref()
+        .find(|(current_line, _)| *current_line > end.line + NUM_LINES_BUFFER)
+        .map(|x| x.1);
 
-        if calculated_start_ix.is_some() && calculated_end_ix.is_some() {
-            break;
+    // this releases the borrow of `current_line`
+    drop(chars);
+
+    let (first_char_line, first_char_offset, last_char_offset) = match (first_char, last_char) {
+        // has first and last
+        (Some((first_char_line, first_char_offset)), Some(last_char_offset)) => {
+            (first_char_line, first_char_offset, last_char_offset)
         }
-        pos += character.len_utf8();
+        // has first and no last
+        (Some((first_char_line, first_char_offset)), None) => {
+            (first_char_line, first_char_offset, input.len())
+        }
+        // others
+        _ => (current_line, input.len(), input.len()),
+    };
+
+    // adjust indices to be inside the returned window
+    start.line = first_char_line;
+    *start_ix = start_ix.saturating_sub(first_char_offset);
+    *end_ix = end_ix.saturating_sub(first_char_offset);
+
+    &input[first_char_offset..last_char_offset]
+}
+
+#[test]
+fn ok_construct_window() {
+    fn t(
+        start_line: usize,
+        start_col: usize,
+        end_line: usize,
+        end_col: usize,
+        start_char: usize,
+        end_char: usize,
+        input: &str,
+    ) -> (usize, usize, &str) {
+        let mut s = LineCol {
+            line: start_line,
+            col: start_col,
+        };
+        let mut start = start_char;
+        let mut end = end_char;
+        let r = construct_window(
+            &mut s,
+            LineCol {
+                line: end_line,
+                col: end_col,
+            },
+            &mut start,
+            &mut end,
+            input,
+        );
+        (start, end, r)
     }
-    let calculated_start_ix = calculated_start_ix.unwrap_or(0);
-    let calculated_end_ix = calculated_end_ix.unwrap_or(input.len());
 
-    let start_ix_bytes = *start_ix - std::cmp::min(calculated_start_ix, *start_ix);
-    let end_ix_bytes = *end_ix - std::cmp::min(calculated_start_ix, *end_ix);
-    // We want the start_ix and end_ix in terms of chars and not bytes, so translate.
-    *start_ix = input[calculated_start_ix..(calculated_start_ix + start_ix_bytes)]
-        .chars()
-        .count();
-    *end_ix = input[calculated_start_ix..(calculated_start_ix + end_ix_bytes)]
-        .chars()
-        .count();
+    // Invalid Empty file
+    assert_eq!(t(0, 0, 0, 0, 0, 0, ""), (0, 0, ""));
 
-    start.line = lines_to_start_of_snippet;
-    &input[calculated_start_ix..calculated_end_ix]
+    // Valid Empty File
+    assert_eq!(t(1, 1, 1, 1, 0, 0, ""), (0, 0, ""));
+
+    // One line, error after the last char
+    assert_eq!(t(1, 7, 1, 7, 6, 6, "script"), (6, 6, "script"));
+
+    //                       01 23 45 67 89 AB CD E
+    let eight_lines = "1\n2\n3\n4\n5\n6\n7\n8";
+
+    assert_eq!(t(1, 1, 1, 1, 0, 1, eight_lines), (0, 1, "1\n2\n3\n"));
+    assert_eq!(t(2, 1, 2, 1, 2, 3, eight_lines), (2, 3, "1\n2\n3\n4\n"));
+    assert_eq!(t(3, 1, 3, 1, 4, 5, eight_lines), (4, 5, "1\n2\n3\n4\n5\n"));
+    assert_eq!(t(4, 1, 4, 1, 6, 7, eight_lines), (4, 5, "2\n3\n4\n5\n6\n"));
+    assert_eq!(t(5, 1, 5, 1, 8, 9, eight_lines), (4, 5, "3\n4\n5\n6\n7\n"));
+    assert_eq!(t(6, 1, 6, 1, 10, 11, eight_lines), (4, 5, "4\n5\n6\n7\n8"));
+    assert_eq!(t(7, 1, 7, 1, 12, 13, eight_lines), (4, 5, "5\n6\n7\n8"));
+    assert_eq!(t(8, 1, 8, 1, 14, 15, eight_lines), (4, 5, "6\n7\n8"));
+
+    // Invalid lines
+    assert_eq!(t(9, 1, 9, 1, 14, 15, eight_lines), (2, 3, "7\n8"));
+    assert_eq!(t(10, 1, 10, 1, 14, 15, eight_lines), (0, 1, "8"));
+    assert_eq!(t(11, 1, 11, 1, 14, 15, eight_lines), (0, 0, ""));
 }

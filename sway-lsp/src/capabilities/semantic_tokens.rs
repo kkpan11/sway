@@ -1,37 +1,79 @@
 use crate::core::{
     session::Session,
-    token::{get_range_from_span, SymbolKind, Token},
+    token::{SymbolKind, Token, TokenIdent},
 };
+use dashmap::mapref::multiple::RefMulti;
 use lsp_types::{
     Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
-    SemanticTokensResult, Url,
+    SemanticTokensRangeResult, SemanticTokensResult, Url,
 };
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
 };
-use sway_types::{Span, Spanned};
 
 // https://github.com/microsoft/vscode-extension-samples/blob/5ae1f7787122812dcc84e37427ca90af5ee09f14/semantic-tokens-sample/vscode.proposed.d.ts#L71
+
+/// Get the semantic tokens for the entire file.
 pub fn semantic_tokens_full(session: Arc<Session>, url: &Url) -> Option<SemanticTokensResult> {
-    let engines = session.engines.read();
-    let tokens = session.token_map().tokens_for_file(engines.se(), url);
-
-    // The tokens need sorting by their span so each token is sequential
-    // If this step isn't done, then the bit offsets used for the lsp_types::SemanticToken are incorrect.
-    let mut tokens_sorted: Vec<_> = tokens.map(|(ident, token)| (ident.span(), token)).collect();
-
-    tokens_sorted.sort_by(|(a_span, _), (b_span, _)| {
-        let a = (a_span.start(), a_span.end());
-        let b = (b_span.start(), b_span.end());
-        a.cmp(&b)
-    });
-
-    let semantic_tokens = semantic_tokens(&tokens_sorted);
-
-    Some(semantic_tokens.into())
+    let tokens: Vec<_> = session.token_map().tokens_for_file(url).collect();
+    let sorted_tokens_refs = sort_tokens(&tokens);
+    Some(semantic_tokens(&sorted_tokens_refs[..]).into())
 }
 
+/// Get the semantic tokens within a range.
+pub fn semantic_tokens_range(
+    session: Arc<Session>,
+    url: &Url,
+    range: &Range,
+) -> Option<SemanticTokensRangeResult> {
+    let _p = tracing::trace_span!("semantic_tokens_range").entered();
+    let tokens: Vec<_> = session
+        .token_map()
+        .tokens_for_file(url)
+        .filter(|item| {
+            // make sure the token_ident range is within the range that was passed in
+            let token_range = item.key().range;
+            token_range.start >= range.start && token_range.end <= range.end
+        })
+        .collect();
+    let sorted_tokens_refs = sort_tokens(&tokens);
+    Some(semantic_tokens(&sorted_tokens_refs[..]).into())
+}
+
+pub fn semantic_tokens(tokens_sorted: &[&RefMulti<TokenIdent, Token>]) -> SemanticTokens {
+    static TOKEN_RESULT_COUNTER: AtomicU32 = AtomicU32::new(1);
+    let id = TOKEN_RESULT_COUNTER
+        .fetch_add(1, Ordering::SeqCst)
+        .to_string();
+    let mut builder = SemanticTokensBuilder::new(id);
+
+    for entry in tokens_sorted {
+        let (ident, token) = entry.pair();
+        let ty = semantic_token_type(&token.kind);
+        let token_index = type_index(&ty);
+        // TODO - improve with modifiers
+        let modifier_bitset = 0;
+        builder.push(ident.range, token_index, modifier_bitset);
+    }
+    builder.build()
+}
+
+/// Sort tokens by their span so each token is sequential.
+///
+/// If this step isn't done, then the bit offsets used for the `lsp_types::SemanticToken` are incorrect.
+fn sort_tokens<'a>(
+    tokens: &'a [RefMulti<'a, TokenIdent, Token>],
+) -> Vec<&'a RefMulti<'a, TokenIdent, Token>> {
+    let mut refs: Vec<_> = tokens.iter().collect();
+    // Sort the vector of references based on the spans of the tokens
+    refs.sort_by(|a, b| {
+        let a_span = a.key().range;
+        let b_span = b.key().range;
+        (a_span.start, a_span.end).cmp(&(b_span.start, b_span.end))
+    });
+    refs
+}
 //-------------------------------
 /// Tokens are encoded relative to each other.
 ///
@@ -49,7 +91,7 @@ impl SemanticTokensBuilder {
             id,
             prev_line: 0,
             prev_char: 0,
-            data: Default::default(),
+            data: Vec::default(),
         }
     }
 
@@ -88,25 +130,6 @@ impl SemanticTokensBuilder {
             data: self.data,
         }
     }
-}
-
-pub fn semantic_tokens(tokens_sorted: &[(Span, Token)]) -> SemanticTokens {
-    static TOKEN_RESULT_COUNTER: AtomicU32 = AtomicU32::new(1);
-    let id = TOKEN_RESULT_COUNTER
-        .fetch_add(1, Ordering::SeqCst)
-        .to_string();
-    let mut builder = SemanticTokensBuilder::new(id);
-
-    for (span, token) in tokens_sorted.iter() {
-        let ty = semantic_token_type(&token.kind);
-        let token_index = type_index(ty);
-        // TODO - improve with modifiers
-        let modifier_bitset = 0;
-        let range = get_range_from_span(span);
-
-        builder.push(range, token_index, modifier_bitset);
-    }
-    builder.build()
 }
 
 pub(crate) const SUPPORTED_TYPES: &[SemanticTokenType] = &[
@@ -153,9 +176,8 @@ fn semantic_token_type(kind: &SymbolKind) -> SemanticTokenType {
     match kind {
         SymbolKind::Field => SemanticTokenType::PROPERTY,
         SymbolKind::ValueParam => SemanticTokenType::PARAMETER,
-        SymbolKind::Variable => SemanticTokenType::VARIABLE,
+        SymbolKind::Variable | SymbolKind::Const => SemanticTokenType::VARIABLE,
         SymbolKind::Function | SymbolKind::Intrinsic => SemanticTokenType::FUNCTION,
-        SymbolKind::Const => SemanticTokenType::VARIABLE,
         SymbolKind::Struct => SemanticTokenType::STRUCT,
         SymbolKind::Enum => SemanticTokenType::ENUM,
         SymbolKind::Variant => SemanticTokenType::ENUM_MEMBER,
@@ -166,7 +188,8 @@ fn semantic_token_type(kind: &SymbolKind) -> SemanticTokenType {
         SymbolKind::ByteLiteral | SymbolKind::NumericLiteral => SemanticTokenType::NUMBER,
         SymbolKind::BoolLiteral => SemanticTokenType::new("boolean"),
         SymbolKind::TypeAlias => SemanticTokenType::new("typeAlias"),
-        SymbolKind::Keyword => SemanticTokenType::new("keyword"),
+        SymbolKind::TraitType => SemanticTokenType::new("traitType"),
+        SymbolKind::Keyword | SymbolKind::ProgramTypeKeyword => SemanticTokenType::new("keyword"),
         SymbolKind::Unknown => SemanticTokenType::new("generic"),
         SymbolKind::BuiltinType => SemanticTokenType::new("builtinType"),
         SymbolKind::DeriveHelper => SemanticTokenType::new("deriveHelper"),
@@ -175,6 +198,6 @@ fn semantic_token_type(kind: &SymbolKind) -> SemanticTokenType {
     }
 }
 
-fn type_index(ty: SemanticTokenType) -> u32 {
-    SUPPORTED_TYPES.iter().position(|it| *it == ty).unwrap() as u32
+fn type_index(ty: &SemanticTokenType) -> u32 {
+    SUPPORTED_TYPES.iter().position(|it| it == ty).unwrap() as u32
 }

@@ -1,4 +1,6 @@
 use crate::{
+    comments::write_comments,
+    constants::NEW_LINE,
     formatter::*,
     utils::{
         map::byte_span::{ByteSpan, LeafSpans},
@@ -6,30 +8,44 @@ use crate::{
     },
 };
 use std::fmt::Write;
-use sway_ast::attribute::{Annotated, Attribute, AttributeArg, AttributeDecl, AttributeHashKind};
-use sway_types::{
-    ast::{Delimiter, PunctKind},
-    constants::DOC_COMMENT_ATTRIBUTE_NAME,
-    Spanned,
+use sway_ast::{
+    attribute::{Annotated, Attribute, AttributeArg, AttributeDecl, AttributeHashKind},
+    keywords::{HashToken, Token},
+    CommaToken,
 };
+use sway_types::{ast::Delimiter, constants::DOC_COMMENT_ATTRIBUTE_NAME, Spanned};
 
-impl<T: Format + Spanned> Format for Annotated<T> {
+impl<T: Format + Spanned + std::fmt::Debug> Format for Annotated<T> {
     fn format(
         &self,
         formatted_code: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         // format each `Attribute`
+        let mut start = None;
         for attr in &self.attribute_list {
+            if let Some(start) = start {
+                // Write any comments that may have been defined in between the
+                // attributes and the value
+                write_comments(formatted_code, start..attr.span().start(), formatter)?;
+                if !formatted_code.ends_with(NEW_LINE) {
+                    write!(formatted_code, "{}", NEW_LINE)?;
+                }
+            }
+            formatter.write_indent_into_buffer(formatted_code)?;
             attr.format(formatted_code, formatter)?;
-
-            write!(
-                formatted_code,
-                "{}",
-                &formatter.shape.indent.to_string(&formatter.config)?,
-            )?;
+            start = Some(attr.span().end());
+        }
+        if let Some(start) = start {
+            // Write any comments that may have been defined in between the
+            // attributes and the value
+            write_comments(formatted_code, start..self.value.span().start(), formatter)?;
+            if !formatted_code.ends_with(NEW_LINE) {
+                write!(formatted_code, "{}", NEW_LINE)?;
+            }
         }
         // format `ItemKind`
+        formatter.write_indent_into_buffer(formatted_code)?;
         self.value.format(formatted_code, formatter)?;
 
         Ok(())
@@ -40,11 +56,12 @@ impl Format for AttributeArg {
     fn format(
         &self,
         formatted_code: &mut FormattedCode,
-        _formatter: &mut Formatter,
+        formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        write!(formatted_code, "{}", self.name.span().as_str())?;
+        write!(formatted_code, "{}", self.name.as_str())?;
         if let Some(value) = &self.value {
-            write!(formatted_code, " = {}", value.span().as_str())?;
+            write!(formatted_code, " = ")?;
+            value.format(formatted_code, formatter)?;
         }
 
         Ok(())
@@ -98,11 +115,12 @@ impl Format for AttributeDecl {
 
         // invariant: attribute lists cannot be empty
         // `#`
-        let hash_type_token_span = match &self.hash_kind {
-            AttributeHashKind::Inner(_) => Err(FormatterError::HashBangAttributeError),
-            AttributeHashKind::Outer(hash_token) => Ok(hash_token.span()),
+        match &self.hash_kind {
+            AttributeHashKind::Inner(_) => return Err(FormatterError::HashBangAttributeError),
+            AttributeHashKind::Outer(_hash_token) => {
+                write!(formatted_code, "{}", HashToken::AS_STR)?;
+            }
         };
-        write!(formatted_code, "{}", hash_type_token_span?.as_str())?;
         // `[`
         Self::open_square_bracket(formatted_code, formatter)?;
         let mut regular_attrs = regular_attrs.iter().peekable();
@@ -111,7 +129,7 @@ impl Format for AttributeDecl {
                 formatter.shape.with_default_code_line(),
                 |formatter| -> Result<(), FormatterError> {
                     // name e.g. `storage`
-                    write!(formatted_code, "{}", attr.name.span().as_str())?;
+                    write!(formatted_code, "{}", attr.name.as_str())?;
                     if let Some(args) = &attr.args {
                         // `(`
                         Self::open_parenthesis(formatted_code, formatter)?;
@@ -125,7 +143,7 @@ impl Format for AttributeDecl {
             )?;
             // do not put a separator after the last attribute
             if regular_attrs.peek().is_some() {
-                write!(formatted_code, "{} ", PunctKind::Comma.as_char())?;
+                write!(formatted_code, "{} ", CommaToken::AS_STR)?;
             }
         }
         // `]\n`

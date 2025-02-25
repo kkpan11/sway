@@ -1,27 +1,27 @@
 //! The base descriptor for various values within the IR.
 //!
-//! [`Value`]s can be function arguments, constants and instructions.  [`Instruction`]s generally
+//! [`Value`]s can be function arguments, constants and instructions. [`Instruction`]s generally
 //! refer to each other and to constants via the [`Value`] wrapper.
 //!
-//! Like most IR data structures they are `Copy` and cheap to pass around by value.  They are
+//! Like most IR data structures they are `Copy` and cheap to pass around by value. They are
 //! therefore also easy to replace, a common practice for optimization passes.
 
 use rustc_hash::FxHashMap;
 
 use crate::{
     block::BlockArgument,
-    constant::Constant,
     context::Context,
-    instruction::{FuelVmInstruction, Instruction},
+    instruction::InstOp,
     irtype::Type,
     metadata::{combine, MetadataIndex},
     pretty::DebugWithContext,
+    Block, Constant, Instruction,
 };
 
-/// A wrapper around an [ECS](https://github.com/fitzgen/generational-arena) handle into the
+/// A wrapper around an [ECS](https://github.com/orlp/slotmap) handle into the
 /// [`Context`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, DebugWithContext)]
-pub struct Value(#[in_context(values)] pub generational_arena::Index);
+pub struct Value(#[in_context(values)] pub slotmap::DefaultKey);
 
 #[doc(hidden)]
 #[derive(Debug, Clone, DebugWithContext)]
@@ -34,7 +34,6 @@ pub struct ValueContent {
 #[derive(Debug, Clone, DebugWithContext)]
 pub enum ValueDatum {
     Argument(BlockArgument),
-    Configurable(Constant),
     Constant(Constant),
     Instruction(Instruction),
 }
@@ -50,15 +49,6 @@ impl Value {
     }
 
     /// Return a new constant [`Value`].
-    pub fn new_configurable(context: &mut Context, constant: Constant) -> Value {
-        let content = ValueContent {
-            value: ValueDatum::Configurable(constant),
-            metadata: None,
-        };
-        Value(context.values.insert(content))
-    }
-
-    /// Return a new constant [`Value`].
     pub fn new_constant(context: &mut Context, constant: Constant) -> Value {
         let content = ValueContent {
             value: ValueDatum::Constant(constant),
@@ -68,9 +58,12 @@ impl Value {
     }
 
     /// Return a new instruction [`Value`].
-    pub fn new_instruction(context: &mut Context, instruction: Instruction) -> Value {
+    pub fn new_instruction(context: &mut Context, block: Block, instruction: InstOp) -> Value {
         let content = ValueContent {
-            value: ValueDatum::Instruction(instruction),
+            value: ValueDatum::Instruction(Instruction {
+                op: instruction,
+                parent: block,
+            }),
             metadata: None,
         };
         Value(context.values.insert(content))
@@ -98,11 +91,6 @@ impl Value {
     }
 
     /// Return whether this is a constant value.
-    pub fn is_configurable(&self, context: &Context) -> bool {
-        matches!(context.values[self.0].value, ValueDatum::Configurable(_))
-    }
-
-    /// Return whether this is a constant value.
     pub fn is_constant(&self, context: &Context) -> bool {
         matches!(context.values[self.0].value, ValueDatum::Constant(_))
     }
@@ -113,29 +101,8 @@ impl Value {
     /// and is either a branch or return.
     pub fn is_terminator(&self, context: &Context) -> bool {
         match &context.values[self.0].value {
-            ValueDatum::Instruction(ins) => matches!(
-                ins,
-                Instruction::Branch(_)
-                    | Instruction::ConditionalBranch { .. }
-                    | Instruction::Ret(_, _)
-                    | Instruction::FuelVm(FuelVmInstruction::Revert(_))
-            ),
-            _ => false,
-        }
-    }
-
-    pub fn is_diverging(&self, context: &Context) -> bool {
-        match &context.values[self.0].value {
-            ValueDatum::Instruction(ins) => matches!(
-                ins,
-                Instruction::Branch(..)
-                    | Instruction::ConditionalBranch { .. }
-                    | Instruction::Ret(..)
-                    | Instruction::FuelVm(FuelVmInstruction::Revert(..))
-            ),
-            ValueDatum::Argument(..) | ValueDatum::Configurable(..) | ValueDatum::Constant(..) => {
-                false
-            }
+            ValueDatum::Instruction(Instruction { op, .. }) => op.is_terminator(),
+            ValueDatum::Argument(..) | ValueDatum::Constant(..) => false,
         }
     }
 
@@ -145,6 +112,8 @@ impl Value {
         self.replace_instruction_values(context, &FxHashMap::from_iter([(old_val, new_val)]))
     }
 
+    /// If this value is an instruction and if any of its parameters is in `replace_map` as
+    /// a key, replace it with the mapped value.
     pub fn replace_instruction_values(
         &self,
         context: &mut Context,
@@ -153,7 +122,7 @@ impl Value {
         if let ValueDatum::Instruction(instruction) =
             &mut context.values.get_mut(self.0).unwrap().value
         {
-            instruction.replace_values(replace_map);
+            instruction.op.replace_values(replace_map);
         }
     }
 
@@ -183,15 +152,6 @@ impl Value {
     }
 
     /// Get a reference to this value as a constant, iff it is one.
-    pub fn get_configurable<'a>(&self, context: &'a Context) -> Option<&'a Constant> {
-        if let ValueDatum::Configurable(cn) = &context.values[self.0].value {
-            Some(cn)
-        } else {
-            None
-        }
-    }
-
-    /// Get a reference to this value as a constant, iff it is one.
     pub fn get_constant<'a>(&self, context: &'a Context) -> Option<&'a Constant> {
         if let ValueDatum::Constant(cn) = &context.values[self.0].value {
             Some(cn)
@@ -209,12 +169,12 @@ impl Value {
         }
     }
 
-    /// Get a reference to this value as a constant or as a configurable, iff it is one of the two.
-    pub fn get_constant_or_configurable<'a>(&self, context: &'a Context) -> Option<&'a Constant> {
-        match &context.values[self.0].value {
-            ValueDatum::Constant(cn) => Some(cn),
-            ValueDatum::Configurable(cn) => Some(cn),
-            _ => None,
+    /// Get a mutable reference to this value as an argument, iff it is one.
+    pub fn get_argument_mut<'a>(&self, context: &'a mut Context) -> Option<&'a mut BlockArgument> {
+        if let ValueDatum::Argument(arg) = &mut context.values[self.0].value {
+            Some(arg)
+        } else {
+            None
         }
     }
 
@@ -224,8 +184,7 @@ impl Value {
     pub fn get_type(&self, context: &Context) -> Option<Type> {
         match &context.values[self.0].value {
             ValueDatum::Argument(BlockArgument { ty, .. }) => Some(*ty),
-            ValueDatum::Configurable(c) => Some(c.ty),
-            ValueDatum::Constant(c) => Some(c.ty),
+            ValueDatum::Constant(c) => Some(c.get_content(context).ty),
             ValueDatum::Instruction(ins) => ins.get_type(context),
         }
     }

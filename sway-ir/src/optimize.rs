@@ -19,6 +19,10 @@ pub mod const_demotion;
 pub use const_demotion::*;
 pub mod constants;
 pub use constants::*;
+pub mod conditional_constprop;
+pub use conditional_constprop::*;
+pub mod cse;
+pub use cse::*;
 pub mod dce;
 pub use dce::*;
 pub mod inline;
@@ -33,12 +37,17 @@ pub mod ret_demotion;
 pub use ret_demotion::*;
 pub mod simplify_cfg;
 pub use simplify_cfg::*;
+pub mod sroa;
+pub use sroa::*;
+pub mod fn_dedup;
+pub use fn_dedup::*;
 
 mod target_fuel;
 
 #[cfg(test)]
 pub mod tests {
     use crate::{PassGroup, PassManager};
+    use sway_features::ExperimentalFeatures;
     use sway_types::SourceEngine;
 
     /// This function parses the IR text representation and run the specified optimizers passes.
@@ -50,7 +59,7 @@ pub mod tests {
     ///
     /// ```rust, ignore
     /// assert_optimization(
-    ///     &["constcombine"],
+    ///     &[CONST_FOLDING_NAME],
     ///     "entry fn main() -> u64 {
     ///        entry():
     ///             l = const u64 1
@@ -77,6 +86,7 @@ pub mod tests {
             "
             ),
             &source_engine,
+            ExperimentalFeatures::default(),
         )
         .unwrap();
 
@@ -121,7 +131,7 @@ pub mod tests {
 
         for (actual, expected) in actual.iter().zip(expected) {
             if !actual.contains(expected) {
-                panic!("error: {actual:?} {expected:?}");
+                panic!("Actual: {actual:?} does not contains expected: {expected:?}. (Run with --nocapture to see a diff)");
             } else {
                 expected_matches -= 1;
             }

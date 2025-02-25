@@ -1,6 +1,6 @@
 use crate::{
-    comments::rewrite_with_comments,
-    config::items::ItemBraceStyle,
+    comments::{has_comments_in_formatter, rewrite_with_comments, write_comments},
+    constants::NEW_LINE,
     formatter::*,
     utils::{
         map::byte_span::{ByteSpan, LeafSpans},
@@ -8,7 +8,10 @@ use crate::{
     },
 };
 use std::fmt::Write;
-use sway_ast::{ItemImpl, ItemImplItem};
+use sway_ast::{
+    keywords::{ForToken, ImplToken, Keyword},
+    ItemImpl, ItemImplItem,
+};
 use sway_types::{ast::Delimiter, Spanned};
 
 #[cfg(test)]
@@ -23,33 +26,41 @@ impl Format for ItemImpl {
         // Required for comment formatting
         let start_len = formatted_code.len();
 
-        write!(formatted_code, "{}", self.impl_token.span().as_str())?;
+        write!(formatted_code, "{}", ImplToken::AS_STR)?;
         if let Some(generic_params) = &self.generic_params_opt {
             generic_params.format(formatted_code, formatter)?;
         }
         write!(formatted_code, " ")?;
-        if let Some((path_type, for_token)) = &self.trait_opt {
+        if let Some((path_type, _for_token)) = &self.trait_opt {
             path_type.format(formatted_code, formatter)?;
-            write!(formatted_code, " {} ", for_token.span().as_str())?;
+            write!(formatted_code, " {} ", ForToken::AS_STR)?;
         }
         self.ty.format(formatted_code, formatter)?;
         if let Some(where_clause) = &self.where_clause_opt {
-            write!(formatted_code, " ")?;
+            writeln!(formatted_code)?;
             where_clause.format(formatted_code, formatter)?;
             formatter.shape.code_line.update_where_clause(true);
         }
-        Self::open_curly_brace(formatted_code, formatter)?;
+
         let contents = self.contents.get();
-        for item in contents.iter() {
-            write!(
-                formatted_code,
-                "{}",
-                formatter.shape.indent.to_string(&formatter.config)?,
-            )?;
-            item.format(formatted_code, formatter)?;
-            writeln!(formatted_code)?;
+        if contents.is_empty() {
+            let range = self.span().into();
+            Self::open_curly_brace(formatted_code, formatter)?;
+            if has_comments_in_formatter(formatter, &range) {
+                formatter.indent();
+                write_comments(formatted_code, range, formatter)?;
+            }
+            Self::close_curly_brace(formatted_code, formatter)?;
+        } else {
+            Self::open_curly_brace(formatted_code, formatter)?;
+            formatter.indent();
+            write!(formatted_code, "{}", NEW_LINE)?;
+            for item in contents.iter() {
+                item.format(formatted_code, formatter)?;
+                write!(formatted_code, "{}", NEW_LINE)?;
+            }
+            Self::close_curly_brace(formatted_code, formatter)?;
         }
-        Self::close_curly_brace(formatted_code, formatter)?;
 
         rewrite_with_comments::<ItemImpl>(
             formatter,
@@ -72,6 +83,7 @@ impl Format for ItemImplItem {
         match self {
             ItemImplItem::Fn(fn_decl) => fn_decl.format(formatted_code, formatter),
             ItemImplItem::Const(const_decl) => const_decl.format(formatted_code, formatter),
+            ItemImplItem::Type(type_decl) => type_decl.format(formatted_code, formatter),
         }
     }
 }
@@ -81,26 +93,14 @@ impl CurlyBrace for ItemImpl {
         line: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        let brace_style = formatter.config.items.item_brace_style;
-        formatter.shape.block_indent(&formatter.config);
         let open_brace = Delimiter::Brace.as_open_char();
-        match brace_style {
-            ItemBraceStyle::AlwaysNextLine => {
-                // Add opening brace to the next line.
-                writeln!(line, "\n{open_brace}")?;
+        match formatter.shape.code_line.has_where_clause {
+            true => {
+                write!(line, "{open_brace}")?;
+                formatter.shape.code_line.update_where_clause(false);
             }
-            ItemBraceStyle::SameLineWhere => match formatter.shape.code_line.has_where_clause {
-                true => {
-                    writeln!(line, "{open_brace}")?;
-                    formatter.shape.code_line.update_where_clause(false);
-                }
-                false => {
-                    writeln!(line, " {open_brace}")?;
-                }
-            },
-            _ => {
-                // TODO: implement PreferSameLine
-                writeln!(line, " {open_brace}")?;
+            false => {
+                write!(line, " {open_brace}")?;
             }
         }
 
@@ -110,11 +110,11 @@ impl CurlyBrace for ItemImpl {
         line: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        formatter.shape.block_unindent(&formatter.config);
+        formatter.unindent();
         write!(
             line,
             "{}{}",
-            formatter.shape.indent.to_string(&formatter.config)?,
+            formatter.indent_to_str()?,
             Delimiter::Brace.as_close_char()
         )?;
 
@@ -128,6 +128,7 @@ impl LeafSpans for ItemImplItem {
         match self {
             ItemImplItem::Fn(fn_decl) => collected_spans.append(&mut fn_decl.leaf_spans()),
             ItemImplItem::Const(const_decl) => collected_spans.append(&mut const_decl.leaf_spans()),
+            ItemImplItem::Type(type_decl) => collected_spans.append(&mut type_decl.leaf_spans()),
         }
         collected_spans
     }

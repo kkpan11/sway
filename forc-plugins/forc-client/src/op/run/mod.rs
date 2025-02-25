@@ -1,16 +1,27 @@
 mod encode;
 use crate::{
     cmd,
+    constants::TX_SUBMIT_TIMEOUT_MS,
     util::{
         pkg::built_pkgs,
-        tx::{TransactionBuilderExt, WalletSelectionMode, TX_SUBMIT_TIMEOUT_MS},
+        tx::{prompt_forc_wallet_password, select_account, SignerSelectionMode},
     },
 };
 use anyhow::{anyhow, bail, Context, Result};
 use forc_pkg::{self as pkg, fuel_core_not_running, PackageManifestFile};
+use forc_tracing::println_warning;
 use forc_util::tx_utils::format_log_receipts;
 use fuel_core_client::client::FuelClient;
-use fuel_tx::{ContractId, Transaction, TransactionBuilder};
+use fuel_tx::{ContractId, Transaction};
+use fuels::{
+    programs::calls::{traits::TransactionTuner, ScriptCall},
+    types::{
+        bech32::Bech32ContractId,
+        transaction::TxPolicies,
+        transaction_builders::{BuildableTransaction, VariableOutputPolicy},
+    },
+};
+use fuels_accounts::{provider::Provider, Account, ViewOnlyAccount};
 use pkg::BuiltPackage;
 use std::time::Duration;
 use std::{path::PathBuf, str::FromStr};
@@ -32,6 +43,11 @@ pub struct RanScript {
 ///
 /// When running a single script, only that script's receipts are returned.
 pub async fn run(command: cmd::Run) -> Result<Vec<RanScript>> {
+    let mut command = command;
+    if command.unsigned {
+        println_warning("--unsigned flag is deprecated, please prefer using --default-signer. Assuming `--default-signer` is passed. This means your transaction will be signed by an account that is funded by fuel-core by default for testing purposes.");
+        command.default_signer = true;
+    }
     let mut receipts = Vec::new();
     let curr_dir = if let Some(path) = &command.pkg.path {
         PathBuf::from(path)
@@ -39,15 +55,27 @@ pub async fn run(command: cmd::Run) -> Result<Vec<RanScript>> {
         std::env::current_dir().map_err(|e| anyhow!("{:?}", e))?
     };
     let build_opts = build_opts_from_cmd(&command);
-    let built_pkgs_with_manifest = built_pkgs(&curr_dir, build_opts)?;
+    let built_pkgs_with_manifest = built_pkgs(&curr_dir, &build_opts)?;
+    let wallet_mode = if command.default_signer || command.signing_key.is_some() {
+        SignerSelectionMode::Manual
+    } else {
+        let password = prompt_forc_wallet_password()?;
+        SignerSelectionMode::ForcWallet(password)
+    };
     for built in built_pkgs_with_manifest {
         if built
             .descriptor
             .manifest_file
-            .check_program_type(vec![TreeType::Script])
+            .check_program_type(&[TreeType::Script])
             .is_ok()
         {
-            let pkg_receipts = run_pkg(&command, &built.descriptor.manifest_file, &built).await?;
+            let pkg_receipts = run_pkg(
+                &command,
+                &built.descriptor.manifest_file,
+                &built,
+                &wallet_mode,
+            )
+            .await?;
             receipts.push(pkg_receipts);
         }
     }
@@ -55,11 +83,35 @@ pub async fn run(command: cmd::Run) -> Result<Vec<RanScript>> {
     Ok(receipts)
 }
 
+fn tx_policies_from_cmd(cmd: &cmd::Run) -> TxPolicies {
+    let mut tx_policies = TxPolicies::default();
+    if let Some(max_fee) = cmd.gas.max_fee {
+        tx_policies = tx_policies.with_max_fee(max_fee);
+    }
+    if let Some(script_gas_limit) = cmd.gas.script_gas_limit {
+        tx_policies = tx_policies.with_script_gas_limit(script_gas_limit);
+    }
+    tx_policies
+}
+
 pub async fn run_pkg(
     command: &cmd::Run,
     manifest: &PackageManifestFile,
     compiled: &BuiltPackage,
+    signer_mode: &SignerSelectionMode,
 ) -> Result<RanScript> {
+    let node_url = command.node.get_node_url(&manifest.network)?;
+    let provider = Provider::connect(node_url.clone()).await?;
+    let tx_count = 1;
+    let account = select_account(
+        signer_mode,
+        command.default_signer || command.unsigned,
+        command.signing_key,
+        &provider,
+        tx_count,
+    )
+    .await?;
+
     let script_data = match (&command.data, &command.args) {
         (None, Some(args)) => {
             let minify_json_abi = true;
@@ -68,8 +120,7 @@ pub async fn run_pkg(
                 .ok_or_else(|| anyhow::anyhow!("Missing json abi string"))?;
             let main_arg_handler = ScriptCallHandler::from_json_abi_str(&package_json_abi)?;
             let args = args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>();
-            let unresolved_bytes = main_arg_handler.encode_arguments(args.as_slice())?;
-            unresolved_bytes.resolve(0)
+            main_arg_handler.encode_arguments(args.as_slice())?
         }
         (Some(_), Some(_)) => {
             bail!("Both --args and --data provided, must choose one.")
@@ -81,12 +132,6 @@ pub async fn run_pkg(
         }
     };
 
-    let node_url = command
-        .node_url
-        .as_deref()
-        .or_else(|| manifest.network.as_ref().map(|nw| &nw.url[..]))
-        .unwrap_or(crate::default::NODE_URL);
-    let client = FuelClient::new(node_url)?;
     let contract_ids = command
         .contract
         .as_ref()
@@ -97,30 +142,40 @@ pub async fn run_pkg(
                 .map_err(|e| anyhow!("Failed to parse contract id: {}", e))
         })
         .collect::<Result<Vec<ContractId>>>()?;
-    let wallet_mode = if command.manual_signing {
-        WalletSelectionMode::Manual
-    } else {
-        WalletSelectionMode::ForcWallet
-    };
 
-    let tx = TransactionBuilder::script(compiled.bytecode.bytes.clone(), script_data)
-        .gas_limit(command.gas.limit)
-        .gas_price(command.gas.price)
-        .maturity(command.maturity.maturity.into())
-        .add_contracts(contract_ids)
-        .finalize_signed(
-            client.clone(),
-            command.unsigned,
-            command.signing_key,
-            wallet_mode,
-        )
+    let script_binary = compiled.bytecode.bytes.clone();
+    let external_contracts = contract_ids
+        .into_iter()
+        .map(Bech32ContractId::from)
+        .collect::<Vec<_>>();
+    let call = ScriptCall {
+        script_binary,
+        encoded_args: Ok(script_data),
+        inputs: vec![],
+        outputs: vec![],
+        external_contracts,
+    };
+    let tx_policies = tx_policies_from_cmd(command);
+    let mut tb = call
+        .transaction_builder(tx_policies, VariableOutputPolicy::EstimateMinimum, &account)
         .await?;
+
+    account.add_witnesses(&mut tb)?;
+    account.adjust_for_fee(&mut tb, 0).await?;
+
+    let tx = tb.build(provider).await?;
+
     if command.dry_run {
         info!("{:?}", tx);
         Ok(RanScript { receipts: vec![] })
     } else {
-        let receipts =
-            try_send_tx(node_url, &tx.into(), command.pretty_print, command.simulate).await?;
+        let receipts = try_send_tx(
+            node_url.as_str(),
+            &tx.into(),
+            command.pretty_print,
+            command.simulate,
+        )
+        .await?;
         Ok(RanScript { receipts })
     }
 }
@@ -150,27 +205,36 @@ async fn send_tx(
     pretty_print: bool,
     simulate: bool,
 ) -> Result<Vec<fuel_tx::Receipt>> {
-    use fuels_accounts::provider::ClientExt;
     let outputs = {
         if !simulate {
-            let (_, receipts) = client.submit_and_await_commit_with_receipts(tx).await?;
-            if let Some(receipts) = receipts {
-                Ok(receipts)
-            } else {
-                bail!("The `receipts` during `send_tx` is empty")
+            let status = client.submit_and_await_commit(tx).await?;
+
+            match status {
+                fuel_core_client::client::types::TransactionStatus::Success {
+                    receipts, ..
+                } => receipts,
+                fuel_core_client::client::types::TransactionStatus::Failure {
+                    receipts, ..
+                } => receipts,
+                _ => vec![],
             }
         } else {
-            client.dry_run(tx).await
+            let txs = vec![tx.clone()];
+            let receipts = client.dry_run(txs.as_slice()).await?;
+            let receipts = receipts
+                .first()
+                .map(|tx| &tx.result)
+                .map(|res| res.receipts());
+            match receipts {
+                Some(receipts) => receipts.to_vec(),
+                None => vec![],
+            }
         }
     };
-
-    match outputs {
-        Ok(logs) => {
-            info!("{}", format_log_receipts(&logs, pretty_print)?);
-            Ok(logs)
-        }
-        Err(e) => bail!("{e}"),
+    if !outputs.is_empty() {
+        info!("{}", format_log_receipts(&outputs, pretty_print)?);
     }
+    Ok(outputs)
 }
 
 fn build_opts_from_cmd(cmd: &cmd::Run) -> pkg::BuildOpts {
@@ -181,16 +245,16 @@ fn build_opts_from_cmd(cmd: &cmd::Run) -> pkg::BuildOpts {
             terse: cmd.pkg.terse,
             locked: cmd.pkg.locked,
             output_directory: cmd.pkg.output_directory.clone(),
-            json_abi_with_callpaths: cmd.pkg.json_abi_with_callpaths,
             ipfs_node: cmd.pkg.ipfs_node.clone().unwrap_or_default(),
         },
         print: pkg::PrintOpts {
             ast: cmd.print.ast,
             dca_graph: cmd.print.dca_graph.clone(),
             dca_graph_url_format: cmd.print.dca_graph_url_format.clone(),
-            finalized_asm: cmd.print.finalized_asm,
-            intermediate_asm: cmd.print.intermediate_asm,
-            ir: cmd.print.ir,
+            asm: cmd.print.asm(),
+            bytecode: cmd.print.bytecode,
+            bytecode_spans: false,
+            ir: cmd.print.ir(),
             reverse_order: cmd.print.reverse_order,
         },
         minify: pkg::MinifyOpts {
@@ -202,10 +266,13 @@ fn build_opts_from_cmd(cmd: &cmd::Run) -> pkg::BuildOpts {
         release: cmd.build_profile.release,
         error_on_warnings: cmd.build_profile.error_on_warnings,
         time_phases: cmd.print.time_phases,
+        profile: cmd.print.profile,
         metrics_outfile: cmd.print.metrics_outfile.clone(),
         binary_outfile: cmd.build_output.bin_file.clone(),
         debug_outfile: cmd.build_output.debug_file.clone(),
         tests: false,
         member_filter: pkg::MemberFilter::only_scripts(),
+        experimental: cmd.experimental.experimental.clone(),
+        no_experimental: cmd.experimental.no_experimental.clone(),
     }
 }

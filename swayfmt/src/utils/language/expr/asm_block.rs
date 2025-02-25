@@ -9,6 +9,7 @@ use crate::{
 use std::fmt::Write;
 use sway_ast::{
     expr::asm::{AsmBlock, AsmBlockContents, AsmFinalExpr, AsmRegisterDeclaration},
+    keywords::{AsmToken, ColonToken, Keyword, SemicolonToken, Token},
     Instruction,
 };
 use sway_types::{ast::Delimiter, Spanned};
@@ -56,25 +57,58 @@ fn format_asm_block(
     formatted_code: &mut FormattedCode,
     formatter: &mut Formatter,
 ) -> Result<(), FormatterError> {
-    write!(formatted_code, "{}", asm_block.asm_token.span().as_str())?;
+    write!(formatted_code, "{}", AsmToken::AS_STR)?;
 
     formatter.with_shape(
         formatter.shape.with_default_code_line(),
         |formatter| -> Result<(), FormatterError> {
-            AsmBlock::open_parenthesis(formatted_code, formatter)?;
+            formatter
+                .shape
+                .code_line
+                .update_line_style(LineStyle::Normal);
+
+            let mut inline_arguments = FormattedCode::new();
             asm_block
                 .registers
                 .get()
-                .format(formatted_code, formatter)?;
-            AsmBlock::close_parenthesis(formatted_code, formatter)?;
+                .format(&mut inline_arguments, formatter)?;
+
+            formatter.shape.code_line.update_expr_new_line(false);
+            formatter
+                .shape
+                .code_line
+                .update_expr_kind(shape::ExprKind::Function);
+            if inline_arguments.len() > formatter.shape.width_heuristics.fn_call_width {
+                formatter
+                    .shape
+                    .code_line
+                    .update_line_style(LineStyle::Multiline);
+                AsmBlock::open_parenthesis(formatted_code, formatter)?;
+                formatter.indent();
+                asm_block
+                    .registers
+                    .get()
+                    .format(formatted_code, formatter)?;
+                formatter.unindent();
+                write!(formatted_code, "{}", formatter.indent_to_str()?)?;
+                AsmBlock::close_parenthesis(formatted_code, formatter)?;
+            } else {
+                AsmBlock::open_parenthesis(formatted_code, formatter)?;
+                write!(formatted_code, "{}", inline_arguments)?;
+                AsmBlock::close_parenthesis(formatted_code, formatter)?;
+            }
+
+            formatter
+                .shape
+                .code_line
+                .update_line_style(LineStyle::Multiline);
+            AsmBlock::open_curly_brace(formatted_code, formatter)?;
+            asm_block.contents.get().format(formatted_code, formatter)?;
+            AsmBlock::close_curly_brace(formatted_code, formatter)?;
 
             Ok(())
         },
     )?;
-
-    AsmBlock::open_curly_brace(formatted_code, formatter)?;
-    asm_block.contents.get().format(formatted_code, formatter)?;
-    AsmBlock::close_curly_brace(formatted_code, formatter)?;
 
     Ok(())
 }
@@ -101,7 +135,7 @@ impl CurlyBrace for AsmBlock {
         line: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        formatter.shape.block_indent(&formatter.config);
+        formatter.indent();
         match formatter.shape.code_line.line_style {
             LineStyle::Inline => {
                 write!(line, " {} ", Delimiter::Brace.as_open_char())?;
@@ -116,7 +150,7 @@ impl CurlyBrace for AsmBlock {
         line: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        formatter.shape.block_unindent(&formatter.config);
+        formatter.unindent();
         match formatter.shape.code_line.line_style {
             LineStyle::Inline => {
                 write!(line, " {}", Delimiter::Brace.as_close_char())?;
@@ -125,7 +159,7 @@ impl CurlyBrace for AsmBlock {
                 write!(
                     line,
                     "{}{}",
-                    formatter.shape.indent.to_string(&formatter.config)?,
+                    formatter.indent_to_str()?,
                     Delimiter::Brace.as_close_char()
                 )?;
             }
@@ -141,8 +175,8 @@ impl Format for AsmRegisterDeclaration {
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         self.register.format(formatted_code, formatter)?;
-        if let Some((colon_token, expr)) = &self.value_opt {
-            write!(formatted_code, "{} ", colon_token.span().as_str())?;
+        if let Some((_colon_token, expr)) = &self.value_opt {
+            write!(formatted_code, "{} ", ColonToken::AS_STR)?;
             expr.format(formatted_code, formatter)?;
         }
 
@@ -156,7 +190,7 @@ impl Format for Instruction {
         formatted_code: &mut FormattedCode,
         _formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        write!(formatted_code, "{:<4}", &self.op_code_ident().as_str())?;
+        write!(formatted_code, "{}", self.op_code_as_str())?;
         for arg in self.register_arg_idents() {
             write!(formatted_code, " {}", arg.as_str())?
         }
@@ -173,22 +207,14 @@ impl Format for AsmBlockContents {
         formatted_code: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        for (instruction, semicolon_token) in self.instructions.iter() {
-            write!(
-                formatted_code,
-                "{}",
-                formatter.shape.indent.to_string(&formatter.config)?
-            )?;
+        for (instruction, _semicolon_token) in self.instructions.iter() {
+            write!(formatted_code, "{}", formatter.indent_to_str()?)?;
             instruction.format(formatted_code, formatter)?;
-            writeln!(formatted_code, "{}", semicolon_token.span().as_str())?
+            writeln!(formatted_code, "{}", SemicolonToken::AS_STR)?
         }
         if let Some(final_expr) = &self.final_expr_opt {
             if formatter.shape.code_line.line_style == LineStyle::Multiline {
-                write!(
-                    formatted_code,
-                    "{}",
-                    formatter.shape.indent.to_string(&formatter.config)?
-                )?;
+                write!(formatted_code, "{}", formatter.indent_to_str()?)?;
                 final_expr.format(formatted_code, formatter)?;
                 writeln!(formatted_code)?;
             } else {
@@ -207,8 +233,8 @@ impl Format for AsmFinalExpr {
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         self.register.format(formatted_code, formatter)?;
-        if let Some((colon_token, ty)) = &self.ty_opt {
-            write!(formatted_code, "{} ", colon_token.span().as_str())?;
+        if let Some((_colon_token, ty)) = &self.ty_opt {
+            write!(formatted_code, "{} ", ColonToken::AS_STR)?;
             ty.format(formatted_code, formatter)?;
         }
 

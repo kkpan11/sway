@@ -6,7 +6,10 @@ use crate::{
     },
 };
 use std::fmt::Write;
-use sway_ast::{ExprArrayDescriptor, ExprTupleDescriptor};
+use sway_ast::{
+    keywords::{SemicolonToken, Token},
+    CommaToken, ExprArrayDescriptor, ExprTupleDescriptor,
+};
 use sway_types::{ast::Delimiter, Spanned};
 
 impl Format for ExprTupleDescriptor {
@@ -20,22 +23,18 @@ impl Format for ExprTupleDescriptor {
             Self::Nil => {}
             Self::Cons {
                 head,
-                comma_token,
+                comma_token: _,
                 tail,
             } => match formatter.shape.code_line.line_style {
                 LineStyle::Multiline => {
-                    write!(
-                        formatted_code,
-                        "{}",
-                        formatter.shape.indent.to_string(&formatter.config)?
-                    )?;
+                    write!(formatted_code, "{}", formatter.indent_to_str()?)?;
                     head.format(formatted_code, formatter)?;
-                    write!(formatted_code, "{}", comma_token.span().as_str())?;
+                    write!(formatted_code, "{}", CommaToken::AS_STR)?;
                     tail.format(formatted_code, formatter)?;
                 }
                 _ => {
                     head.format(formatted_code, formatter)?;
-                    write!(formatted_code, "{} ", comma_token.span().as_str())?;
+                    write!(formatted_code, "{} ", CommaToken::AS_STR)?;
                     tail.format(formatted_code, formatter)?;
                 }
             },
@@ -53,7 +52,7 @@ impl Parenthesis for ExprTupleDescriptor {
     ) -> Result<(), FormatterError> {
         match formatter.shape.code_line.line_style {
             LineStyle::Multiline => {
-                formatter.shape.block_indent(&formatter.config);
+                formatter.indent();
                 writeln!(line, "{}", Delimiter::Parenthesis.as_open_char())?;
             }
             _ => write!(line, "{}", Delimiter::Parenthesis.as_open_char())?,
@@ -67,11 +66,11 @@ impl Parenthesis for ExprTupleDescriptor {
     ) -> Result<(), FormatterError> {
         match formatter.shape.code_line.line_style {
             LineStyle::Multiline => {
-                formatter.shape.block_unindent(&formatter.config);
+                formatter.unindent();
                 write!(
                     line,
                     "{}{}",
-                    formatter.shape.indent.to_string(&formatter.config)?,
+                    formatter.indent_to_str()?,
                     Delimiter::Parenthesis.as_close_char()
                 )?;
             }
@@ -95,11 +94,11 @@ impl Format for ExprArrayDescriptor {
             }
             Self::Repeat {
                 value,
-                semicolon_token,
+                semicolon_token: _,
                 length,
             } => {
                 value.format(formatted_code, formatter)?;
-                write!(formatted_code, "{} ", semicolon_token.span().as_str())?;
+                write!(formatted_code, "{} ", SemicolonToken::AS_STR)?;
                 length.format(formatted_code, formatter)?;
             }
         }
@@ -116,7 +115,7 @@ impl SquareBracket for ExprArrayDescriptor {
     ) -> Result<(), FormatterError> {
         match formatter.shape.code_line.line_style {
             LineStyle::Multiline => {
-                formatter.shape.block_indent(&formatter.config);
+                formatter.indent();
                 write!(line, "{}", Delimiter::Bracket.as_open_char())?;
             }
             _ => write!(line, "{}", Delimiter::Bracket.as_open_char())?,
@@ -130,11 +129,11 @@ impl SquareBracket for ExprArrayDescriptor {
     ) -> Result<(), FormatterError> {
         match formatter.shape.code_line.line_style {
             LineStyle::Multiline => {
-                formatter.shape.block_unindent(&formatter.config);
+                formatter.unindent();
                 write!(
                     line,
                     "{}{}",
-                    formatter.shape.indent.to_string(&formatter.config)?,
+                    formatter.indent_to_str()?,
                     Delimiter::Bracket.as_close_char()
                 )?;
             }

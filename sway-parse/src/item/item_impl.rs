@@ -1,7 +1,9 @@
 use crate::{Parse, ParseResult, Parser};
 
 use sway_ast::attribute::Annotated;
-use sway_ast::keywords::{ConstToken, FnToken, OpenAngleBracketToken, SemicolonToken, WhereToken};
+use sway_ast::keywords::{
+    ConstToken, FnToken, OpenAngleBracketToken, SemicolonToken, TypeToken, WhereToken,
+};
 use sway_ast::{Braces, ItemImpl, ItemImplItem, PubToken, Ty};
 use sway_error::parser_error::ParseErrorKind;
 
@@ -14,6 +16,10 @@ impl Parse for ItemImplItem {
             let const_decl = parser.parse()?;
             parser.parse::<SemicolonToken>()?;
             Ok(ItemImplItem::Const(const_decl))
+        } else if let Some(_type_keyword) = parser.peek::<TypeToken>() {
+            let type_decl = parser.parse()?;
+            parser.parse::<SemicolonToken>()?;
+            Ok(ItemImplItem::Type(type_decl))
         } else {
             Err(parser.emit_error(ParseErrorKind::ExpectedAnItem))
         }
@@ -82,12 +88,28 @@ mod tests {
 
     #[test]
     fn parse_impl_slice() {
-        let item = parse::<ItemImpl>(
-            r#"
-            impl __slice[T] {}
-            "#,
+        // deprecated syntax
+        let item = parse::<ItemImpl>("impl __slice[T] {}");
+        assert_matches!(
+            item.ty,
+            Ty::Slice {
+                slice_token: Some(..),
+                ty: _
+            }
         );
-        assert_matches!(item.ty, Ty::Slice { .. });
+
+        // "new" syntax
+        let item = parse::<ItemImpl>("impl [T] {}");
+        assert_matches!(
+            item.ty,
+            Ty::Slice {
+                slice_token: None,
+                ty: _
+            }
+        );
+
+        let item = parse::<ItemImpl>("impl &[T] {}");
+        assert_matches!(item.ty, Ty::Ref { ty, .. } if matches!(&*ty, Ty::Slice { .. }));
     }
 
     #[test]
@@ -98,5 +120,69 @@ mod tests {
             "#,
         );
         assert_matches!(item.ty, Ty::Slice { .. });
+    }
+
+    #[test]
+    fn parse_impl_ref() {
+        let item = parse::<ItemImpl>(
+            r#"
+            impl &T {}
+            "#,
+        );
+        assert_matches!(
+            item.ty,
+            Ty::Ref {
+                mut_token: None,
+                ..
+            }
+        );
+    }
+
+    #[test]
+    fn parse_impl_for_ref() {
+        let item = parse::<ItemImpl>(
+            r#"
+            impl Foo for &T {}
+            "#,
+        );
+        assert_matches!(
+            item.ty,
+            Ty::Ref {
+                mut_token: None,
+                ..
+            }
+        );
+    }
+
+    #[test]
+    fn parse_impl_mut_ref() {
+        let item = parse::<ItemImpl>(
+            r#"
+            impl &mut T {}
+            "#,
+        );
+        assert_matches!(
+            item.ty,
+            Ty::Ref {
+                mut_token: Some(_),
+                ..
+            }
+        );
+    }
+
+    #[test]
+    fn parse_impl_for_mut_ref() {
+        let item = parse::<ItemImpl>(
+            r#"
+            impl Foo for &mut T {}
+            "#,
+        );
+        assert_matches!(
+            item.ty,
+            Ty::Ref {
+                mut_token: Some(_),
+                ..
+            }
+        );
     }
 }
