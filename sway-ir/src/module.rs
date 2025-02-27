@@ -2,25 +2,48 @@
 //!
 //! A module also has a 'kind' corresponding to the different Sway module types.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, HashMap},
+};
 
 use crate::{
     context::Context,
     function::{Function, FunctionIterator},
     value::Value,
+    Constant, MetadataIndex, Type,
 };
 
-/// A wrapper around an [ECS](https://github.com/fitzgen/generational-arena) handle into the
+/// A wrapper around an [ECS](https://github.com/orlp/slotmap) handle into the
 /// [`Context`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct Module(pub generational_arena::Index);
+pub struct Module(pub slotmap::DefaultKey);
 
 #[doc(hidden)]
 pub struct ModuleContent {
     pub kind: Kind,
     pub functions: Vec<Function>,
     pub global_constants: HashMap<Vec<String>, Value>,
-    pub global_configurable: BTreeMap<Vec<String>, Value>,
+    pub configs: BTreeMap<String, ConfigContent>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConfigContent {
+    V0 {
+        name: String,
+        ty: Type,
+        ptr_ty: Type,
+        constant: Constant,
+        opt_metadata: Option<MetadataIndex>,
+    },
+    V1 {
+        name: String,
+        ty: Type,
+        ptr_ty: Type,
+        encoded_bytes: Vec<u8>,
+        decode_fn: Cell<Function>,
+        opt_metadata: Option<MetadataIndex>,
+    },
 }
 
 /// The different 'kinds' of Sway module: `Contract`, `Library`, `Predicate` or `Script`.
@@ -39,7 +62,7 @@ impl Module {
             kind,
             functions: Vec::new(),
             global_constants: HashMap::new(),
-            global_configurable: BTreeMap::new(),
+            configs: BTreeMap::new(),
         };
         Module(context.modules.insert(content))
     }
@@ -49,7 +72,7 @@ impl Module {
         context.modules[self.0].kind
     }
 
-    /// Return an interator over each of the [`Function`]s in this module.
+    /// Return an iterator over each of the [`Function`]s in this module.
     pub fn function_iter(&self, context: &Context) -> FunctionIterator {
         FunctionIterator::new(context, self)
     }
@@ -74,28 +97,14 @@ impl Module {
             .copied()
     }
 
-    /// Add a global configurable value to this module.
-    pub fn add_global_configurable(
-        &self,
-        context: &mut Context,
-        call_path: Vec<String>,
-        config_val: Value,
-    ) {
-        context.modules[self.0]
-            .global_configurable
-            .insert(call_path, config_val);
+    /// Add a config value to this module.
+    pub fn add_config(&self, context: &mut Context, name: String, content: ConfigContent) {
+        context.modules[self.0].configs.insert(name, content);
     }
 
-    /// Get a named global configurable value from this module, if found.
-    pub fn get_global_configurable(
-        &self,
-        context: &Context,
-        call_path: &Vec<String>,
-    ) -> Option<Value> {
-        context.modules[self.0]
-            .global_configurable
-            .get(call_path)
-            .copied()
+    /// Get a named config content from this module, if found.
+    pub fn get_config<'a>(&self, context: &'a Context, name: &str) -> Option<&'a ConfigContent> {
+        context.modules[self.0].configs.get(name)
     }
 
     /// Removed a function from the module.  Returns true if function was found and removed.
@@ -109,11 +118,18 @@ impl Module {
             .functions
             .retain(|mod_fn| mod_fn != function);
     }
+
+    pub fn iter_configs<'a>(
+        &'a self,
+        context: &'a Context,
+    ) -> impl Iterator<Item = &'a ConfigContent> + 'a {
+        context.modules[self.0].configs.values()
+    }
 }
 
 /// An iterator over [`Module`]s within a [`Context`].
 pub struct ModuleIterator {
-    modules: Vec<generational_arena::Index>,
+    modules: Vec<slotmap::DefaultKey>,
     next: usize,
 }
 

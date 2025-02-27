@@ -9,7 +9,7 @@ category = "fail"
 # check: bhsh r1 r2;
 # nextln: $()The BHSH opcode cannot be used in a predicate.
 
-# check: burn r1;
+# check: burn r1 r2;
 # nextln: $()The BURN opcode cannot be used in a predicate.
 
 # check: call r1 r2 r3 r4;
@@ -35,16 +35,13 @@ category = "fail"
 
 # not: $()The GM (get-metadata) opcode, when called from an external context, will cause the VM to panic.
 
-# check: ldc r1 r2 r3;
-# nextln: $()The LDC opcode cannot be used in a predicate.
-
 # check: log r1 r2 r3 r4;
 # nextln: $()The LOG opcode cannot be used in a predicate.
 
 # check: logd r1 r2 r3 r4;
 # nextln: $()The LOGD opcode cannot be used in a predicate.
 
-# check: mint r1;
+# check: mint r1 r2;
 # nextln: $()The MINT opcode cannot be used in a predicate.
 
 # check: smo r1 r2 r3 r4;

@@ -30,17 +30,19 @@ pub trait Ownable : StorageHelpers {
 
     #[storage(write)]
     fn renounce_ownership() {
-        Self::set_owner(std::constants::ZERO_B256);
+        Self::set_owner(b256::zero());
     }
 
     #[storage(read, write)]
     fn transfer_ownership(new_owner: b256) {
-        assert(new_owner != std::constants::ZERO_B256);
+        assert(new_owner != b256::zero());
         let old_owner = Self::get_owner();
         Self::set_owner(new_owner);
-        std::logging::log(OwnershipTransferred {
+
+        // log does not work here
+        log(OwnershipTransferred {
             previous_owner: old_owner,
             new_owner: new_owner,
-        });
+        })
     }
 }

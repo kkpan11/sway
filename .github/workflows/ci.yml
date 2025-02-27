@@ -15,12 +15,69 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
-  RUST_VERSION: 1.71.0
-  NIGHTLY_RUST_VERSION: nightly-2023-04-01
+  RUST_VERSION: 1.82.0
+  NIGHTLY_RUST_VERSION: nightly-2024-10-21
 
 jobs:
-  build-sway-lib-core:
+  verifications-complete:
+    needs:
+      - build-sway-lib-core
+      - build-sway-lib-std
+      - build-sway-examples
+      - build-reference-examples
+      - forc-fmt-check-sway-lib-core
+      - forc-fmt-check-sway-lib-std
+      - forc-fmt-check-sway-examples
+      - forc-fmt-check-panic
+      - check-sdk-harness-test-suite-compatibility
+      - build-mdbook
+      - build-forc-doc-sway-lib-std
+      - build-forc-test-project
+      - cargo-build-workspace
+      - cargo-clippy
+      - cargo-toml-fmt-check
+      - cargo-fmt-check
+      - cargo-run-e2e-test-evm
+      - cargo-test-lib-std
+      - forc-run-benchmarks
+      - forc-unit-tests
+      - forc-pkg-fuels-deps-check
+      - cargo-test-sway-lsp
+      - cargo-test-forc
+      - cargo-test-workspace
+      - cargo-unused-deps-check
+      - pre-publish-check
+      - cargo-run-e2e-test
+      - cargo-run-e2e-test-release
+      - cargo-test-forc-debug
+      - cargo-test-forc-client
+      - cargo-test-forc-node
+      - notify-slack-on-failure
     runs-on: ubuntu-latest
+    steps:
+      - run: echo "pass"
+  get-fuel-core-version:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    outputs:
+      fuel_core_version: ${{steps.get_fuel_core_ver.outputs.version}}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: get fuel core version
+        id: get_fuel_core_ver
+        run: |
+          cargo install toml-cli
+          version=$(toml get Cargo.toml workspace.dependencies.fuel-core-client.version | tr -d '"')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-sway-lib-core:
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -28,13 +85,15 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Install Forc
         run: cargo install --locked --debug --path ./forc
       - name: Build sway-lib-core
         run: forc build --path sway-lib-core
 
   build-sway-lib-std:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -42,13 +101,15 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Install Forc
         run: cargo install --locked --debug --path ./forc
       - name: Build sway-lib-std
         run: forc build --path sway-lib-std
 
   build-sway-examples:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -56,11 +117,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Build Sway examples workspace
         run: cargo run --locked -p forc -- build --locked --path ./examples/Forc.toml
-  
+
   build-reference-examples:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -68,11 +131,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Build Sway examples workspace
         run: cargo run --locked -p forc -- build --locked --path ./docs/reference/src/code/Forc.toml
 
-  forc-fmt-check-sway-examples:
-    runs-on: ubuntu-latest
+  forc-fmt-check-sway-lib-core:
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -80,11 +145,41 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Check Sway sway-lib-core formatting
+        run: cargo run --locked -p forc-fmt -- --check --path ./sway-lib-core
+
+  forc-fmt-check-sway-lib-std:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Check Sway sway-lib-std formatting
+        run: cargo run --locked -p forc-fmt -- --check --path ./sway-lib-std
+
+  forc-fmt-check-sway-examples:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Check Sway examples formatting
         run: cargo run --locked -p forc-fmt -- --check --path ./examples
 
-  build-mdbook:
-    runs-on: ubuntu-latest
+  forc-fmt-check-panic:
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -92,6 +187,48 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Install forc-fmt
+        run: cargo install --locked --debug --path ./forc-plugins/forc-fmt
+      - name: Run the formatter against all sway projects and fail if any of them panic
+        run: scripts/formatter/forc-fmt-check-panic.sh
+
+  check-sdk-harness-test-suite-compatibility:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install toml-cli
+        run: cargo install toml-cli
+
+      - name: Read and compare versions
+        env:
+          PACKAGE_NAMES: "fuel-core-client" # multiple packages can be specified delimeted with `,`.
+        run: |
+          .github/workflows/scripts/check-sdk-harness-version.sh
+
+  build-mdbook:
+    runs-on: buildjet-8vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: buildjet/cache@v3
+        with:
+          path: |
+            ~/.cargo/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Install Forc
         run: cargo install --locked --debug --path ./forc
       - name: Install Forc plugins
@@ -99,8 +236,12 @@ jobs:
           cargo install --locked --debug --path ./forc-plugins/forc-fmt
           cargo install --locked --debug --path ./forc-plugins/forc-lsp
           cargo install --locked --debug --path ./forc-plugins/forc-client
+          cargo install --locked --debug --path ./forc-plugins/forc-debug
           cargo install --locked --debug --path ./forc-plugins/forc-doc
           cargo install --locked --debug --path ./forc-plugins/forc-tx
+          cargo install --locked --debug --path ./forc-plugins/forc-crypto
+          cargo install --locked --debug --path ./forc-plugins/forc-node
+          cargo install --locked --debug --path ./forc-plugins/forc-migrate
           cargo install --locked --debug forc-explore
       - name: Install mdbook-forc-documenter
         run: cargo install --locked --debug --path ./scripts/mdbook-forc-documenter
@@ -111,7 +252,7 @@ jobs:
           mdbook-version: "0.4.25"
       - name: Emit book logs to tmp.txt, fail if build logs contain 'ERROR'
         run: |
-          MDBOOK_preprocessor__FORC_documenter__STRICT="true" mdbook build docs/book &> tmp.txt
+          MDBOOK_preprocessor__FORC_documenter__STRICT="true" mdbook build docs/book 2>&1 | tee tmp.txt
           if cat tmp.txt | grep 'ERROR'
           then
             cat tmp.txt
@@ -133,7 +274,7 @@ jobs:
           fi
 
   build-forc-doc-sway-lib-std:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -141,23 +282,28 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Install Forc
         run: cargo install --locked --debug --path ./forc
       - name: Install Forc plugins
         run: |
           cargo install --locked --debug --path ./forc-plugins/forc-doc
       - name: Build sway-lib-std docs
-        run: forc doc --manifest-path ./sway-lib-std
+        run: forc doc --path ./sway-lib-std
 
   build-forc-test-project:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Install Forc
         run: cargo install --locked --debug --path ./forc
       - name: Initialize test project
@@ -171,6 +317,8 @@ jobs:
       #   run: (cd test-proj && forc test)
       - name: Install cargo-generate
         run: cargo install --locked cargo-generate
+      - name: Install fuel-core
+        run: cargo install --locked fuel-core-bin
       - name: Generate Rust Integration Tests
         run: (cd test-proj && cargo generate --init --path ../templates/sway-test-rs --name test-proj)
       - name: Update project cargo manifest with workspace
@@ -179,10 +327,10 @@ jobs:
 
           [workspace]" >> test-proj/Cargo.toml
       - name: Build and Run Default Integration Test
-        run: (cd test-proj && cargo test)
+        run: (cd test-proj && cargo test --release)
 
   cargo-build-workspace:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-8vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -190,13 +338,15 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: "Build Workspace"
         run: cargo build --locked --workspace --all-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
 
   cargo-clippy:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -205,11 +355,13 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Check Clippy Linter
         run: cargo clippy --all-features --all-targets -- -D warnings
 
   cargo-toml-fmt-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # Switching this runner to buildjet causes failure.
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -222,10 +374,10 @@ jobs:
           crate: cargo-toml-lint
           version: "0.1"
       - name: Run Cargo.toml linter
-        run: git ls-files | grep Cargo.toml$ | grep -v 'templates/sway-test-rs' | xargs --verbose -n 1 cargo-toml-lint
+        run: git ls-files | grep Cargo.toml$ | grep -v 'templates/' | xargs --verbose -n 1 cargo-toml-lint
 
   cargo-fmt-check:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -237,48 +389,56 @@ jobs:
         run: cargo fmt --all -- --check
 
   cargo-run-e2e-test:
-    runs-on: ubuntu-latest
-    services:
-      fuel-core:
-        image: ghcr.io/fuellabs/fuel-core:v0.19.1
-        ports:
-          - 4000:4000
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    needs: get-fuel-core-version
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu, wasm32-unknown-unknown"
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Install fuel-core for tests
+        run: |
+          curl -sSLf https://github.com/FuelLabs/fuel-core/releases/download/v${{ needs.get-fuel-core-version.outputs.fuel_core_version }}/fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu.tar.gz -L -o fuel-core.tar.gz
+          tar -xvf fuel-core.tar.gz
+          chmod +x fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core
+          mv fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core /usr/local/bin/fuel-core
       - name: Cargo Run E2E Tests (Fuel VM)
-        run: cargo run --locked --release --bin test -- --locked
+        run: |
+          fuel-core run --db-type in-memory --debug &
+          sleep 5 &&
+          cargo run --locked --release --bin test -- --locked
+
+  cargo-run-e2e-test-release:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    needs: get-fuel-core-version
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu, wasm32-unknown-unknown"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Install fuel-core for tests
+        run: |
+          curl -sSLf https://github.com/FuelLabs/fuel-core/releases/download/v${{ needs.get-fuel-core-version.outputs.fuel_core_version }}/fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu.tar.gz -L -o fuel-core.tar.gz
+          tar -xvf fuel-core.tar.gz
+          chmod +x fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core
+          mv fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core /usr/local/bin/fuel-core
+      - name: Cargo Run E2E Tests (Fuel VM)
+        run: |
+          fuel-core run --db-type in-memory --debug &
+          sleep 5 &&
+          cargo run --locked --release --bin test -- --locked --release
 
   cargo-run-e2e-test-evm:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Cargo Run E2E Tests (EVM)
-        run: cargo run --locked --release --bin test -- --target evm --locked
-
-  cargo-run-e2e-test-midenvm:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Cargo Run E2E Tests (EVM)
-        run: cargo run --locked --release --bin test -- --target midenvm --locked
-
-  # TODO: Remove this upon merging std tests with the rest of the E2E tests.
-  cargo-test-lib-std:
     runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
@@ -286,16 +446,51 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu, wasm32-unknown-unknown"
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Cargo Run E2E Tests (EVM)
+        run: cargo run --locked --release --bin test -- --target evm --locked --no-experimental new_encoding
+
+  # TODO: Remove this upon merging std tests with the rest of the E2E tests.
+  cargo-test-lib-std:
+    runs-on: buildjet-8vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu, wasm32-unknown-unknown"
+      - uses: buildjet/cache@v3
+        with:
+          path: |
+            ~/.cargo/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Build All Tests
-        run: cargo run --locked -p forc -- build --locked --path ./test/src/sdk-harness
+        run: cargo run --locked --release -p forc -- build --release --locked --path ./test/src/sdk-harness
       - name: Cargo Test sway-lib-std
-        run: cargo test --locked --manifest-path ./test/src/sdk-harness/Cargo.toml -- --nocapture
+        run: cargo test --locked --release --manifest-path ./test/src/sdk-harness/Cargo.toml -- --nocapture
+      - name: Build All Tests - Experimental Feature 'storage_domains'
+        run: cargo run --locked --release -p forc -- build --experimental storage_domains --release --locked --path ./test/src/sdk-harness
+      - name: Cargo Test sway-lib-std - Experimental Feature 'storage_domains'
+        run: cargo test --locked --release --manifest-path ./test/src/sdk-harness/Cargo.toml -- --nocapture
+      - name: Build All Tests - Experimental Feature 'error_type'
+        run: cargo run --locked --release -p forc -- build --experimental error_type --release --locked --path ./test/src/sdk-harness
+      - name: Cargo Test sway-lib-std - Experimental Feature 'error_type'
+        run: cargo test --locked --release --manifest-path ./test/src/sdk-harness/Cargo.toml -- --nocapture
+      - name: Build All Tests - Experimental Feature 'partial_eq'
+        run: cargo run --locked --release -p forc -- build --experimental partial_eq --release --locked --path ./test/src/sdk-harness
+      - name: Cargo Test sway-lib-std - Experimental Feature 'partial_eq'
+        run: cargo test --locked --release --manifest-path ./test/src/sdk-harness/Cargo.toml -- --nocapture
 
   forc-run-benchmarks:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    environment: fuel-sway-bot
     permissions:
-        contents: write
+      contents: write
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -303,6 +498,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Install Forc
         run: cargo install --locked --debug --path ./forc
       - name: Run benchmarks
@@ -313,24 +510,32 @@ jobs:
         with:
           repository: FuelLabs/sway-performance-data
           path: performance-data
+      - name: Get GitHub app token
+        if: github.event_name == 'push'
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_KEY }}
+          owner: FuelLabs
       - name: Checkout benchmark data
         if: github.event_name == 'push'
         uses: actions/checkout@v3
         with:
           repository: FuelLabs/sway-performance-data
           path: performance-data
-          token: ${{ secrets.CI_ACCOUNT_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
       - name: Prepare benchmarks data for commit
         if: github.event_name == 'push'
         run: ./benchmark.sh --prepare-for-commit
       - uses: EndBug/add-and-commit@v9
         with:
-          cwd: './performance-data'
-          message: 'Updated benchmark data'
+          cwd: "./performance-data"
+          message: "Updated benchmark data"
           default_author: github_actions
 
   forc-unit-tests:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -338,13 +543,37 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Install Forc
         run: cargo install --locked --debug --path ./forc
-      - name: Run Unit Tests
-        run: forc build --path sway-lib-core && forc test --path sway-lib-core && forc build --path sway-lib-std && forc test --path sway-lib-std
+      - name: Run Core Unit Tests
+        run: forc build --path sway-lib-core && forc test --path sway-lib-core
+      - name: Run Core Unit Tests - Experimental feature 'storage_domains'
+        run: forc build --experimental storage_domains --path sway-lib-core && forc test --experimental storage_domains --path sway-lib-core
+      - name: Run Core Unit Tests - Experimental feature 'error_type'
+        run: forc build --experimental error_type --path sway-lib-core && forc test --experimental error_type --path sway-lib-core
+      - name: Run Core Unit Tests - Experimental feature 'partial_eq'
+        run: forc build --experimental partial_eq --path sway-lib-core && forc test --experimental partial_eq --path sway-lib-core
+      - name: Run Std Unit Tests
+        run: forc build --path sway-lib-std && forc test --path sway-lib-std
+      - name: Run Std Unit Tests - Experimental feature 'storage_domains'
+        run: forc build --experimental storage_domains --path sway-lib-std && forc test --experimental storage_domains --path sway-lib-std
+      - name: Run Std Unit Tests - Experimental feature 'error_type'
+        run: forc build --experimental error_type --path sway-lib-std && forc test --experimental error_type --path sway-lib-std
+      - name: Run Std Unit Tests - Experimental feature 'partial_eq'
+        run: forc build --experimental partial_eq --path sway-lib-std && forc test --experimental partial_eq --path sway-lib-std
+      - name: Run In Language Unit Tests
+        run: forc build --path test/src/in_language_tests && forc test --path test/src/in_language_tests
+      - name: Run In Language Unit Tests - Experimental feature 'storage_domains'
+        run: forc build --experimental storage_domains --path test/src/in_language_tests && forc test --experimental storage_domains --path test/src/in_language_tests
+      - name: Run In Language Unit Tests - Experimental feature 'error_type'
+        run: forc build --experimental error_type --path test/src/in_language_tests && forc test --experimental error_type --path test/src/in_language_tests
+      - name: Run In Language Unit Tests - Experimental feature 'partial_eq'
+        run: forc build --experimental partial_eq --path test/src/in_language_tests && forc test --experimental partial_eq --path test/src/in_language_tests
 
   forc-pkg-fuels-deps-check:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -352,15 +581,14 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-deps
-        run: cargo install cargo-deps
+        with:
+          cache-provider: "buildjet"
 
       # We require this check to avoid cyclic dependencies between 'fuels' and 'forc-pkg'.
       # Detailed explanation is found in the echo below.
       - name: Check 'forc-pkg' dependencies for 'fuels' crates
         run: |
-          deps=$(cargo deps --manifest-path forc-pkg/Cargo.toml)
+          deps=$(cargo tree --manifest-path forc-pkg/Cargo.toml)
 
           case "$deps" in
             *fuels*)
@@ -377,10 +605,85 @@ jobs:
               exit 0
               ;;
           esac
-
-
-  cargo-test-workspace:
-    runs-on: ubuntu-latest
+  cargo-test-forc-debug:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    needs: get-fuel-core-version
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu, wasm32-unknown-unknown"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Install fuel-core for tests
+        run: |
+          curl -sSLf https://github.com/FuelLabs/fuel-core/releases/download/v${{ needs.get-fuel-core-version.outputs.fuel_core_version }}/fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu.tar.gz -L -o fuel-core.tar.gz
+          tar -xvf fuel-core.tar.gz
+          chmod +x fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core
+          mv fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core /usr/local/bin/fuel-core
+      - name: Run tests
+        run: cargo test --locked --release -p forc-debug
+  cargo-test-forc-client:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    needs: get-fuel-core-version
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu, wasm32-unknown-unknown"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Install fuel-core for tests
+        run: |
+          curl -sSLf https://github.com/FuelLabs/fuel-core/releases/download/v${{ needs.get-fuel-core-version.outputs.fuel_core_version }}/fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu.tar.gz -L -o fuel-core.tar.gz
+          tar -xvf fuel-core.tar.gz
+          chmod +x fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core
+          mv fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core /usr/local/bin/fuel-core
+      - name: Run tests
+        run: cargo test --locked --release -p forc-client -- --test-threads 1
+  cargo-test-forc-node:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    needs: get-fuel-core-version
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: "x86_64-unknown-linux-gnu, wasm32-unknown-unknown"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Install fuel-core for tests
+        run: |
+          curl -sSLf https://github.com/FuelLabs/fuel-core/releases/download/v${{ needs.get-fuel-core-version.outputs.fuel_core_version }}/fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu.tar.gz -L -o fuel-core.tar.gz
+          tar -xvf fuel-core.tar.gz
+          chmod +x fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core
+          mv fuel-core-${{ needs.get-fuel-core-version.outputs.fuel_core_version }}-x86_64-unknown-linux-gnu/fuel-core /usr/local/bin/fuel-core
+      - name: Run tests
+        run: cargo test --locked --release -p forc-node -- --test-threads 1
+  cargo-test-sway-lsp:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Rust and cargo-nextest
+        uses: moonrepo/setup-rust@v0
+        with:
+          channel: stable
+          cache-target: release
+          bins: cargo-nextest
+      - name: Run sway-lsp tests sequentially
+        env:
+          RUST_BACKTRACE: full
+        run: cargo nextest run --locked --release -p sway-lsp --no-capture --profile ci --config-file sway-lsp/tests/nextest.toml
+  cargo-test-forc:
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -388,11 +691,27 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
+      - name: Run forc tests separately 
+        env:
+          RUST_BACKTRACE: full
+        run: cargo test --locked --release -p forc -- --nocapture
+  cargo-test-workspace:
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Run tests
-        run: cargo test --locked
-
+        run: cargo test --locked --release --workspace --exclude forc-debug --exclude sway-lsp --exclude forc-client --exclude forc --exclude forc-node
   cargo-unused-deps-check:
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v3
       - name: Install toolchain
@@ -401,6 +720,8 @@ jobs:
           # `cargo-udeps` requires nightly to run
           toolchain: ${{ env.NIGHTLY_RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: "buildjet"
       - name: Install cargo-udeps
         run: cargo install --locked cargo-udeps
       - name: Check Unused Deps
@@ -420,9 +741,10 @@ jobs:
         cargo-run-e2e-test-evm,
         cargo-test-lib-std,
         cargo-test-workspace,
+        cargo-test-sway-lsp,
         cargo-unused-deps-check,
       ]
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - name: Notify Slack On Failure
         uses: ravsamhq/notify-slack-action@v2
@@ -441,7 +763,7 @@ jobs:
   # This is a separate job because we want this to fail fast if something is invalid here.
   pre-publish-check:
     if: github.event_name == 'release' && github.event.action == 'published'
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -454,26 +776,7 @@ jobs:
       - name: Verify tag version
         run: |
           cargo install toml-cli
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-pkg/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-plugins/forc-client/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-plugins/forc-doc/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-plugins/forc-fmt/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-plugins/forc-lsp/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-plugins/forc-tx/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-test/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-tracing/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} forc-util/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-ast/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-core/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-error/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-ir/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-ir/sway-ir-macros/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-lsp/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-parse/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-types/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} sway-utils/Cargo.toml
-          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }} swayfmt/Cargo.toml
+          ./.github/workflows/scripts/verify_tag.sh ${{ github.ref_name }}
 
       - name: Notify if Job Fails
         uses: ravsamhq/notify-slack-action@v2
@@ -503,6 +806,7 @@ jobs:
         cargo-run-e2e-test-evm,
         cargo-test-lib-std,
         cargo-test-workspace,
+        cargo-test-sway-lsp,
         cargo-unused-deps-check,
         pre-publish-check,
       ]
@@ -519,7 +823,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - name: Publish crate
-        uses: katyo/publish-crates@v2
+        uses: FuelLabs/publish-crates@v1
         with:
           publish-delay: 30000
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -551,10 +855,11 @@ jobs:
         cargo-run-e2e-test-evm,
         cargo-test-lib-std,
         cargo-test-workspace,
+        cargo-test-sway-lsp,
         cargo-unused-deps-check,
       ]
     if: github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     permissions:
       contents: read
       packages: write
@@ -616,7 +921,7 @@ jobs:
   build-publish-release-image:
     # Build & Publish Docker Image Per Sway Release
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: buildjet-4vcpu-ubuntu-2204
     permissions:
       contents: read
       packages: write
@@ -724,13 +1029,13 @@ jobs:
       - name: Strip release binaries x86_64-linux-gnu
         if: matrix.job.target == 'x86_64-unknown-linux-gnu'
         run: |
-          for BINARY in forc forc-fmt forc-lsp forc-deploy forc-run forc-doc forc-tx forc-submit; do
+          for BINARY in forc forc-fmt forc-lsp forc-debug forc-deploy forc-run forc-doc forc-crypto forc-tx forc-submit forc-migrate; do
             strip "target/${{ matrix.job.target }}/release/$BINARY"
           done
       - name: Strip release binaries aarch64-linux-gnu
         if: matrix.job.target == 'aarch64-unknown-linux-gnu'
         run: |
-          for BINARY in forc forc-fmt forc-lsp forc-deploy forc-run forc-doc forc-tx forc-submit; do
+          for BINARY in forc forc-fmt forc-lsp forc-debug forc-deploy forc-run forc-doc forc-crypto forc-tx forc-submit forc-migrate; do
             docker run --rm -v \
             "$PWD/target:/target:Z" \
             ghcr.io/cross-rs/${{ matrix.job.target }}:main \
@@ -740,7 +1045,7 @@ jobs:
       - name: Strip release binaries mac
         if: matrix.job.os == 'macos-latest'
         run: |
-          for BINARY in forc forc-fmt forc-lsp forc-deploy forc-run forc-doc forc-tx forc-submit; do
+          for BINARY in forc forc-fmt forc-lsp forc-debug forc-deploy forc-run forc-doc forc-crypto forc-tx forc-submit forc-migrate; do
             strip -x "target/${{ matrix.job.target }}/release/$BINARY"
           done
 
@@ -754,7 +1059,7 @@ jobs:
           ZIP_FILE_NAME=forc-binaries-${{ env.PLATFORM_NAME }}_${{ env.ARCH }}.tar.gz
           echo "ZIP_FILE_NAME=$ZIP_FILE_NAME" >> $GITHUB_ENV
           mkdir -pv ./forc-binaries
-          for BINARY in forc forc-fmt forc-lsp forc-deploy forc-run forc-doc forc-tx forc-submit; do
+          for BINARY in forc forc-fmt forc-lsp forc-debug forc-deploy forc-run forc-doc forc-crypto forc-tx forc-submit forc-migrate; do
             cp "target/${{ matrix.job.target }}/release/$BINARY" ./forc-binaries
           done
           tar -czvf $ZIP_FILE_NAME ./forc-binaries

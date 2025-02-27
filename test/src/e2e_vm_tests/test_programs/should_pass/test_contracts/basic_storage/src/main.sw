@@ -1,23 +1,34 @@
 contract;
-use std::{hash::sha256, storage::storage_api::{read, write}};
+use std::{hash::*, storage::storage_api::{read, write}};
 use basic_storage_abi::*;
 
 const C1 = 1;
-const S5 = "aaaaa";
+const NS1_NS2_C1 = 2;
+const S5 = __to_str_array("aaaaa");
+
+const C1KEY: b256 = 0x933a534d4af4c376b0b569e8d8a2c62e635e26f403e124cb91d9c42e83d54373;
 
 storage {
-    c1: u64 = C1,
-    str0: str[0] = "",
-    str1: str[1] = "a",
-    str2: str[2] = "aa",
-    str3: str[3] = "aaa",
-    str4: str[4] = "aaaa",
+    c1 in C1KEY: u8 = C1,
+    str0: str[0] = __to_str_array(""),
+    str1: str[1] = __to_str_array("a"),
+    str2: str[2] = __to_str_array("aa"),
+    str3: str[3] = __to_str_array("aaa"),
+    str4: str[4] = __to_str_array("aaaa"),
     str5: str[5] = S5,
-    str6: str[6] = "aaaaaa",
-    str7: str[7] = "aaaaaaa",
-    str8: str[8] = "aaaaaaaa",
-    str9: str[9] = "aaaaaaaaa",
-    str10: str[10] = "aaaaaaaaaa",
+    str6: str[6] = __to_str_array("aaaaaa"),
+    str7: str[7] = __to_str_array("aaaaaaa"),
+    str8: str[8] = __to_str_array("aaaaaaaa"),
+    str9: str[9] = __to_str_array("aaaaaaaaa"),
+    str10: str[10] = __to_str_array("aaaaaaaaaa"),
+
+    const_u256: u256 = 0x0000000000000000000000000000000000000000000000000000000001234567u256,
+    const_b256: b256 = 0x0000000000000000000000000000000000000000000000000000000001234567,
+    ns1 {
+        ns2 {
+            c1: u64 = NS1_NS2_C1,
+        }
+    }
 }
 
 impl BasicStorage for Contract {
@@ -38,7 +49,7 @@ impl BasicStorage for Contract {
 
     #[storage(write)]
     fn intrinsic_store_word(key: b256, value: u64) {
-        __state_store_word(key, value);
+        let _ = __state_store_word(key, value);
     }
 
     #[storage(read)]
@@ -56,13 +67,13 @@ impl BasicStorage for Contract {
             i += 1;
         }
 
-        __state_load_quad(key, values.buf.ptr(), slots);
+        let _ = __state_load_quad(key, values.ptr(), slots);
         values
     }
 
     #[storage(write)]
     fn intrinsic_store_quad(key: b256, values: Vec<Quad>) {
-        __state_store_quad(key, values.buf.ptr(), values.len());
+        let _ = __state_store_quad(key, values.ptr(), values.len());
     }
 
     #[storage(read, write)]
@@ -91,6 +102,17 @@ pub struct T {
 pub enum E {
     A: u64,
     B: T,
+}
+
+pub enum F {
+    A: u8,
+    B: bool,
+    C: (),
+}
+
+pub enum G {
+    A: u8,
+    B: u64,
 }
 
 // These inputs are taken from the storage_access_contract test.
@@ -186,6 +208,61 @@ fn test_storage() {
     let e2_ = read::<E>(key, 0).unwrap();
     match (e2, e2_) {
         (E::A(i1), E::A(i2)) => {
+            assert(i1 == 777);
+            assert(i1 == i2);
+        }
+        _ => assert(false),
+    }
+
+    let f1: F = F::A(8);
+    write(key, 0, f1);
+    let f1_ = read::<F>(key, 0).unwrap();
+    match (f1, f1_) {
+        (F::A(i1), F::A(i2)) => {
+            assert(i1 == 8);
+            assert(i1 == i2);
+        }
+        _ => assert(false),
+    }
+
+    let f2: F = F::B(true);
+    write(key, 0, f2);
+    let f2_ = read::<F>(key, 0).unwrap();
+    match (f2, f2_) {
+        (F::B(i1), F::B(i2)) => {
+            assert(i1 == true);
+            assert(i1 == i2);
+        }
+        _ => assert(false),
+    }
+
+    let f3: F = F::C;
+    write(key, 0, f3);
+    let f3_ = read::<F>(key, 0).unwrap();
+    match (f3, f3_) {
+        (F::C, F::C) => {
+            assert(true);
+        }
+        _ => assert(false),
+    }
+
+    let g1: G = G::A(8);
+    write(key, 0, g1);
+    let g1_ = read::<G>(key, 0).unwrap();
+    match (g1, g1_) {
+        (G::A(i1), G::A(i2)) => {
+            assert(i1 == 8);
+            assert(i1 == i2);
+        }
+        _ => assert(false),
+    }
+
+    let g2: G = G::B(64);
+    write(key, 0, g2);
+    let g2_ = read::<G>(key, 0).unwrap();
+    match (g2, g2_) {
+        (G::B(i1), G::B(i2)) => {
+            assert(i1 == 64);
             assert(i1 == i2);
         }
         _ => assert(false),
@@ -203,11 +280,27 @@ fn test_storage() {
     assert_streq(storage.str8.read(), "aaaaaaaa");
     assert_streq(storage.str9.read(), "aaaaaaaaa");
     assert_streq(storage.str10.read(), "aaaaaaaaaa");
+
+    assert_eq(storage.c1.read(), C1);
+    storage.c1.write(2);
+    assert_eq(storage.c1.read(), 2);
+    
+    assert_eq(storage.const_u256.read(), 0x0000000000000000000000000000000000000000000000000000000001234567u256);
+    storage.const_u256.write(0x0000000000000000000000000000000000000000000000000000000012345678u256);
+    assert_eq(storage.const_u256.read(), 0x0000000000000000000000000000000000000000000000000000000012345678u256);
+
+    assert_eq(storage.const_b256.read(), 0x0000000000000000000000000000000000000000000000000000000001234567);
+    storage.const_b256.write(0x0000000000000000000000000000000000000000000000000000000012345678);
+    assert_eq(storage.const_b256.read(), 0x0000000000000000000000000000000000000000000000000000000012345678);
+
+    assert_eq(storage::ns1::ns2.c1.read(), NS1_NS2_C1);
+
+    assert_eq(storage.c1.slot(), C1KEY);
 }
 
 // If these comparisons are done inline just above then it blows out the register allocator due to
 // all the ASM blocks.
 #[inline(never)]
-fn assert_streq<S1, S2>(lhs: S1, rhs: S2) {
-    assert(sha256(lhs) == sha256(rhs));
+fn assert_streq<S1>(lhs: S1, rhs: str) {
+    assert(sha256_str_array(lhs) == sha256(rhs));
 }

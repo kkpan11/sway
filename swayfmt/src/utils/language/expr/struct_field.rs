@@ -1,13 +1,19 @@
 use crate::{
-    config::items::ItemBraceStyle,
-    formatter::{shape::LineStyle, *},
+    formatter::{
+        shape::{ExprKind, LineStyle},
+        *,
+    },
     utils::{
+        language::expr::should_write_multiline,
         map::byte_span::{ByteSpan, LeafSpans},
         CurlyBrace,
     },
 };
 use std::fmt::Write;
-use sway_ast::ExprStructField;
+use sway_ast::{
+    keywords::{ColonToken, Token},
+    ExprStructField,
+};
 use sway_types::{ast::Delimiter, Spanned};
 
 impl Format for ExprStructField {
@@ -16,10 +22,28 @@ impl Format for ExprStructField {
         formatted_code: &mut FormattedCode,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        write!(formatted_code, "{}", self.field_name.span().as_str())?;
-        if let Some((colon_token, expr)) = &self.expr_opt {
-            write!(formatted_code, "{} ", colon_token.span().as_str())?;
-            expr.format(formatted_code, formatter)?;
+        write!(formatted_code, "{}", self.field_name.as_str())?;
+        if let Some((_colon_token, expr)) = &self.expr_opt {
+            formatter.with_shape(
+                formatter
+                    .shape
+                    .with_code_line_from(LineStyle::Inline, ExprKind::Struct),
+                |formatter| -> Result<(), FormatterError> {
+                    let mut expr_str = FormattedCode::new();
+                    expr.format(&mut expr_str, formatter)?;
+
+                    let expr_str = if should_write_multiline(&expr_str, formatter) {
+                        let mut expr_str = FormattedCode::new();
+                        formatter.shape.code_line.update_expr_new_line(true);
+                        expr.format(&mut expr_str, formatter)?;
+                        expr_str
+                    } else {
+                        expr_str
+                    };
+                    write!(formatted_code, "{} {}", ColonToken::AS_STR, expr_str)?;
+                    Ok(())
+                },
+            )?;
         }
 
         Ok(())
@@ -31,19 +55,9 @@ impl CurlyBrace for ExprStructField {
         line: &mut String,
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
-        let brace_style = formatter.config.items.item_brace_style;
-        match brace_style {
-            ItemBraceStyle::AlwaysNextLine => {
-                // Add openning brace to the next line.
-                write!(line, "\n{}", Delimiter::Brace.as_open_char())?;
-                formatter.shape.block_indent(&formatter.config);
-            }
-            _ => {
-                // Add opening brace to the same line
-                write!(line, " {}", Delimiter::Brace.as_open_char())?;
-                formatter.shape.block_indent(&formatter.config);
-            }
-        }
+        // Add opening brace to the same line
+        write!(line, " {}", Delimiter::Brace.as_open_char())?;
+        formatter.indent();
 
         Ok(())
     }
@@ -53,13 +67,13 @@ impl CurlyBrace for ExprStructField {
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         // Unindent by one block
-        formatter.shape.block_unindent(&formatter.config);
+        formatter.unindent();
         match formatter.shape.code_line.line_style {
             LineStyle::Inline => write!(line, "{}", Delimiter::Brace.as_close_char())?,
             _ => write!(
                 line,
                 "{}{}",
-                formatter.shape.indent.to_string(&formatter.config)?,
+                formatter.indent_to_str()?,
                 Delimiter::Brace.as_close_char()
             )?,
         }

@@ -14,9 +14,10 @@ pub(crate) mod engine;
 pub mod id;
 pub(crate) mod interface_decl_id;
 pub(crate) mod mapping;
+pub(crate) mod parsed_engine;
+pub mod parsed_id;
 pub(crate) mod r#ref;
 pub(crate) mod replace_decls;
-pub(crate) mod template;
 
 use std::collections::BTreeMap;
 
@@ -25,10 +26,10 @@ pub use engine::*;
 pub(crate) use id::*;
 pub use interface_decl_id::*;
 pub(crate) use mapping::*;
+pub use parsed_engine::*;
 pub use r#ref::*;
 pub(crate) use replace_decls::*;
 use sway_types::Ident;
-pub(crate) use template::*;
 
 use crate::{
     language::ty::{TyTraitInterfaceItem, TyTraitItem},

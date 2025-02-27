@@ -1,98 +1,223 @@
-//! A wrapper around the `b256` type to help enhance type-safety.
+//! The `ContractId` type used for interacting with contracts on the fuel network.
 library;
 
-use ::convert::From;
+use ::convert::{From, Into, TryFrom};
+use ::hash::{Hash, Hasher};
+use ::bytes::Bytes;
+use ::option::Option::{self, *};
 
 /// The `ContractId` type, a struct wrapper around the inner `b256` value.
 pub struct ContractId {
-    value: b256,
+    /// The underlying raw `b256` data of the contract id.
+    bits: b256,
 }
 
+impl ContractId {
+    /// Returns the underlying raw `b256` data of the contract id.
+    ///
+    /// # Returns
+    ///
+    /// * [b256] - The raw data of the contract id.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// fn foo() -> {
+    ///     let my_contract = ContractId:zero();
+    ///     assert(my_contract.bits() == b256::zero());
+    /// }
+    /// ```
+    pub fn bits(self) -> b256 {
+        self.bits
+    }
+}
+
+#[cfg(experimental_partial_eq = false)]
 impl core::ops::Eq for ContractId {
     fn eq(self, other: Self) -> bool {
-        self.value == other.value
+        self.bits == other.bits
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::PartialEq for ContractId {
+    fn eq(self, other: Self) -> bool {
+        self.bits == other.bits
+    }
+}
+#[cfg(experimental_partial_eq = true)]
+impl core::ops::Eq for ContractId {}
+
+impl From<b256> for ContractId {
+    /// Casts raw `b256` data to a `ContractId`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits`: [b256] - The raw `b256` data to be casted.
+    ///
+    /// # Returns
+    ///
+    /// * [ContractId] - The newly created `ContractId` from the raw `b256`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// fn foo() {
+    ///    let contract_id = ContractId::from(b256::zero());
+    /// }
+    /// ```
+    fn from(bits: b256) -> Self {
+        Self { bits }
     }
 }
 
-/// Functions for casting between the `b256` and `ContractId` types.
-impl From<b256> for ContractId {
-    fn from(bits: b256) -> Self {
-        Self { value: bits }
+impl From<ContractId> for b256 {
+    /// Casts a `ContractId` to raw `b256` data.
+    ///
+    /// # Returns
+    ///
+    /// * [b256] - The underlying raw `b256` data of the `ContractId`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// fn foo() {
+    ///     let contract_id = ContractId::from(b256::zero());
+    ///     let b256_data: b256 = contract_id.into();
+    ///     assert(b256_data == b256::zero());
+    /// }
+    /// ```
+    fn from(id: ContractId) -> Self {
+        id.bits()
     }
+}
 
-    fn into(self) -> b256 {
-        self.value
+impl TryFrom<Bytes> for ContractId {
+    /// Casts raw `Bytes` data to an `ContractId`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes`: [Bytes] - The raw `Bytes` data to be casted.
+    ///
+    /// # Returns
+    ///
+    /// * [ContractId] - The newly created `ContractId` from the raw `Bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// use std::bytes::Bytes;
+    ///
+    /// fn foo(bytes: Bytes) {
+    ///    let result = ContractId::try_from(bytes);
+    ///    assert(result.is_some());
+    ///    let contract_id = result.unwrap();
+    /// }
+    /// ```
+    fn try_from(bytes: Bytes) -> Option<Self> {
+        if bytes.len() != 32 {
+            return None;
+        }
+
+        Some(Self {
+            bits: asm(ptr: bytes.ptr()) {
+                ptr: b256
+            },
+        })
+    }
+}
+
+impl Into<Bytes> for ContractId {
+    /// Casts an `ContractId` to raw `Bytes` data.
+    ///
+    /// # Returns
+    ///
+    /// * [Bytes] - The underlying raw `Bytes` data of the `ContractId`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// fn foo() {
+    ///     let contract_id = ContractId::zero();
+    ///     let bytes_data: Bytes = contract_id.into()
+    ///     assert(bytes_data.len() == 32);
+    /// }
+    /// ```
+    fn into(self) -> Bytes {
+        Bytes::from(self.bits())
+    }
+}
+
+impl Hash for ContractId {
+    fn hash(self, ref mut state: Hasher) {
+        let Self { bits } = self;
+        bits.hash(state);
     }
 }
 
 impl ContractId {
-    /// UNCONDITIONAL transfer of `amount` coins of type `asset_id` to
-    /// the ContractId.
+    /// Returns the ContractId of the currently executing contract.
     ///
-    /// > **_WARNING:_**
-    /// >
-    /// > This will transfer coins to a contract even with no way to retrieve them
-    /// > (i.e. no withdrawal functionality on receiving contract), possibly leading
-    /// > to the **_PERMANENT LOSS OF COINS_** if not used with care.
+    /// # Additional Information
     ///
-    /// ### Arguments
+    /// **_Note:_** If called in an external context, this will **not** return a ContractId.
+    /// If called externally, will actually return a pointer to the Transaction Id (Wrapped in the ContractId struct).
     ///
-    /// * `amount` - The amount of tokens to transfer.
-    /// * `asset_id` - The `AssetId` of the token to transfer.
+    /// # Returns
     ///
-    /// ### Reverts
+    /// * [ContractId] - The contract id of this contract.
     ///
-    /// * If `amount` is greater than the contract balance for `asset_id`.
-    /// * If `amount` is equal to zero.
-    ///
-    /// ### Examples
+    /// # Examples
     ///
     /// ```sway
-    /// use std::constants::{BASE_ASSET_ID, ZERO_B256};
+    /// use std::asset::mint;
     ///
-    /// // replace the zero ContractId with your desired ContractId
-    /// let contract_id = ContractId::from(ZERO_B256);
-    /// contract_id.transfer(500, BASE_ASSET_ID);
+    /// fn foo() {
+    ///     let this_contract = ContractId::this();
+    ///     mint(b256::zero(), 50);
+    ///     Address::zero().transfer(AssetId::default(this_contract), 50);
+    /// }
     /// ```
-    pub fn transfer(self, amount: u64, asset_id: AssetId) {
-        asm(r1: amount, r2: asset_id.value, r3: self.value) {
-            tr r3 r1 r2;
+    pub fn this() -> ContractId {
+        ContractId::from(asm() {
+            fp: b256
+        })
+    }
+
+    /// Returns the zero value for the `ContractId` type.
+    ///
+    /// # Returns
+    ///
+    /// * [ContractId] -> The zero value for the `ContractId` type.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// fn foo() {
+    ///     let zero_contract_id = ContractId::zero();
+    ///     assert(zero_contract_id == ContractId::from(b256::zero()));
+    /// }
+    /// ```
+    pub fn zero() -> Self {
+        Self {
+            bits: b256::zero(),
         }
     }
-}
 
-impl ContractId {
-    /// Mint `amount` coins of the current contract's `asset_id` and send them
-    /// UNCONDITIONALLY to the contract at `to`.
+    /// Returns whether a `ContractId` is set to zero.
     ///
-    /// > **_WARNING:_**
-    /// >
-    /// > This will transfer coins to a contract even with no way to retrieve them
-    /// > (i.e: no withdrawal functionality on the receiving contract), possibly leading to
-    /// > the **_PERMANENT LOSS OF COINS_** if not used with care.
+    /// # Returns
     ///
-    /// ### Arguments
+    /// * [bool] -> True if the `ContractId` is zero, otherwise false.
     ///
-    /// * `amount` - The amount of tokens to mint.
-    /// * `to` - The `ContractId` to which to send the tokens.
-    ///
-    /// ### Examples
+    /// # Examples
     ///
     /// ```sway
-    /// use std::constants::ZERO_B256;
-    ///
-    /// // replace the zero ContractId with your desired ContractId
-    /// let contract_id = ContractId::from(ZERO_B256);
-    /// contract_id.mint_to(500);
+    /// fn foo() {
+    ///     let zero_contract_id = ContractId::zero();
+    ///     assert(zero_contract_id.is_zero());
+    /// }
     /// ```
-    pub fn mint_to(self, amount: u64) {
-        asm(r1: amount) {
-            mint r1;
-        };
-        self.transfer(amount, Self::from(asm() { fp: b256 })); // Transfer the self contract token
+    pub fn is_zero(self) -> bool {
+        self.bits == b256::zero()
     }
 }
-
-/// The `AssetId` type is simply an alias for `ContractId` that represents the ID of a native asset
-/// which matches the ID of the contract that implements that asset.
-pub type AssetId = ContractId;

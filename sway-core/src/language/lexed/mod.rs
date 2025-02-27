@@ -2,13 +2,15 @@ mod program;
 
 use crate::language::ModName;
 pub use program::LexedProgram;
-use sway_ast::Module;
+use sway_ast::{attribute::Annotated, Module};
+
+use super::{HasModule, HasSubmodules};
 
 /// A module and its submodules in the form of a tree.
 #[derive(Debug, Clone)]
 pub struct LexedModule {
     /// The content of this module in the form of a [Module].
-    pub tree: Module,
+    pub tree: Annotated<Module>,
     /// Submodules introduced within this module using the `dep` syntax in order of declaration.
     pub submodules: Vec<(ModName, LexedSubmodule)>,
 }
@@ -19,4 +21,16 @@ pub struct LexedModule {
 #[derive(Debug, Clone)]
 pub struct LexedSubmodule {
     pub module: LexedModule,
+}
+
+impl HasModule<LexedModule> for LexedSubmodule {
+    fn module(&self) -> &LexedModule {
+        &self.module
+    }
+}
+
+impl HasSubmodules<LexedSubmodule> for LexedModule {
+    fn submodules(&self) -> &[(ModName, LexedSubmodule)] {
+        &self.submodules
+    }
 }

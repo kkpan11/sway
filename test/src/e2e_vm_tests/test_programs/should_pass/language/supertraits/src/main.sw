@@ -1,17 +1,16 @@
 script;
 
-/// Inheritence tree:
+/// Inheritance tree:
 ///      A 
 ///      |
 ///      |
-///      B     
+///      B
 ///     /|
 ///    / |
 ///   C  |
 ///    \ |
 ///     \|
 ///      D
-///
 
 trait A {
     fn f(self) -> u64;

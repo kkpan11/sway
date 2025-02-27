@@ -112,6 +112,8 @@ pub(crate) struct CodeLine {
     pub(crate) expr_kind: ExprKind,
     /// Used in determining `SameLineWhere` formatting.
     pub(crate) has_where_clause: bool,
+    /// Expression is too long to fit in a single line
+    pub(crate) expr_new_line: bool,
 }
 
 impl CodeLine {
@@ -121,6 +123,7 @@ impl CodeLine {
             line_style,
             expr_kind,
             has_where_clause: Default::default(),
+            expr_new_line: false,
         }
     }
     pub(crate) fn reset_width(&mut self) {
@@ -147,6 +150,10 @@ impl CodeLine {
     pub(crate) fn update_where_clause(&mut self, has_where_clause: bool) {
         self.has_where_clause = has_where_clause;
     }
+
+    pub(crate) fn update_expr_new_line(&mut self, expr_new_line: bool) {
+        self.expr_new_line = expr_new_line;
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -154,6 +161,12 @@ pub(crate) enum LineStyle {
     Normal,
     Inline,
     Multiline,
+}
+
+impl LineStyle {
+    pub fn is_multiline(&self) -> bool {
+        matches!(self, Self::Multiline)
+    }
 }
 
 impl Default for LineStyle {
@@ -300,10 +313,9 @@ impl Shape {
     }
     /// Create a new `Shape` with default `CodeLine`.
     pub(crate) fn with_default_code_line(self) -> Self {
-        Self {
-            code_line: CodeLine::default(),
-            ..self
-        }
+        let mut code_line = CodeLine::default();
+        code_line.update_expr_new_line(self.code_line.expr_new_line);
+        Self { code_line, ..self }
     }
 }
 
@@ -351,7 +363,7 @@ mod test {
         formatter.config.whitespace.tab_spaces = 24;
         let max_width = formatter.config.whitespace.max_width;
         formatter.shape.code_line.width = max_width;
-        formatter.shape.block_indent(&formatter.config);
+        formatter.indent();
 
         assert_eq!(max_width, formatter.shape.code_line.width);
         assert_eq!(24, formatter.shape.indent.block_indent);

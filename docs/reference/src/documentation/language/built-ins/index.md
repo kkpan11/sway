@@ -13,15 +13,19 @@ Sway has the following primitive types:
    2. `u16` (16-bit unsigned integer)
    3. `u32` (32-bit unsigned integer)
    4. `u64` (64-bit unsigned integer)
-   5. `hexadecimal`, `binary` & `base-10` syntax
+   5. `u256` (256-bit unsigned integer)
+   6. `hexadecimal`, `binary` & `base-10` syntax
 2. [Boolean](boolean.md)
    1. `bool` (true or false)
 3. [Strings](string.md)
+   1. `str` (string slice)
    1. `str[n]` (fixed-length string of size n)
 4. [Bytes](b256.md)
    1. `b256` (256 bits / 32 bytes, i.e. a hash)
+5. [Slices](slices.md)
 
 <!-- TODO: The following sentence does not belong here. We need to convey the default size, including word size, somewhere however not on this page -->
+
 The default numeric type is `u64`. The FuelVM's word size is 64 bits, and the cases where using a smaller numeric type to save space are minimal.
 
 All other types in Sway are built up of these primitive types, or references to these primitive types.

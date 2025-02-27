@@ -1,3 +1,5 @@
+use sway_types::SourceId;
+
 use crate::priv_prelude::*;
 
 #[derive(Clone, Debug, Serialize)]
@@ -17,6 +19,10 @@ impl Module {
             }
         })
     }
+
+    pub fn source_id(&self) -> Option<SourceId> {
+        self.kind.span().source_id().copied()
+    }
 }
 
 impl Spanned for Module {
@@ -27,7 +33,7 @@ impl Spanned for Module {
         } else {
             self.semicolon_token.span()
         };
-        Span::join(start, end)
+        Span::join(start, &end)
     }
 }
 

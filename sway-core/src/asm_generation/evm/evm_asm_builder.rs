@@ -2,9 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     asm_generation::{
-        asm_builder::{AsmBuilder, AsmBuilderResult},
-        from_ir::StateAccessType,
-        ProgramKind,
+        asm_builder::AsmBuilder, from_ir::StateAccessType, fuel::data_section::DataSection,
+        instruction_set::InstructionSet, FinalizedAsm, ProgramABI, ProgramKind,
     },
     asm_lang::Label,
     metadata::MetadataManager,
@@ -41,7 +40,6 @@ use etk_asm::{asm::Assembler, ops::*};
 /// The code that is compiled but not stored on the blockchain is thus the code needed
 /// to store the correct code on the blockchain but also any logic that is contained in
 /// a (potential) constructor of the contract.
-
 pub struct EvmAsmBuilder<'ir, 'eng> {
     #[allow(dead_code)]
     program_kind: ProgramKind,
@@ -95,7 +93,7 @@ pub struct EvmAsmBuilderResult {
 
 pub type EvmAbiResult = Vec<ethabi::operation::Operation>;
 
-impl<'ir, 'eng> AsmBuilder for EvmAsmBuilder<'ir, 'eng> {
+impl AsmBuilder for EvmAsmBuilder<'_, '_> {
     fn func_to_labels(&mut self, func: &Function) -> (Label, Label) {
         self.func_to_labels(func)
     }
@@ -108,28 +106,14 @@ impl<'ir, 'eng> AsmBuilder for EvmAsmBuilder<'ir, 'eng> {
         self.compile_function(handler, function)
     }
 
-    fn finalize(&self) -> AsmBuilderResult {
-        self.finalize()
-    }
-}
+    fn compile_configurable(&mut self, _config: &ConfigContent) {}
 
-#[allow(unused_variables)]
-#[allow(dead_code)]
-impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
-    pub fn new(program_kind: ProgramKind, context: &'ir Context<'eng>) -> Self {
-        Self {
-            program_kind,
-            sections: Vec::new(),
-            func_label_map: HashMap::new(),
-            block_label_map: HashMap::new(),
-            context,
-            md_mgr: MetadataManager::default(),
-            label_idx: 0,
-            cur_section: None,
-        }
-    }
-
-    pub fn finalize(&self) -> AsmBuilderResult {
+    fn finalize(
+        self,
+        _handler: &Handler,
+        _build_config: Option<&crate::BuildConfig>,
+        _fallback_fn: Option<Label>,
+    ) -> Result<FinalizedAsm, ErrorEmitted> {
         let mut global_ops = Vec::new();
         let mut global_abi = Vec::new();
 
@@ -156,11 +140,29 @@ impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
         ctor.ops.append(&mut global_ops);
         global_abi.append(&mut ctor.abi);
 
-        AsmBuilderResult::Evm(EvmAsmBuilderResult {
+        let final_program = EvmFinalProgram {
             ops: ctor.ops.clone(),
-            ops_runtime: ctor.ops,
             abi: global_abi,
-        })
+        };
+
+        Ok(final_program.finalize())
+    }
+}
+
+#[allow(unused_variables)]
+#[allow(dead_code)]
+impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
+    pub fn new(program_kind: ProgramKind, context: &'ir Context<'eng>) -> Self {
+        Self {
+            program_kind,
+            sections: Vec::new(),
+            func_label_map: HashMap::new(),
+            block_label_map: HashMap::new(),
+            context,
+            md_mgr: MetadataManager::default(),
+            label_idx: 0,
+            cur_section: None,
+        }
     }
 
     fn generate_constructor(
@@ -176,7 +178,7 @@ impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
         self.setup_free_memory_pointer(&mut s);
 
         if is_payable {
-            // Get the the amount of ETH transferred to the contract by the parent contract,
+            // Get the amount of ETH transferred to the contract by the parent contract,
             // or by a transaction and check for a non-payable contract. Revert if caller
             // sent ether.
             //
@@ -297,36 +299,36 @@ impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
         func_is_entry: bool,
     ) -> Result<(), ErrorEmitted> {
         if let Some(instruction) = instr_val.get_instruction(self.context) {
-            match instruction {
-                Instruction::AsmBlock(asm, args) => {
+            match &instruction.op {
+                InstOp::AsmBlock(asm, args) => {
                     self.compile_asm_block(handler, instr_val, asm, args)?
                 }
-                Instruction::BitCast(val, ty) => self.compile_bitcast(instr_val, val, ty),
-                Instruction::UnaryOp { op, arg } => self.compile_unary_op(instr_val, op, arg),
-                Instruction::BinaryOp { op, arg1, arg2 } => {
+                InstOp::BitCast(val, ty) => self.compile_bitcast(instr_val, val, ty),
+                InstOp::UnaryOp { op, arg } => self.compile_unary_op(instr_val, op, arg),
+                InstOp::BinaryOp { op, arg1, arg2 } => {
                     self.compile_binary_op(instr_val, op, arg1, arg2)
                 }
-                Instruction::Branch(to_block) => self.compile_branch(to_block),
-                Instruction::Call(func, args) => self.compile_call(instr_val, func, args),
-                Instruction::CastPtr(val, ty) => self.compile_cast_ptr(instr_val, val, ty),
-                Instruction::Cmp(pred, lhs_value, rhs_value) => {
+                InstOp::Branch(to_block) => self.compile_branch(to_block),
+                InstOp::Call(func, args) => self.compile_call(instr_val, func, args),
+                InstOp::CastPtr(val, ty) => self.compile_cast_ptr(instr_val, val, ty),
+                InstOp::Cmp(pred, lhs_value, rhs_value) => {
                     self.compile_cmp(instr_val, pred, lhs_value, rhs_value)
                 }
-                Instruction::ConditionalBranch {
+                InstOp::ConditionalBranch {
                     cond_value,
                     true_block,
                     false_block,
                 } => {
                     self.compile_conditional_branch(handler, cond_value, true_block, false_block)?
                 }
-                Instruction::ContractCall {
+                InstOp::ContractCall {
                     params,
                     coins,
                     asset_id,
                     gas,
                     ..
                 } => self.compile_contract_call(instr_val, params, coins, asset_id, gas),
-                Instruction::FuelVm(fuel_vm_instr) => {
+                InstOp::FuelVm(fuel_vm_instr) => {
                     handler.emit_err(CompileError::Internal(
                         "Invalid FuelVM IR instruction provided to the EVM code gen.",
                         self.md_mgr
@@ -334,35 +336,36 @@ impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
                             .unwrap_or_else(Self::empty_span),
                     ));
                 }
-                Instruction::GetElemPtr {
+                InstOp::GetElemPtr {
                     base,
                     elem_ptr_ty,
                     indices,
                 } => self.compile_get_elem_ptr(instr_val, base, elem_ptr_ty, indices),
-                Instruction::GetLocal(local_var) => self.compile_get_local(instr_val, local_var),
-                Instruction::IntToPtr(val, _) => self.compile_int_to_ptr(instr_val, val),
-                Instruction::Load(src_val) => self.compile_load(handler, instr_val, src_val)?,
-                Instruction::MemCopyBytes {
+                InstOp::GetLocal(local_var) => self.compile_get_local(instr_val, local_var),
+                InstOp::GetConfig(_, name) => self.compile_get_config(instr_val, name),
+                InstOp::IntToPtr(val, _) => self.compile_int_to_ptr(instr_val, val),
+                InstOp::Load(src_val) => self.compile_load(handler, instr_val, src_val)?,
+                InstOp::MemCopyBytes {
                     dst_val_ptr,
                     src_val_ptr,
                     byte_len,
                 } => self.compile_mem_copy_bytes(instr_val, dst_val_ptr, src_val_ptr, *byte_len),
-                Instruction::MemCopyVal {
+                InstOp::MemCopyVal {
                     dst_val_ptr,
                     src_val_ptr,
                 } => self.compile_mem_copy_val(instr_val, dst_val_ptr, src_val_ptr),
-                Instruction::Nop => (),
-                Instruction::PtrToInt(ptr_val, int_ty) => {
+                InstOp::Nop => (),
+                InstOp::PtrToInt(ptr_val, int_ty) => {
                     self.compile_ptr_to_int(instr_val, ptr_val, int_ty)
                 }
-                Instruction::Ret(ret_val, ty) => {
+                InstOp::Ret(ret_val, ty) => {
                     if func_is_entry {
                         self.compile_ret_from_entry(instr_val, ret_val, ty)
                     } else {
                         self.compile_ret_from_call(instr_val, ret_val)
                     }
                 }
-                Instruction::Store {
+                InstOp::Store {
                     dst_val_ptr: dst_val,
                     stored_val,
                 } => self.compile_store(handler, instr_val, dst_val, stored_val)?,
@@ -469,6 +472,10 @@ impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
     }
 
     fn compile_get_local(&mut self, instr_val: &Value, local_var: &LocalVar) {
+        todo!();
+    }
+
+    fn compile_get_config(&mut self, instr_val: &Value, name: &str) {
         todo!();
     }
 
@@ -706,5 +713,24 @@ impl<'ir, 'eng> EvmAsmBuilder<'ir, 'eng> {
             self.block_label_map.insert(*block, label);
             label
         })
+    }
+}
+
+struct EvmFinalProgram {
+    ops: Vec<etk_asm::ops::AbstractOp>,
+    abi: Vec<ethabi::operation::Operation>,
+}
+
+impl EvmFinalProgram {
+    fn finalize(self) -> FinalizedAsm {
+        FinalizedAsm {
+            data_section: DataSection {
+                ..Default::default()
+            },
+            program_section: InstructionSet::Evm { ops: self.ops },
+            program_kind: ProgramKind::Script,
+            entries: vec![],
+            abi: Some(ProgramABI::Evm(self.abi)),
+        }
     }
 }

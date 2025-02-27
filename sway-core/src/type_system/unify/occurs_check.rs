@@ -1,4 +1,5 @@
-use crate::{engine_threading::*, type_system::priv_prelude::*};
+#![allow(clippy::mutable_key_type)]
+use crate::{engine_threading::Engines, type_system::priv_prelude::*};
 
 /// Helper struct to perform the occurs check.
 ///
@@ -30,8 +31,12 @@ impl<'a> OccursCheck<'a> {
     /// NOTE: This implementation assumes that `other` =/ `generic`, in which
     /// case the occurs check would return `false`, as this is a valid
     /// unification.
-    pub(super) fn check(&self, generic: TypeInfo, other: &TypeInfo) -> bool {
+    pub(super) fn check(&self, generic: TypeId, other: TypeId) -> bool {
         let other_generics = other.extract_nested_generics(self.engines);
-        other_generics.contains(&self.engines.help_out(generic))
+        other_generics.contains(
+            &self
+                .engines
+                .help_out((*self.engines.te().get(generic)).clone()),
+        )
     }
 }

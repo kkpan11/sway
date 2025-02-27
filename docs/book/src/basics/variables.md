@@ -32,6 +32,18 @@ foo = 6;
 
 Now, `foo` is mutable, and the reassignment to the number `6` is valid. That is, we are allowed to _mutate_ the variable `foo` to change its value.
 
+When assigning to a mutable variable, the right-hand side of the assignment is evaluated before the left-hand side. In the below example, the mutable variable `i` will first be increased and the resulting value of `1` will be stored to `array[1]`, thus resulting in `array` being changed to `[0, 1, 0]`.
+
+```sway
+let mut array = [0, 0, 0];
+let mut i = 0;
+
+array[i] = {
+    i += 1;
+    i
+};
+```
+
 ## Type Annotations
 
 <!-- This section should explain type annotations -->
@@ -48,7 +60,7 @@ let foo: u32 = 5;
 We have just declared the _type_ of the variable `foo` as a `u32`, which is an unsigned 32-bit integer. Let's take a look at a few other type annotations:
 
 ```sway
-let bar: str[4] = "sway";
+let bar: str[4] = __to_str_array("sway");
 let baz: bool = true;
 ```
 

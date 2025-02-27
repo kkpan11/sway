@@ -1,13 +1,17 @@
-use crate::{engine_threading::*, language::parsed, transform, type_system::*};
+use super::{TyDeclParsedType, TyTraitInterfaceItem, TyTraitItem};
+use crate::{
+    engine_threading::*,
+    language::parsed::{self, AbiDeclaration},
+    transform,
+    type_system::*,
+};
+use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
-
 use sway_types::{Ident, Named, Span, Spanned};
-
-use super::{TyTraitInterfaceItem, TyTraitItem};
 
 /// A [TyAbiDecl] contains the type-checked version of the parse tree's
 /// `AbiDeclaration`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TyAbiDecl {
     /// The name of the abi trait (also known as a "contract trait")
     pub name: Ident,
@@ -19,9 +23,13 @@ pub struct TyAbiDecl {
     pub attributes: transform::AttributesMap,
 }
 
+impl TyDeclParsedType for TyAbiDecl {
+    type ParsedType = AbiDeclaration;
+}
+
 impl EqWithEngines for TyAbiDecl {}
 impl PartialEqWithEngines for TyAbiDecl {
-    fn eq(&self, other: &Self, engines: &Engines) -> bool {
+    fn eq(&self, other: &Self, ctx: &PartialEqWithEnginesContext) -> bool {
         let TyAbiDecl {
             name: ln,
             interface_surface: lis,
@@ -42,7 +50,7 @@ impl PartialEqWithEngines for TyAbiDecl {
             attributes: _,
             span: _,
         } = other;
-        ln == rn && lis.eq(ris, engines) && li.eq(ri, engines) && ls.eq(rs, engines)
+        ln == rn && lis.eq(ris, ctx) && li.eq(ri, ctx) && ls.eq(rs, ctx)
     }
 }
 
@@ -67,12 +75,9 @@ impl HashWithEngines for TyAbiDecl {
 
 impl CreateTypeId for TyAbiDecl {
     fn create_type_id(&self, engines: &Engines) -> TypeId {
-        let type_engine = engines.te();
-        let ty = TypeInfo::ContractCaller {
-            abi_name: AbiName::Known(self.name.clone().into()),
-            address: None,
-        };
-        type_engine.insert(engines, ty)
+        engines
+            .te()
+            .new_contract_caller(engines, AbiName::Known(self.name.clone().into()), None)
     }
 }
 

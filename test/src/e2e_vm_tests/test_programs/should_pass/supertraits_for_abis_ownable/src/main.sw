@@ -1,10 +1,10 @@
 contract;
 
 mod ownable;
-use ownable::{Ownable, StorageHelpers};
+use ownable::*;
 
 storage {
-    owner: b256 = std::constants::ZERO_B256,
+    owner: b256 = b256::zero(),
     data: u64 = 0,
 }
 

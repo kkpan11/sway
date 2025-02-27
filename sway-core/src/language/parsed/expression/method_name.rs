@@ -1,6 +1,7 @@
+use crate::engine_threading::{EqWithEngines, PartialEqWithEngines, PartialEqWithEnginesContext};
 use crate::language::CallPath;
 use crate::type_system::TypeBinding;
-use crate::{Ident, TypeArgument, TypeInfo};
+use crate::{Ident, TypeArgument, TypeId, TypeInfo};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -24,9 +25,52 @@ pub enum MethodName {
     /// like <S as Trait>::method()
     FromQualifiedPathRoot {
         ty: TypeArgument,
-        as_trait: TypeInfo,
+        as_trait: TypeId,
         method_name: Ident,
     },
+}
+
+impl EqWithEngines for MethodName {}
+impl PartialEqWithEngines for MethodName {
+    fn eq(&self, other: &Self, ctx: &PartialEqWithEnginesContext) -> bool {
+        match (self, other) {
+            (
+                MethodName::FromType {
+                    call_path_binding,
+                    method_name,
+                },
+                MethodName::FromType {
+                    call_path_binding: r_call_path_binding,
+                    method_name: r_method_name,
+                },
+            ) => call_path_binding.eq(r_call_path_binding, ctx) && method_name == r_method_name,
+            (
+                MethodName::FromModule { method_name },
+                MethodName::FromModule {
+                    method_name: r_method_name,
+                },
+            ) => method_name == r_method_name,
+            (
+                MethodName::FromTrait { call_path },
+                MethodName::FromTrait {
+                    call_path: r_call_path,
+                },
+            ) => call_path == r_call_path,
+            (
+                MethodName::FromQualifiedPathRoot {
+                    ty,
+                    as_trait,
+                    method_name,
+                },
+                MethodName::FromQualifiedPathRoot {
+                    ty: r_ty,
+                    as_trait: r_as_trait,
+                    method_name: r_method_name,
+                },
+            ) => ty.eq(r_ty, ctx) && as_trait.eq(r_as_trait) && method_name == r_method_name,
+            _ => false,
+        }
+    }
 }
 
 impl MethodName {

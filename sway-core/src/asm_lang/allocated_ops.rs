@@ -17,7 +17,10 @@ use crate::{
     },
     fuel_prelude::fuel_asm::{self, op},
 };
-use either::Either;
+use fuel_vm::fuel_asm::{
+    op::{ADD, ADDI, MOVI},
+    Imm12, Imm18,
+};
 use std::fmt::{self, Write};
 use sway_types::span::Span;
 
@@ -43,11 +46,15 @@ impl fmt::Display for AllocatedRegister {
 }
 
 impl AllocatedRegister {
-    fn to_reg_id(&self) -> fuel_asm::RegId {
+    pub(crate) fn to_reg_id(&self) -> fuel_asm::RegId {
         match self {
             AllocatedRegister::Allocated(a) => fuel_asm::RegId::new(a + 16),
             AllocatedRegister::Constant(constant) => constant.to_reg_id(),
         }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        matches!(self, Self::Constant(ConstantRegister::Zero))
     }
 }
 
@@ -109,6 +116,12 @@ pub(crate) enum AllocatedOpcode {
         AllocatedRegister,
         VirtualImmediate06,
     ),
+    WQMD(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+    ),
     WQCM(
         AllocatedRegister,
         AllocatedRegister,
@@ -121,8 +134,14 @@ pub(crate) enum AllocatedOpcode {
         AllocatedRegister,
         AllocatedRegister,
     ),
+    WQMM(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+    ),
 
-    /* Conrol Flow Instructions */
+    /* Control Flow Instructions */
     JMP(AllocatedRegister),
     JI(VirtualImmediate24),
     JNE(AllocatedRegister, AllocatedRegister, AllocatedRegister),
@@ -138,6 +157,8 @@ pub(crate) enum AllocatedOpcode {
     ALOC(AllocatedRegister),
     CFEI(VirtualImmediate24),
     CFSI(VirtualImmediate24),
+    CFE(AllocatedRegister),
+    CFS(AllocatedRegister),
     LB(AllocatedRegister, AllocatedRegister, VirtualImmediate12),
     LW(AllocatedRegister, AllocatedRegister, VirtualImmediate12),
     MCL(AllocatedRegister, AllocatedRegister),
@@ -150,6 +171,10 @@ pub(crate) enum AllocatedOpcode {
         AllocatedRegister,
         AllocatedRegister,
     ),
+    PSHH(VirtualImmediate24),
+    PSHL(VirtualImmediate24),
+    POPH(VirtualImmediate24),
+    POPL(VirtualImmediate24),
     SB(AllocatedRegister, AllocatedRegister, VirtualImmediate12),
     SW(AllocatedRegister, AllocatedRegister, VirtualImmediate12),
 
@@ -157,7 +182,7 @@ pub(crate) enum AllocatedOpcode {
     BAL(AllocatedRegister, AllocatedRegister, AllocatedRegister),
     BHEI(AllocatedRegister),
     BHSH(AllocatedRegister, AllocatedRegister),
-    BURN(AllocatedRegister),
+    BURN(AllocatedRegister, AllocatedRegister),
     CALL(
         AllocatedRegister,
         AllocatedRegister,
@@ -173,7 +198,19 @@ pub(crate) enum AllocatedOpcode {
     ),
     CROO(AllocatedRegister, AllocatedRegister),
     CSIZ(AllocatedRegister, AllocatedRegister),
-    LDC(AllocatedRegister, AllocatedRegister, AllocatedRegister),
+    BSIZ(AllocatedRegister, AllocatedRegister),
+    LDC(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        VirtualImmediate06,
+    ),
+    BLDD(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+    ),
     LOG(
         AllocatedRegister,
         AllocatedRegister,
@@ -186,7 +223,7 @@ pub(crate) enum AllocatedOpcode {
         AllocatedRegister,
         AllocatedRegister,
     ),
-    MINT(AllocatedRegister),
+    MINT(AllocatedRegister, AllocatedRegister),
     RETD(AllocatedRegister, AllocatedRegister),
     RVRT(AllocatedRegister),
     SMO(
@@ -220,24 +257,51 @@ pub(crate) enum AllocatedOpcode {
     ),
 
     /* Cryptographic Instructions */
-    ECR(AllocatedRegister, AllocatedRegister, AllocatedRegister),
+    ECK1(AllocatedRegister, AllocatedRegister, AllocatedRegister),
+    ECR1(AllocatedRegister, AllocatedRegister, AllocatedRegister),
+    ED19(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+    ),
     K256(AllocatedRegister, AllocatedRegister, AllocatedRegister),
     S256(AllocatedRegister, AllocatedRegister, AllocatedRegister),
+    ECOP(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+    ),
+    EPAR(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+    ),
 
     /* Other Instructions */
+    ECAL(
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+        AllocatedRegister,
+    ),
     FLAG(AllocatedRegister),
     GM(AllocatedRegister, VirtualImmediate18),
     GTF(AllocatedRegister, AllocatedRegister, VirtualImmediate12),
 
     /* Non-VM Instructions */
     BLOB(VirtualImmediate24),
+    ConfigurablesOffsetPlaceholder,
     DataSectionOffsetPlaceholder,
-    DataSectionRegisterLoadPlaceholder,
-    LWDataId(AllocatedRegister, DataId),
+    LoadDataId(AllocatedRegister, DataId),
+    AddrDataId(AllocatedRegister, DataId),
     Undefined,
 }
 
 impl AllocatedOpcode {
+    /// Returns a list of all registers *written* by instruction `self`.
     pub(crate) fn def_registers(&self) -> BTreeSet<&AllocatedRegister> {
         use AllocatedOpcode::*;
         (match self {
@@ -276,8 +340,10 @@ impl AllocatedOpcode {
             WQOP(_, _, _, _) => vec![],
             WQML(_, _, _, _) => vec![],
             WQDV(_, _, _, _) => vec![],
+            WQMD(_, _, _, _) => vec![],
             WQCM(r1, _, _, _) => vec![r1],
             WQAM(_, _, _, _) => vec![],
+            WQMM(_, _, _, _) => vec![],
 
             /* Control Flow Instructions */
             JMP(_r1) => vec![],
@@ -295,6 +361,8 @@ impl AllocatedOpcode {
             ALOC(_r1) => vec![],
             CFEI(_imm) => vec![],
             CFSI(_imm) => vec![],
+            CFE(_r1) => vec![],
+            CFS(_r1) => vec![],
             LB(r1, _r2, _i) => vec![r1],
             LW(r1, _r2, _i) => vec![r1],
             MCL(_r1, _r2) => vec![],
@@ -302,6 +370,9 @@ impl AllocatedOpcode {
             MCP(_r1, _r2, _r3) => vec![],
             MCPI(_r1, _r2, _imm) => vec![],
             MEQ(r1, _r2, _r3, _r4) => vec![r1],
+            PSHH(_mask) | PSHL(_mask) | POPH(_mask) | POPL(_mask) => {
+                panic!("Cannot determine defined registers for register PUSH/POP instructions")
+            }
             SB(_r1, _r2, _i) => vec![],
             SW(_r1, _r2, _i) => vec![],
 
@@ -309,16 +380,18 @@ impl AllocatedOpcode {
             BAL(r1, _r2, _r3) => vec![r1],
             BHEI(r1) => vec![r1],
             BHSH(_r1, _r2) => vec![],
-            BURN(_r1) => vec![],
+            BURN(_r1, _r2) => vec![],
             CALL(_r1, _r2, _r3, _r4) => vec![],
             CB(_r1) => vec![],
             CCP(_r1, _r2, _r3, _r4) => vec![],
             CROO(_r1, _r2) => vec![],
             CSIZ(r1, _r2) => vec![r1],
-            LDC(_r1, _r2, _r3) => vec![],
+            BSIZ(r1, _r2) => vec![r1],
+            LDC(_r1, _r2, _r3, _i0) => vec![],
+            BLDD(_r1, _r2, _r3, _r4) => vec![],
             LOG(_r1, _r2, _r3, _r4) => vec![],
             LOGD(_r1, _r2, _r3, _r4) => vec![],
-            MINT(_r1) => vec![],
+            MINT(_r1, _r2) => vec![],
             RETD(_r1, _r2) => vec![],
             RVRT(_r1) => vec![],
             SMO(_r1, _r2, _r3, _r4) => vec![],
@@ -332,22 +405,26 @@ impl AllocatedOpcode {
             TRO(_r1, _r2, _r3, _r4) => vec![],
 
             /* Cryptographic Instructions */
-            ECR(_r1, _r2, _r3) => vec![],
+            ECK1(_r1, _r2, _r3) => vec![],
+            ECR1(_r1, _r2, _r3) => vec![],
+            ED19(_r1, _r2, _r3, _r4) => vec![],
             K256(_r1, _r2, _r3) => vec![],
             S256(_r1, _r2, _r3) => vec![],
+            ECOP(_r1, _r2, _r3, _r4) => vec![],
+            EPAR(r1, _r2, _r3, _r4) => vec![r1],
 
             /* Other Instructions */
+            ECAL(_r1, _r2, _r3, _r4) => vec![],
             FLAG(_r1) => vec![],
             GM(r1, _imm) => vec![r1],
             GTF(r1, _r2, _i) => vec![r1],
 
             /* Non-VM Instructions */
             BLOB(_imm) => vec![],
+            ConfigurablesOffsetPlaceholder => vec![],
             DataSectionOffsetPlaceholder => vec![],
-            DataSectionRegisterLoadPlaceholder => vec![&AllocatedRegister::Constant(
-                ConstantRegister::DataSectionStart,
-            )],
-            LWDataId(r1, _i) => vec![r1],
+            LoadDataId(r1, _i) => vec![r1],
+            AddrDataId(r1, _i) => vec![r1],
             Undefined => vec![],
         })
         .into_iter()
@@ -394,8 +471,10 @@ impl fmt::Display for AllocatedOpcode {
             WQOP(a, b, c, d) => write!(fmtr, "wqop {a} {b} {c} {d}"),
             WQML(a, b, c, d) => write!(fmtr, "wqml {a} {b} {c} {d}"),
             WQDV(a, b, c, d) => write!(fmtr, "wqdv {a} {b} {c} {d}"),
+            WQMD(a, b, c, d) => write!(fmtr, "wqmd {a} {b} {c} {d}"),
             WQCM(a, b, c, d) => write!(fmtr, "wqcm {a} {b} {c} {d}"),
             WQAM(a, b, c, d) => write!(fmtr, "wqam {a} {b} {c} {d}"),
+            WQMM(a, b, c, d) => write!(fmtr, "wqmm {a} {b} {c} {d}"),
 
             /* Control Flow Instructions */
             JMP(a) => write!(fmtr, "jmp {a}"),
@@ -413,6 +492,8 @@ impl fmt::Display for AllocatedOpcode {
             ALOC(a) => write!(fmtr, "aloc {a}"),
             CFEI(a) => write!(fmtr, "cfei {a}"),
             CFSI(a) => write!(fmtr, "cfsi {a}"),
+            CFE(a) => write!(fmtr, "cfe {a}"),
+            CFS(a) => write!(fmtr, "cfs {a}"),
             LB(a, b, c) => write!(fmtr, "lb   {a} {b} {c}"),
             LW(a, b, c) => write!(fmtr, "lw   {a} {b} {c}"),
             MCL(a, b) => write!(fmtr, "mcl  {a} {b}"),
@@ -420,6 +501,10 @@ impl fmt::Display for AllocatedOpcode {
             MCP(a, b, c) => write!(fmtr, "mcp  {a} {b} {c}"),
             MCPI(a, b, c) => write!(fmtr, "mcpi {a} {b} {c}"),
             MEQ(a, b, c, d) => write!(fmtr, "meq  {a} {b} {c} {d}"),
+            PSHH(mask) => write!(fmtr, "pshh {mask}"),
+            PSHL(mask) => write!(fmtr, "pshl {mask}"),
+            POPH(mask) => write!(fmtr, "poph {mask}"),
+            POPL(mask) => write!(fmtr, "popl {mask}"),
             SB(a, b, c) => write!(fmtr, "sb   {a} {b} {c}"),
             SW(a, b, c) => write!(fmtr, "sw   {a} {b} {c}"),
 
@@ -427,16 +512,18 @@ impl fmt::Display for AllocatedOpcode {
             BAL(a, b, c) => write!(fmtr, "bal  {a} {b} {c}"),
             BHEI(a) => write!(fmtr, "bhei {a}"),
             BHSH(a, b) => write!(fmtr, "bhsh {a} {b}"),
-            BURN(a) => write!(fmtr, "burn {a}"),
+            BURN(a, b) => write!(fmtr, "burn {a} {b}"),
             CALL(a, b, c, d) => write!(fmtr, "call {a} {b} {c} {d}"),
             CB(a) => write!(fmtr, "cb   {a}"),
             CCP(a, b, c, d) => write!(fmtr, "ccp  {a} {b} {c} {d}"),
             CROO(a, b) => write!(fmtr, "croo {a} {b}"),
             CSIZ(a, b) => write!(fmtr, "csiz {a} {b}"),
-            LDC(a, b, c) => write!(fmtr, "ldc  {a} {b} {c}"),
+            BSIZ(a, b) => write!(fmtr, "bsiz {a} {b}"),
+            LDC(a, b, c, d) => write!(fmtr, "ldc  {a} {b} {c} {d}"),
+            BLDD(a, b, c, d) => write!(fmtr, "bldd {a} {b} {c} {d}"),
             LOG(a, b, c, d) => write!(fmtr, "log  {a} {b} {c} {d}"),
             LOGD(a, b, c, d) => write!(fmtr, "logd {a} {b} {c} {d}"),
-            MINT(a) => write!(fmtr, "mint {a}"),
+            MINT(a, b) => write!(fmtr, "mint {a} {b}"),
             RETD(a, b) => write!(fmtr, "retd  {a} {b}"),
             RVRT(a) => write!(fmtr, "rvrt {a}"),
             SMO(a, b, c, d) => write!(fmtr, "smo  {a} {b} {c} {d}"),
@@ -450,25 +537,34 @@ impl fmt::Display for AllocatedOpcode {
             TRO(a, b, c, d) => write!(fmtr, "tro  {a} {b} {c} {d}"),
 
             /* Cryptographic Instructions */
-            ECR(a, b, c) => write!(fmtr, "ecr  {a} {b} {c}"),
+            ECK1(a, b, c) => write!(fmtr, "eck1  {a} {b} {c}"),
+            ECR1(a, b, c) => write!(fmtr, "ecr1  {a} {b} {c}"),
+            ED19(a, b, c, d) => write!(fmtr, "ed19  {a} {b} {c} {d}"),
             K256(a, b, c) => write!(fmtr, "k256 {a} {b} {c}"),
             S256(a, b, c) => write!(fmtr, "s256 {a} {b} {c}"),
+            ECOP(a, b, c, d) => write!(fmtr, "ecop {a} {b} {c} {d}"),
+            EPAR(a, b, c, d) => write!(fmtr, "epar {a} {b} {c} {d}"),
 
             /* Other Instructions */
+            ECAL(a, b, c, d) => write!(fmtr, "ecal {a} {b} {c} {d}"),
             FLAG(a) => write!(fmtr, "flag {a}"),
             GM(a, b) => write!(fmtr, "gm   {a} {b}"),
             GTF(a, b, c) => write!(fmtr, "gtf  {a} {b} {c}"),
 
             /* Non-VM Instructions */
             BLOB(a) => write!(fmtr, "blob {a}"),
+            ConfigurablesOffsetPlaceholder => write!(
+                fmtr,
+                "CONFIGURABLES_OFFSET[0..32]\nCONFIGURABLES_OFFSET[32..64]"
+            ),
             DataSectionOffsetPlaceholder => {
                 write!(
                     fmtr,
                     "DATA_SECTION_OFFSET[0..32]\nDATA_SECTION_OFFSET[32..64]"
                 )
             }
-            DataSectionRegisterLoadPlaceholder => write!(fmtr, "lw   $ds $is 1"),
-            LWDataId(a, b) => write!(fmtr, "lw   {a} {b}"),
+            LoadDataId(a, b) => write!(fmtr, "load {a} {b}"),
+            AddrDataId(a, b) => write!(fmtr, "addr {a} {b}"),
             Undefined => write!(fmtr, "undefined op"),
         }
     }
@@ -498,97 +594,132 @@ impl fmt::Display for AllocatedOp {
     }
 }
 
-type DoubleWideData = [u8; 8];
+pub(crate) enum FuelAsmData {
+    ConfigurablesOffset([u8; 8]),
+    DatasectionOffset([u8; 8]),
+    Instructions(Vec<fuel_asm::Instruction>),
+}
 
 impl AllocatedOp {
     pub(crate) fn to_fuel_asm(
         &self,
         offset_to_data_section: u64,
-        data_section: &mut DataSection,
-    ) -> Either<Vec<fuel_asm::Instruction>, DoubleWideData> {
+        offset_from_instr_start: u64,
+        data_section: &DataSection,
+    ) -> FuelAsmData {
         use AllocatedOpcode::*;
-        Either::Left(vec![match &self.opcode {
+        FuelAsmData::Instructions(vec![match &self.opcode {
             /* Arithmetic/Logic (ALU) Instructions */
             ADD(a, b, c) => op::ADD::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            ADDI(a, b, c) => op::ADDI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            ADDI(a, b, c) => op::ADDI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             AND(a, b, c) => op::AND::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            ANDI(a, b, c) => op::ANDI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            ANDI(a, b, c) => op::ANDI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             DIV(a, b, c) => op::DIV::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            DIVI(a, b, c) => op::DIVI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            DIVI(a, b, c) => op::DIVI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             EQ(a, b, c) => op::EQ::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
             EXP(a, b, c) => op::EXP::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            EXPI(a, b, c) => op::EXPI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            EXPI(a, b, c) => op::EXPI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             GT(a, b, c) => op::GT::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
             LT(a, b, c) => op::LT::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
             MLOG(a, b, c) => op::MLOG::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
             MOD(a, b, c) => op::MOD::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            MODI(a, b, c) => op::MODI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            MODI(a, b, c) => op::MODI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             MOVE(a, b) => op::MOVE::new(a.to_reg_id(), b.to_reg_id()).into(),
-            MOVI(a, b) => op::MOVI::new(a.to_reg_id(), b.value.into()).into(),
+            MOVI(a, b) => op::MOVI::new(a.to_reg_id(), b.value().into()).into(),
             MROO(a, b, c) => op::MROO::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
             MUL(a, b, c) => op::MUL::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            MULI(a, b, c) => op::MULI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            MULI(a, b, c) => op::MULI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             NOOP => op::NOOP::new().into(),
             NOT(a, b) => op::NOT::new(a.to_reg_id(), b.to_reg_id()).into(),
             OR(a, b, c) => op::OR::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            ORI(a, b, c) => op::ORI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            ORI(a, b, c) => op::ORI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             SLL(a, b, c) => op::SLL::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            SLLI(a, b, c) => op::SLLI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            SLLI(a, b, c) => op::SLLI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             SRL(a, b, c) => op::SRL::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            SRLI(a, b, c) => op::SRLI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            SRLI(a, b, c) => op::SRLI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             SUB(a, b, c) => op::SUB::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            SUBI(a, b, c) => op::SUBI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            SUBI(a, b, c) => op::SUBI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             XOR(a, b, c) => op::XOR::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            XORI(a, b, c) => op::XORI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
-            WQOP(a, b, c, d) => {
-                op::WQOP::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.value.into()).into()
+            XORI(a, b, c) => op::XORI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
+            WQOP(a, b, c, d) => op::WQOP::new(
+                a.to_reg_id(),
+                b.to_reg_id(),
+                c.to_reg_id(),
+                d.value().into(),
+            )
+            .into(),
+            WQML(a, b, c, d) => op::WQML::new(
+                a.to_reg_id(),
+                b.to_reg_id(),
+                c.to_reg_id(),
+                d.value().into(),
+            )
+            .into(),
+            WQDV(a, b, c, d) => op::WQDV::new(
+                a.to_reg_id(),
+                b.to_reg_id(),
+                c.to_reg_id(),
+                d.value().into(),
+            )
+            .into(),
+            WQMD(a, b, c, d) => {
+                op::WQMD::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
             }
-            WQML(a, b, c, d) => {
-                op::WQML::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.value.into()).into()
-            }
-            WQDV(a, b, c, d) => {
-                op::WQDV::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.value.into()).into()
-            }
-            WQCM(a, b, c, d) => {
-                op::WQCM::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.value.into()).into()
-            }
+            WQCM(a, b, c, d) => op::WQCM::new(
+                a.to_reg_id(),
+                b.to_reg_id(),
+                c.to_reg_id(),
+                d.value().into(),
+            )
+            .into(),
             WQAM(a, b, c, d) => {
                 op::WQAM::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
+            }
+            WQMM(a, b, c, d) => {
+                op::WQMM::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
             }
 
             /* Control Flow Instructions */
             JMP(a) => op::JMP::new(a.to_reg_id()).into(),
-            JI(a) => op::JI::new(a.value.into()).into(),
+            JI(a) => op::JI::new(a.value().into()).into(),
             JNE(a, b, c) => op::JNE::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            JNEI(a, b, c) => op::JNEI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
-            JNZI(a, b) => op::JNZI::new(a.to_reg_id(), b.value.into()).into(),
-            JMPB(a, b) => op::JMPB::new(a.to_reg_id(), b.value.into()).into(),
-            JMPF(a, b) => op::JMPF::new(a.to_reg_id(), b.value.into()).into(),
-            JNZB(a, b, c) => op::JNZB::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
-            JNZF(a, b, c) => op::JNZF::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            JNEI(a, b, c) => op::JNEI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
+            JNZI(a, b) => op::JNZI::new(a.to_reg_id(), b.value().into()).into(),
+            JMPB(a, b) => op::JMPB::new(a.to_reg_id(), b.value().into()).into(),
+            JMPF(a, b) => op::JMPF::new(a.to_reg_id(), b.value().into()).into(),
+            JNZB(a, b, c) => op::JNZB::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
+            JNZF(a, b, c) => op::JNZF::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             RET(a) => op::RET::new(a.to_reg_id()).into(),
 
             /* Memory Instructions */
             ALOC(a) => op::ALOC::new(a.to_reg_id()).into(),
-            CFEI(a) => op::CFEI::new(a.value.into()).into(),
-            CFSI(a) => op::CFSI::new(a.value.into()).into(),
-            LB(a, b, c) => op::LB::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
-            LW(a, b, c) => op::LW::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            CFEI(a) if a.value() == 0 => return FuelAsmData::Instructions(vec![]),
+            CFEI(a) => op::CFEI::new(a.value().into()).into(),
+            CFSI(a) if a.value() == 0 => return FuelAsmData::Instructions(vec![]),
+            CFSI(a) => op::CFSI::new(a.value().into()).into(),
+            CFE(a) => op::CFE::new(a.to_reg_id()).into(),
+            CFS(a) => op::CFS::new(a.to_reg_id()).into(),
+            LB(a, b, c) => op::LB::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
+            LW(a, b, c) => op::LW::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             MCL(a, b) => op::MCL::new(a.to_reg_id(), b.to_reg_id()).into(),
-            MCLI(a, b) => op::MCLI::new(a.to_reg_id(), b.value.into()).into(),
+            MCLI(a, b) => op::MCLI::new(a.to_reg_id(), b.value().into()).into(),
             MCP(a, b, c) => op::MCP::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
-            MCPI(a, b, c) => op::MCPI::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            MCPI(a, b, c) => op::MCPI::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
             MEQ(a, b, c, d) => {
                 op::MEQ::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
             }
-            SB(a, b, c) => op::SB::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
-            SW(a, b, c) => op::SW::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            PSHH(mask) => op::PSHH::new(mask.value().into()).into(),
+            PSHL(mask) => op::PSHL::new(mask.value().into()).into(),
+            POPH(mask) => op::POPH::new(mask.value().into()).into(),
+            POPL(mask) => op::POPL::new(mask.value().into()).into(),
+            SB(a, b, c) => op::SB::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
+            SW(a, b, c) => op::SW::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
 
             /* Contract Instructions */
             BAL(a, b, c) => op::BAL::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
             BHEI(a) => op::BHEI::new(a.to_reg_id()).into(),
             BHSH(a, b) => op::BHSH::new(a.to_reg_id(), b.to_reg_id()).into(),
-            BURN(a) => op::BURN::new(a.to_reg_id()).into(),
+            BURN(a, b) => op::BURN::new(a.to_reg_id(), b.to_reg_id()).into(),
             CALL(a, b, c, d) => {
                 op::CALL::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
             }
@@ -598,14 +729,24 @@ impl AllocatedOp {
             }
             CROO(a, b) => op::CROO::new(a.to_reg_id(), b.to_reg_id()).into(),
             CSIZ(a, b) => op::CSIZ::new(a.to_reg_id(), b.to_reg_id()).into(),
-            LDC(a, b, c) => op::LDC::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
+            BSIZ(a, b) => op::BSIZ::new(a.to_reg_id(), b.to_reg_id()).into(),
+            LDC(a, b, c, d) => op::LDC::new(
+                a.to_reg_id(),
+                b.to_reg_id(),
+                c.to_reg_id(),
+                d.value().into(),
+            )
+            .into(),
+            BLDD(a, b, c, d) => {
+                op::BLDD::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
+            }
             LOG(a, b, c, d) => {
                 op::LOG::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
             }
             LOGD(a, b, c, d) => {
                 op::LOGD::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
             }
-            MINT(a) => op::MINT::new(a.to_reg_id()).into(),
+            MINT(a, b) => op::MINT::new(a.to_reg_id(), b.to_reg_id()).into(),
             RETD(a, b) => op::RETD::new(a.to_reg_id(), b.to_reg_id()).into(),
             RVRT(a) => op::RVRT::new(a.to_reg_id()).into(),
             SMO(a, b, c, d) => {
@@ -627,37 +768,85 @@ impl AllocatedOp {
             }
 
             /* Cryptographic Instructions */
-            ECR(a, b, c) => op::ECR::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
+            ECK1(a, b, c) => op::ECK1::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
+            ECR1(a, b, c) => op::ECR1::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
+            ED19(a, b, c, d) => {
+                op::ED19::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
+            }
             K256(a, b, c) => op::K256::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
             S256(a, b, c) => op::S256::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id()).into(),
+            ECOP(a, b, c, d) => {
+                op::ECOP::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
+            }
+            EPAR(a, b, c, d) => {
+                op::EPAR::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
+            }
 
             /* Other Instructions */
+            ECAL(a, b, c, d) => {
+                op::ECAL::new(a.to_reg_id(), b.to_reg_id(), c.to_reg_id(), d.to_reg_id()).into()
+            }
             FLAG(a) => op::FLAG::new(a.to_reg_id()).into(),
-            GM(a, b) => op::GM::new(a.to_reg_id(), b.value.into()).into(),
-            GTF(a, b, c) => op::GTF::new(a.to_reg_id(), b.to_reg_id(), c.value.into()).into(),
+            GM(a, b) => op::GM::new(a.to_reg_id(), b.value().into()).into(),
+            GTF(a, b, c) => op::GTF::new(a.to_reg_id(), b.to_reg_id(), c.value().into()).into(),
 
             /* Non-VM Instructions */
             BLOB(a) => {
-                return Either::Left(
+                return FuelAsmData::Instructions(
                     std::iter::repeat(op::NOOP::new().into())
-                        .take(a.value as usize)
+                        .take(a.value() as usize)
                         .collect(),
                 )
             }
+            ConfigurablesOffsetPlaceholder => {
+                return FuelAsmData::ConfigurablesOffset([0, 0, 0, 0, 0, 0, 0, 0])
+            }
             DataSectionOffsetPlaceholder => {
-                return Either::Right(offset_to_data_section.to_be_bytes())
+                return FuelAsmData::DatasectionOffset(offset_to_data_section.to_be_bytes())
             }
-            DataSectionRegisterLoadPlaceholder => op::LW::new(
-                fuel_asm::RegId::new(DATA_SECTION_REGISTER),
-                ConstantRegister::InstructionStart.to_reg_id(),
-                1.into(),
-            )
-            .into(),
-            LWDataId(a, b) => {
-                return Either::Left(realize_lw(a, b, data_section, offset_to_data_section))
+            LoadDataId(a, b) => {
+                return FuelAsmData::Instructions(realize_load(
+                    a,
+                    b,
+                    data_section,
+                    offset_to_data_section,
+                    offset_from_instr_start,
+                ))
             }
+            AddrDataId(a, b) => return FuelAsmData::Instructions(addr_of(a, b, data_section)),
             Undefined => unreachable!("Sway cannot generate undefined ASM opcodes"),
         }])
+    }
+}
+
+/// Address of a data section item
+fn addr_of(
+    dest: &AllocatedRegister,
+    data_id: &DataId,
+    data_section: &DataSection,
+) -> Vec<fuel_asm::Instruction> {
+    let offset_bytes = data_section.data_id_to_offset(data_id) as u64;
+
+    if offset_bytes <= u64::from(Imm12::MAX.to_u16()) {
+        // Small enough to fit into an ADDI instruction immediate
+        vec![fuel_asm::Instruction::ADDI(ADDI::new(
+            dest.to_reg_id(),
+            fuel_asm::RegId::new(DATA_SECTION_REGISTER),
+            Imm12::new(offset_bytes.try_into().unwrap()),
+        ))]
+    } else {
+        // Offset too large to fit into ADDI immediate, so we need to use MOVI first
+        vec![
+            fuel_asm::Instruction::MOVI(MOVI::new(
+                dest.to_reg_id(),
+                Imm18::new(offset_bytes.try_into().unwrap()),
+            )),
+            fuel_asm::Instruction::ADD(ADD::new(
+                dest.to_reg_id(),
+                dest.to_reg_id(),
+                fuel_asm::RegId::new(DATA_SECTION_REGISTER),
+            )),
+        ]
     }
 }
 
@@ -665,56 +854,87 @@ impl AllocatedOp {
 /// actual bytewise offsets for use in bytecode.
 /// Returns one op if the type is less than one word big, but two ops if it has to construct
 /// a pointer and add it to $is.
-fn realize_lw(
+fn realize_load(
     dest: &AllocatedRegister,
     data_id: &DataId,
-    data_section: &mut DataSection,
+    data_section: &DataSection,
     offset_to_data_section: u64,
+    offset_from_instr_start: u64,
 ) -> Vec<fuel_asm::Instruction> {
-    // all data is word-aligned right now, and `offset_to_id` returns the offset in bytes
-    let offset_bytes = data_section.data_id_to_offset(data_id) as u64;
-    let offset_words = offset_bytes / 8;
-    let offset = match VirtualImmediate12::new(offset_words, Span::new(" ".into(), 0, 0, None).unwrap()) {
-        Ok(value) => value,
-        Err(_) => panic!("Unable to offset into the data section more than 2^12 bits. Unsupported data section length.")
-    };
     // if this data is larger than a word, instead of loading the data directly
     // into the register, we want to load a pointer to the data into the register
     // this appends onto the data section and mutates it by adding the pointer as a literal
     let has_copy_type = data_section.has_copy_type(data_id).expect(
         "Internal miscalculation in data section -- data id did not match up to any actual data",
     );
+
+    let is_byte = data_section.is_byte(data_id).expect(
+        "Internal miscalculation in data section -- data id did not match up to any actual data",
+    );
+
+    // all data is word-aligned right now, and `offset_to_id` returns the offset in bytes
+    let offset_bytes = data_section.data_id_to_offset(data_id) as u64;
+    assert!(
+        offset_bytes % 8 == 0,
+        "Internal miscalculation in data section -- data offset is not aligned to a word",
+    );
+    let offset_words = offset_bytes / 8;
+
+    let imm = VirtualImmediate12::new(
+        if is_byte { offset_bytes } else { offset_words },
+        Span::new(" ".into(), 0, 0, None).unwrap(),
+    );
+    let offset = match imm {
+        Ok(value) => value,
+        Err(_) => panic!(
+            "Unable to offset into the data section more than 2^12 bits. \
+                                Unsupported data section length: {} words.",
+            offset_words
+        ),
+    };
+
     if !has_copy_type {
-        // load the pointer itself into the register
-        // `offset_to_data_section` is in bytes. We want a byte
-        // address here
-        let pointer_offset_from_instruction_start = offset_to_data_section + offset_bytes;
+        // load the pointer itself into the register. `offset_to_data_section` is in bytes.
+        // The -4 is because $pc is added in the *next* instruction.
+        let pointer_offset_from_current_instr =
+            offset_to_data_section - offset_from_instr_start + offset_bytes - 4;
+
         // insert the pointer as bytes as a new data section entry at the end of the data
-        let data_id_for_pointer =
-            data_section.append_pointer(pointer_offset_from_instruction_start);
+        let data_id_for_pointer = data_section
+            .data_id_of_pointer(pointer_offset_from_current_instr)
+            .expect("Pointer offset must be in data_section");
+
         // now load the pointer we just created into the `dest`ination
         let mut buf = Vec::with_capacity(2);
-        buf.append(&mut realize_lw(
+        buf.append(&mut realize_load(
             dest,
             &data_id_for_pointer,
             data_section,
             offset_to_data_section,
+            offset_from_instr_start,
         ));
-        // add $is to the pointer since it is relative to the data section
+        // add $pc to the pointer since it is relative to the current instruction.
         buf.push(
             fuel_asm::op::ADD::new(
                 dest.to_reg_id(),
                 dest.to_reg_id(),
-                ConstantRegister::InstructionStart.to_reg_id(),
+                ConstantRegister::ProgramCounter.to_reg_id(),
             )
             .into(),
         );
         buf
+    } else if is_byte {
+        vec![fuel_asm::op::LB::new(
+            dest.to_reg_id(),
+            fuel_asm::RegId::new(DATA_SECTION_REGISTER),
+            offset.value().into(),
+        )
+        .into()]
     } else {
         vec![fuel_asm::op::LW::new(
             dest.to_reg_id(),
             fuel_asm::RegId::new(DATA_SECTION_REGISTER),
-            offset.value.into(),
+            offset.value().into(),
         )
         .into()]
     }

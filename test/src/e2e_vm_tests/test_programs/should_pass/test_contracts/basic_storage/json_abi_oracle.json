@@ -1,5 +1,6 @@
 {
   "configurables": [],
+  "encoding": "1",
   "functions": [
     {
       "attributes": [
@@ -24,7 +25,7 @@
         "typeArguments": [
           {
             "name": "",
-            "type": 8,
+            "type": 9,
             "typeArguments": null
           }
         ]
@@ -47,7 +48,7 @@
         },
         {
           "name": "slots",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         }
       ],
@@ -83,7 +84,7 @@
       "name": "intrinsic_load_word",
       "output": {
         "name": "",
-        "type": 8,
+        "type": 9,
         "typeArguments": null
       }
     },
@@ -138,7 +139,7 @@
         },
         {
           "name": "value",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         }
       ],
@@ -166,7 +167,7 @@
         },
         {
           "name": "value",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         }
       ],
@@ -196,7 +197,40 @@
       }
     }
   ],
-  "loggedTypes": [],
+  "loggedTypes": [
+    {
+      "logId": "14454674236531057292",
+      "loggedType": {
+        "name": "",
+        "type": 10,
+        "typeArguments": null
+      }
+    },
+    {
+      "logId": "1970142151624111756",
+      "loggedType": {
+        "name": "",
+        "type": 8,
+        "typeArguments": null
+      }
+    },
+    {
+      "logId": "8961848586872524460",
+      "loggedType": {
+        "name": "",
+        "type": 1,
+        "typeArguments": null
+      }
+    },
+    {
+      "logId": "1515152261580153489",
+      "loggedType": {
+        "name": "",
+        "type": 9,
+        "typeArguments": null
+      }
+    }
+  ],
   "messagesTypes": [],
   "types": [
     {
@@ -246,22 +280,22 @@
       "components": [
         {
           "name": "v1",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         },
         {
           "name": "v2",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         },
         {
           "name": "v3",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         },
         {
           "name": "v4",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         }
       ],
@@ -278,7 +312,7 @@
         },
         {
           "name": "cap",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         }
       ],
@@ -303,7 +337,7 @@
         },
         {
           "name": "len",
-          "type": 8,
+          "type": 9,
           "typeArguments": null
         }
       ],
@@ -315,8 +349,20 @@
     },
     {
       "components": null,
-      "type": "u64",
+      "type": "u256",
       "typeId": 8,
+      "typeParameters": null
+    },
+    {
+      "components": null,
+      "type": "u64",
+      "typeId": 9,
+      "typeParameters": null
+    },
+    {
+      "components": null,
+      "type": "u8",
+      "typeId": 10,
       "typeParameters": null
     }
   ]

@@ -49,8 +49,8 @@ impl ByteSpan {
 
 impl Ord for ByteSpan {
     fn cmp(&self, other: &Self) -> Ordering {
-        // If the starting position is the same encapsulatig span (i.e, wider one) should come
-        // first
+        // If the starting position is the same encapsulating span (i.e, wider one) should come
+        // first.
         match self.start.cmp(&other.start) {
             Ordering::Equal => other.end.cmp(&self.end),
             ord => ord,
@@ -177,7 +177,11 @@ impl LeafSpans for CommaToken {
 
 impl LeafSpans for TypeField {
     fn leaf_spans(&self) -> Vec<ByteSpan> {
-        let mut collected_spans = vec![ByteSpan::from(self.name.span())];
+        let mut collected_spans = Vec::new();
+        if let Some(visibility) = &self.visibility {
+            collected_spans.push(ByteSpan::from(visibility.span()));
+        }
+        collected_spans.push(ByteSpan::from(self.name.span()));
         collected_spans.push(ByteSpan::from(self.colon_token.span()));
         collected_spans.append(&mut self.ty.leaf_spans());
         collected_spans
@@ -229,7 +233,7 @@ mod tests {
         let second_span = ByteSpan { start: 2, end: 4 };
         let third_span = ByteSpan { start: 4, end: 7 };
 
-        let mut vec = vec![second_span.clone(), third_span.clone(), first_span.clone()];
+        let mut vec = [second_span.clone(), third_span.clone(), first_span.clone()];
         vec.sort();
 
         assert_eq!(vec[0], first_span);

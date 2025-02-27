@@ -34,7 +34,7 @@ library;
 use ::revert::revert;
 ```
 
-- The `enum` definition which starts with the keyword `pub` to indicate that this `Option<T>` is publically available _outside_ the `option` library:
+- The `enum` definition which starts with the keyword `pub` to indicate that this `Option<T>` is publicly available _outside_ the `option` library:
 
 ```sway
 pub enum Option<T> {
@@ -91,7 +91,7 @@ mod vm;
 // .. Other deps
 ```
 
-with other libraries contained in the `src` folder, like the vm library (inside of `src/vm.sw`):
+with other libraries contained in the `src` folder, like the `vm` library (inside of `src/vm.sw`):
 
 ```sway
 library;
@@ -100,7 +100,7 @@ mod evm;
 // ...
 ```
 
-and it's own sub-library evm located in `src/vm/evm.sw`:
+and it's own sub-library `evm` located in `src/vm/evm.sw`:
 
 ```sway
 library;
@@ -131,7 +131,7 @@ $ tree
 
 As `internal_lib` is an internal library, it can be imported into `main.sw` as follows:
 
-- Use the `mod` keyword followed by the library name to make the internal library a dependancy
+- Use the `mod` keyword followed by the library name to make the internal library a dependency
 - Use the `use` keyword with a `::` separating the name of the library and the imported item(s)
 
 ```sway
@@ -186,31 +186,25 @@ Wildcard imports using `*` are supported, but it is generally recommended to use
 
 ## Reference Sway Libraries
 
-The repository [`sway-libs`](https://github.com/FuelLabs/sway-libs/) is a collection of external libraries that you can import and make use of in your Fuel applications. These libraries are meant to be learning references of common use-cases valuable for dapp development.
+The repository [`sway-libs`](https://github.com/FuelLabs/sway-libs/) is a collection of external libraries that you can import and make use of in your Fuel applications. These libraries are meant to be implementations of common use-cases valuable for dapp development.
 
 Some Sway Libraries to try out:
 
-- [Binary Merkle Proof](https://github.com/FuelLabs/sway-libs/tree/master/libs/merkle_proof)
-- [Non-Fungible Token](https://github.com/FuelLabs/sway-libs/tree/master/libs/nft)
-- [Signed Integers](https://github.com/FuelLabs/sway-libs/tree/master/libs/signed_integers)
-- [Unsigned Fixed Point Number](https://github.com/FuelLabs/sway-libs/tree/master/libs/fixed_point)
+- [Binary Merkle Proof](https://github.com/FuelLabs/sway-libs/tree/master/libs/src/merkle)
+- [Signed Integers](https://github.com/FuelLabs/sway-libs/tree/master/libs/src/signed_integers)
+- [Ownership](https://github.com/FuelLabs/sway-libs/tree/master/libs/src/ownership)
 
 ### Example
 
-You can import and use a Sway Library such as the [NFT](https://github.com/FuelLabs/sway-libs/tree/master/libs/nft/src) library just like any other external library.
+You can import and use a Sway Library such as the [Ownership](https://github.com/FuelLabs/sway-libs/tree/master/libs/src/ownership) library just like any other external library.
 
 ```sway
-use sway_libs::nft::{
-    mint,
-    transfer,
-    owner_of,
-    approve,
-};
+use ownership::Ownership;
 ```
 
 Once imported, you can use the following basic functionality of the library in your smart contract:
 
-- Minting tokens
-- Transfering tokens
-- Retrieving owner of a token
-- Approving users to transfer a token
+- Declaring an owner
+- Changing ownership
+- Renouncing ownership
+- Ensuring a function may only be called by the owner

@@ -3,6 +3,7 @@ contract;
 mod other_contract;
 
 use other_contract::*;
+use std::hash::*;
 
 abi MyContract {
     #[storage(read, write)]
@@ -10,7 +11,7 @@ abi MyContract {
 }
 
 storage {
-    balances: StorageMap<Identity, u64> = StorageMap {},
+    balances: StorageMap<Identity, u64> = StorageMap::<Identity, u64> {},
 }
 
 impl MyContract for Contract {
@@ -23,7 +24,9 @@ impl MyContract for Contract {
 
         // External call
         let caller = abi(OtherContract, external_contract_id.into());
-        caller.external_call { coins: bal }();
+        caller.external_call {
+            coins: bal,
+        }();
 
         // Storage update _after_ external call
         storage.balances.insert(sender, 0);

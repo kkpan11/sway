@@ -1,3 +1,4 @@
+use lsp_types::Range;
 use swayfmt::FormatterError;
 use thiserror::Error;
 
@@ -14,12 +15,16 @@ pub enum LanguageServerError {
     // Top level errors
     #[error("Failed to create build plan. {0}")]
     BuildPlanFailed(anyhow::Error),
+    #[error("Build Plan Cache is empty")]
+    BuildPlanCacheIsEmpty,
     #[error("Failed to compile. {0}")]
     FailedToCompile(anyhow::Error),
     #[error("Failed to parse document")]
     FailedToParse,
     #[error("Error formatting document: {0}")]
     FormatError(FormatterError),
+    #[error("No Programs were returned from the compiler")]
+    ProgramsIsNone,
     #[error("Unable to acquire a semaphore permit for parsing")]
     UnableToAcquirePermit,
 }
@@ -40,6 +45,15 @@ pub enum DocumentError {
     UnableToCreateFile { path: String, err: String },
     #[error("Unable to write string to file at {:?} : {:?}", path, err)]
     UnableToWriteFile { path: String, err: String },
+    #[error("File wasn't able to be removed at path {:?} : {:?}", path, err)]
+    UnableToRemoveFile { path: String, err: String },
+
+    #[error("Permission denied for path {:?}", path)]
+    PermissionDenied { path: String },
+    #[error("IO error for path {:?} : {:?}", path, error)]
+    IOError { path: String, error: String },
+    #[error("Invalid range {:?}", range)]
+    InvalidRange { range: Range },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -50,6 +64,8 @@ pub enum DirectoryError {
     ManifestDirNotFound,
     #[error("Can't extract project name from {:?}", dir)]
     CantExtractProjectName { dir: String },
+    #[error("Failed to create hidden .lsp_locks directory: {0}")]
+    LspLocksDirFailed(String),
     #[error("Failed to create temp directory")]
     TempDirFailed,
     #[error("Failed to canonicalize path")]
@@ -66,6 +82,8 @@ pub enum DirectoryError {
     PathFromUrlFailed { url: String },
     #[error("Unable to create span from path {:?}", path)]
     SpanFromPathFailed { path: String },
+    #[error("No program ID found for path {:?}", path)]
+    ProgramIdNotFound { path: String },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -74,7 +92,7 @@ pub enum RenameError {
     TokenNotFound,
     #[error("Token is not part of the user's workspace")]
     TokenNotPartOfWorkspace,
-    #[error("Keywords and instrinsics are unable to be renamed")]
+    #[error("Keywords and intrinsics are unable to be renamed")]
     SymbolKindNotAllowed,
     #[error("Invalid name {:?}: not an identifier", name)]
     InvalidName { name: String },

@@ -4,15 +4,17 @@ use crate::{Parse, ParseBracket, ParseResult, ParseToEnd, Parser, ParserConsumed
 use sway_ast::attribute::{Annotated, Attribute, AttributeArg, AttributeDecl, AttributeHashKind};
 use sway_ast::brackets::{Parens, SquareBrackets};
 use sway_ast::keywords::{EqToken, HashBangToken, HashToken, StorageToken, Token};
+use sway_ast::literal::LitBool;
 use sway_ast::punctuated::Punctuated;
 use sway_ast::token::{DocComment, DocStyle};
+use sway_ast::Literal;
 use sway_error::parser_error::ParseErrorKind;
 use sway_types::constants::DOC_COMMENT_ATTRIBUTE_NAME;
-use sway_types::Ident;
+use sway_types::{Ident, Spanned};
 
 impl Peek for DocComment {
     fn peek(peeker: Peeker<'_>) -> Option<DocComment> {
-        peeker.peek_doc_comment().ok().map(Clone::clone)
+        peeker.peek_doc_comment().ok().cloned()
     }
 }
 
@@ -55,15 +57,45 @@ impl<T: Parse> Parse for Annotated<T> {
                 ),
             });
         }
+
         while let Some(attr) = parser.guarded_parse::<HashToken, _>()? {
             attribute_list.push(attr);
         }
 
-        // Parse the `T` value.
-        let value = parser.parse()?;
+        if parser.check_empty().is_some() {
+            let error = parser.emit_error(ParseErrorKind::ExpectedAnItemAfterDocComment);
+            Err(error)
+        } else {
+            // Parse the `T` value.
+            let value = match parser.parse_with_recovery() {
+                Ok(value) => value,
+                Err(r) => {
+                    let (spans, error) =
+                        r.recover_at_next_line_with_fallback_error(ParseErrorKind::InvalidItem);
+                    if let Some(error) = T::error(spans, error) {
+                        error
+                    } else {
+                        Err(error)?
+                    }
+                }
+            };
 
-        Ok(Annotated {
-            attribute_list,
+            Ok(Annotated {
+                attribute_list,
+                value,
+            })
+        }
+    }
+
+    fn error(
+        spans: Box<[sway_types::Span]>,
+        error: sway_error::handler::ErrorEmitted,
+    ) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        T::error(spans, error).map(|value| Annotated {
+            attribute_list: vec![],
             value,
         })
     }
@@ -95,7 +127,18 @@ impl Parse for AttributeArg {
         let name = parser.parse()?;
         match parser.take::<EqToken>() {
             Some(_) => {
-                let value = parser.parse()?;
+                let value = match parser.take::<Ident>() {
+                    Some(ident) if ident.as_str() == "true" => Literal::Bool(LitBool {
+                        span: ident.span(),
+                        kind: sway_ast::literal::LitBoolType::True,
+                    }),
+                    Some(ident) if ident.as_str() == "false" => Literal::Bool(LitBool {
+                        span: ident.span(),
+                        kind: sway_ast::literal::LitBoolType::False,
+                    }),
+                    _ => parser.parse()?,
+                };
+
                 Ok(AttributeArg {
                     name,
                     value: Some(value),
@@ -145,67 +188,121 @@ mod tests {
             fn main() {
                 ()
             }
-        "#,), @r###"
+        "#,), @r#"
         Annotated(
           attribute_list: [
             AttributeDecl(
               hash_kind: Outer(HashToken(
-                span: (82, 108),
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 82,
+                  end: 108,
+                  source_id: None,
+                ),
               )),
               attribute: SquareBrackets(
                 inner: Punctuated(
                   value_separator_pairs: [],
                   final_value_opt: Some(Attribute(
-                    name: Ident(
-                      to_string: "doc-comment",
-                      span: (82, 108),
+                    name: BaseIdent(
+                      name_override_opt: Some("doc-comment"),
+                      span: Span(
+                        src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                        start: 82,
+                        end: 108,
+                        source_id: None,
+                      ),
+                      is_raw_ident: false,
                     ),
                     args: Some(Parens(
                       inner: Punctuated(
                         value_separator_pairs: [],
                         final_value_opt: Some(AttributeArg(
-                          name: Ident(
-                            to_string: " This is a doc comment.",
-                            span: (85, 108),
+                          name: BaseIdent(
+                            name_override_opt: None,
+                            span: Span(
+                              src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                              start: 85,
+                              end: 108,
+                              source_id: None,
+                            ),
+                            is_raw_ident: false,
                           ),
                           value: None,
                         )),
                       ),
-                      span: (85, 108),
+                      span: Span(
+                        src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                        start: 85,
+                        end: 108,
+                        source_id: None,
+                      ),
                     )),
                   )),
                 ),
-                span: (82, 108),
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 82,
+                  end: 108,
+                  source_id: None,
+                ),
               ),
             ),
             AttributeDecl(
               hash_kind: Outer(HashToken(
-                span: (121, 122),
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 121,
+                  end: 122,
+                  source_id: None,
+                ),
               )),
               attribute: SquareBrackets(
                 inner: Punctuated(
                   value_separator_pairs: [],
                   final_value_opt: Some(Attribute(
-                    name: Ident(
-                      to_string: "storage",
-                      span: (123, 130),
+                    name: BaseIdent(
+                      name_override_opt: None,
+                      span: Span(
+                        src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                        start: 123,
+                        end: 130,
+                        source_id: None,
+                      ),
+                      is_raw_ident: false,
                     ),
                     args: Some(Parens(
                       inner: Punctuated(
                         value_separator_pairs: [],
                         final_value_opt: Some(AttributeArg(
-                          name: Ident(
-                            to_string: "read",
-                            span: (131, 135),
+                          name: BaseIdent(
+                            name_override_opt: None,
+                            span: Span(
+                              src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                              start: 131,
+                              end: 135,
+                              source_id: None,
+                            ),
+                            is_raw_ident: false,
                           ),
                           value: None,
                         )),
                       ),
-                      span: (130, 136),
+                      span: Span(
+                        src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                        start: 130,
+                        end: 136,
+                        source_id: None,
+                      ),
                     )),
                   )),
                 ),
-                span: (122, 137),
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 122,
+                  end: 137,
+                  source_id: None,
+                ),
               ),
             ),
           ],
@@ -213,11 +310,22 @@ mod tests {
             fn_signature: FnSignature(
               visibility: None,
               fn_token: FnToken(
-                span: (150, 152),
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 150,
+                  end: 152,
+                  source_id: None,
+                ),
               ),
-              name: Ident(
-                to_string: "main",
-                span: (153, 157),
+              name: BaseIdent(
+                name_override_opt: None,
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 153,
+                  end: 157,
+                  source_id: None,
+                ),
+                is_raw_ident: false,
               ),
               generics: None,
               arguments: Parens(
@@ -225,7 +333,12 @@ mod tests {
                   value_separator_pairs: [],
                   final_value_opt: None,
                 )),
-                span: (157, 159),
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 157,
+                  end: 159,
+                  source_id: None,
+                ),
               ),
               return_type_opt: None,
               where_clause_opt: None,
@@ -235,62 +348,122 @@ mod tests {
                 statements: [],
                 final_expr_opt: Some(Tuple(Parens(
                   inner: Nil,
-                  span: (178, 180),
+                  span: Span(
+                    src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                    start: 178,
+                    end: 180,
+                    source_id: None,
+                  ),
                 ))),
+                span: Span(
+                  src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                  start: 161,
+                  end: 193,
+                  source_id: None,
+                ),
               ),
-              span: (160, 194),
+              span: Span(
+                src: "\n            // I will be ignored.\n            //! I will be ignored.\n            /// This is a doc comment.\n            #[storage(read)]\n            fn main() {\n                ()\n            }\n        ",
+                start: 160,
+                end: 194,
+                source_id: None,
+              ),
             ),
           ),
         )
-        "###);
+        "#);
     }
 
     #[test]
     fn parse_attribute() {
         assert_ron_snapshot!(parse::<Attribute>(r#"
             name(arg1, arg2 = "value", arg3)
-        "#,), @r###"
+        "#,), @r#"
         Attribute(
-          name: Ident(
-            to_string: "name",
-            span: (13, 17),
+          name: BaseIdent(
+            name_override_opt: None,
+            span: Span(
+              src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+              start: 13,
+              end: 17,
+              source_id: None,
+            ),
+            is_raw_ident: false,
           ),
           args: Some(Parens(
             inner: Punctuated(
               value_separator_pairs: [
                 (AttributeArg(
-                  name: Ident(
-                    to_string: "arg1",
-                    span: (18, 22),
+                  name: BaseIdent(
+                    name_override_opt: None,
+                    span: Span(
+                      src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+                      start: 18,
+                      end: 22,
+                      source_id: None,
+                    ),
+                    is_raw_ident: false,
                   ),
                   value: None,
                 ), CommaToken(
-                  span: (22, 23),
+                  span: Span(
+                    src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+                    start: 22,
+                    end: 23,
+                    source_id: None,
+                  ),
                 )),
                 (AttributeArg(
-                  name: Ident(
-                    to_string: "arg2",
-                    span: (24, 28),
+                  name: BaseIdent(
+                    name_override_opt: None,
+                    span: Span(
+                      src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+                      start: 24,
+                      end: 28,
+                      source_id: None,
+                    ),
+                    is_raw_ident: false,
                   ),
                   value: Some(String(LitString(
-                    span: (31, 38),
+                    span: Span(
+                      src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+                      start: 31,
+                      end: 38,
+                      source_id: None,
+                    ),
                     parsed: "value",
                   ))),
                 ), CommaToken(
-                  span: (38, 39),
+                  span: Span(
+                    src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+                    start: 38,
+                    end: 39,
+                    source_id: None,
+                  ),
                 )),
               ],
               final_value_opt: Some(AttributeArg(
-                name: Ident(
-                  to_string: "arg3",
-                  span: (40, 44),
+                name: BaseIdent(
+                  name_override_opt: None,
+                  span: Span(
+                    src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+                    start: 40,
+                    end: 44,
+                    source_id: None,
+                  ),
+                  is_raw_ident: false,
                 ),
                 value: None,
               )),
             ),
-            span: (17, 45),
+            span: Span(
+              src: "\n            name(arg1, arg2 = \"value\", arg3)\n        ",
+              start: 17,
+              end: 45,
+              source_id: None,
+            ),
           )),
         )
-        "###);
+        "#);
     }
 }

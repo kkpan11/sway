@@ -1,3 +1,4 @@
+//! Handles the gathering of module information used in navigation and documentation of modules.
 use crate::render::{constant::INDEX_FILENAME, util::format::docstring::create_preview};
 use anyhow::Result;
 use horrorshow::{box_html, Template};
@@ -6,9 +7,18 @@ use sway_core::language::CallPath;
 
 pub(crate) type ModulePrefixes = Vec<String>;
 
+/// Information about a Sway module.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-pub(crate) struct ModuleInfo {
-    pub(crate) module_prefixes: ModulePrefixes,
+pub struct ModuleInfo {
+    /// The preceding module names, used in navigating between modules.
+    pub module_prefixes: ModulePrefixes,
+    /// Doc attributes of a module.
+    /// Renders into the module level docstrings.
+    ///
+    /// ```sway
+    /// //! Module level docstring
+    /// library;
+    /// ```
     pub(crate) attributes: Option<String>,
 }
 impl ModuleInfo {
@@ -32,13 +42,12 @@ impl ModuleInfo {
     ///
     /// Returns `None` if there is no parent.
     pub(crate) fn parent(&self) -> Option<&String> {
-        match self.has_parent() {
-            true => {
-                let mut iter = self.module_prefixes.iter();
-                iter.next_back();
-                iter.next_back()
-            }
-            false => None,
+        if self.has_parent() {
+            let mut iter = self.module_prefixes.iter();
+            iter.next_back();
+            iter.next_back()
+        } else {
+            None
         }
     }
     /// Determines if the current module has a parent module.
@@ -69,14 +78,14 @@ impl ModuleInfo {
                 break;
             }
         }
-        iter.map(|s| s.as_str()).collect::<Vec<&str>>().join("::")
+        iter.map(String::as_str).collect::<Vec<&str>>().join("::")
     }
     /// Renders the [ModuleInfo] into a [CallPath] with anchors. We return this as a `Result<Vec<String>>`
     /// since the `box_html!` macro returns a closure and no two closures are considered the same type.
     pub(crate) fn get_anchors(&self) -> Result<Vec<String>> {
         let mut count = self.depth();
         let mut rendered_module_anchors = Vec::with_capacity(self.depth());
-        for prefix in self.module_prefixes.iter() {
+        for prefix in &self.module_prefixes {
             let mut href = (1..count).map(|_| "../").collect::<String>();
             href.push_str(INDEX_FILENAME);
             rendered_module_anchors.push(
@@ -111,44 +120,71 @@ impl ModuleInfo {
             .map(|file_path_str| file_path_str.to_string())
             .ok_or_else(|| anyhow::anyhow!("There will always be at least the item name"))
     }
+
     /// Compares the current `module_info` to the next `module_info` to determine how many directories to go back to make
     /// the next file path valid, and returns that path as a `String`.
     ///
     /// Example:
     /// ```
     /// // number of dirs:               [match][    2    ][    1    ]
-    /// current_location = "project_root/module/submodule1/submodule2/struct.Name.html";
-    /// next_location    =              "module/other_submodule/enum.Name.html";
-    /// result           =               "../../other_submodule/enum.Name.html";
+    /// let current_location = "project_root/module/submodule1/submodule2/struct.Name.html";
+    /// let next_location    =              "module/other_submodule/enum.Name.html";
+    /// let result           =               "../../other_submodule/enum.Name.html";
     /// ```
     /// In this case the first module to match is "module", so we have no need to go back further than that.
     pub(crate) fn file_path_from_location(
         &self,
         file_name: &str,
         current_module_info: &ModuleInfo,
+        is_external_item: bool,
     ) -> Result<String> {
-        let mut mid = 0; // the index to split the module_info from call_path at
-        let mut offset = 0; // the number of directories to go back
-        let mut next_location_iter = self.module_prefixes.iter().rev().enumerate().peekable();
-        while let Some((index, prefix)) = next_location_iter.peek() {
-            for (count, module) in current_module_info.module_prefixes.iter().rev().enumerate() {
-                if module == *prefix {
-                    offset = count;
-                    mid = self.module_prefixes.len() - index;
-                    break;
+        if is_external_item {
+            let mut new_path = (0..current_module_info.module_prefixes.len())
+                .map(|_| "../")
+                .collect::<String>();
+            write!(new_path, "{}/{}", self.module_prefixes.join("/"), file_name)?;
+            Ok(new_path)
+        } else {
+            let mut mid = 0; // the index to split the module_info from call_path at
+            let mut offset = 0; // the number of directories to go back
+            let mut next_location_iter = self.module_prefixes.iter().rev().enumerate().peekable();
+            while let Some((index, prefix)) = next_location_iter.peek() {
+                for (count, module) in current_module_info.module_prefixes.iter().rev().enumerate()
+                {
+                    if module == *prefix {
+                        offset = count;
+                        mid = self.module_prefixes.len() - index;
+                        break;
+                    }
                 }
+                next_location_iter.next();
             }
-            next_location_iter.next();
+            let mut new_path = (0..offset).map(|_| "../").collect::<String>();
+            write!(
+                new_path,
+                "{}/{}",
+                self.module_prefixes.split_at(mid).1.join("/"),
+                file_name
+            )?;
+            Ok(new_path)
         }
-        let mut new_path = (0..offset).map(|_| "../").collect::<String>();
-        write!(
-            new_path,
-            "{}/{}",
-            self.module_prefixes.split_at(mid).1.join("/"),
-            file_name
-        )?;
-        Ok(new_path)
     }
+
+    /// Returns the relative path to the root of the project.
+    ///
+    /// Example:
+    /// ```
+    /// let current_location = "project_root/module/submodule1/submodule2/struct.Name.html";
+    /// let result           = "../..";
+    /// ```
+    /// In this case the first module to match is "module", so we have no need to go back further than that.
+    pub(crate) fn path_to_root(&self) -> String {
+        (0..self.module_prefixes.len())
+            .map(|_| "..")
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     /// Create a path `&str` for navigation from the `module.depth()` & `file_name`.
     ///
     /// This is only used for shorthand path syntax, e.g `../../file_name.html`.
@@ -171,7 +207,7 @@ impl ModuleInfo {
         }
     }
     /// Create a new [ModuleInfo] from a `CallPath`.
-    pub(crate) fn from_call_path(call_path: CallPath) -> Self {
+    pub(crate) fn from_call_path(call_path: &CallPath) -> Self {
         let module_prefixes = call_path
             .prefixes
             .iter()
@@ -179,6 +215,13 @@ impl ModuleInfo {
             .collect::<Vec<String>>();
         Self {
             module_prefixes,
+            attributes: None,
+        }
+    }
+    /// Create a new [ModuleInfo] from a `&[String]`.
+    pub(crate) fn from_vec_str(module_prefixes: &[String]) -> Self {
+        Self {
+            module_prefixes: module_prefixes.to_owned(),
             attributes: None,
         }
     }

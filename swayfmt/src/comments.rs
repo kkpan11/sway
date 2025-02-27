@@ -1,8 +1,3 @@
-use ropey::Rope;
-use std::{fmt::Write, ops::Range};
-use sway_ast::token::{Comment, CommentKind};
-use sway_types::{Span, Spanned};
-
 use crate::{
     formatter::FormattedCode,
     parse::parse_snippet,
@@ -12,6 +7,10 @@ use crate::{
     },
     Format, Formatter, FormatterError,
 };
+use ropey::Rope;
+use std::{fmt::Write, ops::Range};
+use sway_ast::token::{Comment, CommentKind};
+use sway_types::{Span, Spanned};
 
 pub type UnformattedCode = String;
 
@@ -36,6 +35,18 @@ impl CommentsContext {
     }
 }
 
+#[inline]
+pub fn has_comments_in_formatter(formatter: &Formatter, range: &Range<usize>) -> bool {
+    formatter
+        .comments_context
+        .map
+        .comments_between(range)
+        .peekable()
+        .peek()
+        .is_some()
+}
+
+#[inline]
 pub fn has_comments<I: Iterator>(comments: I) -> bool {
     comments.peekable().peek().is_some()
 }
@@ -65,15 +76,18 @@ fn write_trailing_comment(
 }
 
 /// Given a range, writes comments contained within the range. This function
-/// removes comments that are written here from the CommentMap for later use.
+/// removes comments that are written here from the [CommentMap] for later use.
 ///
-/// Most comment formatting should be done using `rewrite_with_comments` in
+/// Most comment formatting should be done using [rewrite_with_comments] in
 /// the context of the AST, but in some cases (eg. at the end of module) we require this function.
 ///
 /// Returns:
 /// `Ok(true)` on successful execution with comments written,
 /// `Ok(false)` on successful execution and if there are no comments within the given range,
 /// `Err` if a FormatterError was encountered.
+///
+/// The `range` can be an empty [Range], or have its start being greater then its end.
+/// This is to support formatting arbitrary lexed trees, that are not necessarily backed by source code.
 pub fn write_comments(
     formatted_code: &mut FormattedCode,
     range: Range<usize>,
@@ -92,7 +106,7 @@ pub fn write_comments(
 
         // If the already formatted code ends with some pattern and doesn't already end with a newline,
         // we want to add a newline here.
-        if formatted_code.ends_with(&['{', '}']) && !formatted_code.ends_with('\n') {
+        if formatted_code.ends_with(['{', '}']) && !formatted_code.ends_with('\n') {
             writeln!(formatted_code)?;
         }
 
@@ -104,7 +118,7 @@ pub fn write_comments(
                     write!(
                         formatted_code,
                         "{}{}{}",
-                        formatter.shape.indent.to_string(&formatter.config)?,
+                        formatter.indent_to_str()?,
                         comment.span().as_str(),
                         newlines
                     )?;
@@ -116,9 +130,16 @@ pub fn write_comments(
                     // We do a trim and truncate here to ensure that only a single whitespace separates
                     // the inlined comment from the previous token.
                     formatted_code.truncate(formatted_code.trim_end().len());
-                    write!(formatted_code, " {} ", comment.span().as_str(),)?;
+                    write!(formatted_code, " {} ", comment.span().as_str())?;
                 }
-                CommentKind::Multilined => {}
+                CommentKind::Multilined => {
+                    write!(
+                        formatted_code,
+                        "{}{}",
+                        formatter.indent_to_str()?,
+                        comment.span().as_str(),
+                    )?;
+                }
             }
         }
     }
@@ -139,6 +160,9 @@ pub fn write_comments(
 /// This takes a given AST node's unformatted span, its leaf spans and its formatted code (a string) and
 /// parses the equivalent formatted version to get its leaf spans. We traverse the spaces between both
 /// formatted and unformatted leaf spans to find possible comments and inserts them between.
+///
+/// The `unformatted_span` can be an empty [Span]. This is to support formatting arbitrary lexed trees,
+/// that are not necessarily backed by source code.
 pub fn rewrite_with_comments<T: sway_parse::Parse + Format + LeafSpans>(
     formatter: &mut Formatter,
     unformatted_span: Span,
@@ -151,9 +175,7 @@ pub fn rewrite_with_comments<T: sway_parse::Parse + Format + LeafSpans>(
     let mut offset = 0;
     let mut to_rewrite = formatted_code[last_formatted..].to_string();
 
-    let formatted_leaf_spans = parse_snippet::<T>(&formatted_code[last_formatted..])
-        .unwrap()
-        .leaf_spans();
+    let formatted_leaf_spans = parse_snippet::<T>(&formatted_code[last_formatted..])?.leaf_spans();
 
     let mut previous_unformatted_leaf_span = unformatted_leaf_spans
         .first()
@@ -352,13 +374,17 @@ fn insert_after_span(
         };
 
         // Insert the actual comment(s).
-        src_rope.insert(from.end + offset, &comment_str);
+        src_rope
+            .try_insert(from.end + offset, &comment_str)
+            .map_err(|_| FormatterError::CommentError)?;
 
         formatted_code.clear();
         formatted_code.push_str(&src_rope.to_string());
     }
 
-    Ok(comment_str.len())
+    // In order to handle special characters, we return the number of characters rather than
+    // the size of the string.
+    Ok(comment_str.chars().count())
 }
 
 #[cfg(test)]

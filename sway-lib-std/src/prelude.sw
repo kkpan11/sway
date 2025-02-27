@@ -4,31 +4,37 @@
 library;
 
 // Blockchain types
-use ::address::Address;
-use ::contract_id::{ContractId, AssetId};
-use ::identity::Identity;
+pub use ::address::Address;
+pub use ::alias::SubId;
+pub use ::asset_id::AssetId;
+pub use ::contract_id::ContractId;
+pub use ::identity::Identity;
 
 // `StorageKey` API
-use ::storage::storage_key::*;
+pub use ::storage::storage_key::*;
 
 // Collections
-use ::storage::storage_map::*;
-use ::vec::Vec;
+pub use ::storage::storage_map::*;
+pub use ::vec::{Vec, VecIter};
 
 // Error handling
-use ::assert::{assert, assert_eq};
-use ::option::Option::{self, *};
-use ::result::Result::{self, *};
-use ::revert::{require, revert};
+pub use ::assert::{assert, assert_eq, assert_ne};
+pub use ::option::Option::{self, *};
+pub use ::result::Result::{self, *};
+pub use ::revert::{require, revert, revert_with_log};
 
 // Convert
-use ::convert::From;
+pub use ::convert::From;
+pub use ::clone::Clone;
 
 // Primitive conversions
-use ::primitive_conversions::*;
+pub use ::primitive_conversions::{b256::*, str::*, u16::*, u256::*, u32::*, u64::*, u8::*};
 
 // Logging
-use ::logging::log;
+pub use ::logging::log;
 
 // Auth
-use ::auth::msg_sender;
+pub use ::auth::msg_sender;
+
+// Math
+pub use ::math::*;

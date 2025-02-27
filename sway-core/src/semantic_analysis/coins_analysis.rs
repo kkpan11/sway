@@ -1,39 +1,39 @@
 use sway_error::handler::Handler;
 
-use crate::{decl_engine::DeclEngine, language::ty, Namespace};
+use crate::language::ty;
+
+use super::TypeCheckContext;
 
 // This analysis checks if an expression is known statically to evaluate
 // to a non-zero value at runtime.
 // It's intended to be used in the payability analysis to check if a non-payable
 // method gets called with a non-zero amount of `coins`
-pub fn possibly_nonzero_u64_expression(
-    namespace: &Namespace,
-    decl_engine: &DeclEngine,
-    expr: &ty::TyExpression,
-) -> bool {
+pub fn possibly_nonzero_u64_expression(ctx: &TypeCheckContext, expr: &ty::TyExpression) -> bool {
     use ty::TyExpressionVariant::*;
     match &expr.expression {
         Literal(crate::language::Literal::U64(value)) => *value != 0,
         Literal(crate::language::Literal::Numeric(value)) => *value != 0,
         // not a u64 literal, hence we return true to be on the safe side
         Literal(_) => true,
-        ConstantExpression { const_decl, .. } => match &const_decl.value {
-            Some(expr) => possibly_nonzero_u64_expression(namespace, decl_engine, expr),
+        ConstantExpression { decl, .. } => match &decl.value {
+            Some(expr) => possibly_nonzero_u64_expression(ctx, expr),
+            None => false,
+        },
+        ConfigurableExpression { decl, .. } => match &decl.value {
+            Some(expr) => possibly_nonzero_u64_expression(ctx, expr),
             None => false,
         },
         VariableExpression { name, .. } => {
-            match namespace.resolve_symbol(&Handler::default(), name).ok() {
+            match ctx.resolve_symbol(&Handler::default(), name).ok() {
                 Some(ty_decl) => {
                     match ty_decl {
                         ty::TyDecl::VariableDecl(var_decl) => {
-                            possibly_nonzero_u64_expression(namespace, decl_engine, &var_decl.body)
+                            possibly_nonzero_u64_expression(ctx, &var_decl.body)
                         }
                         ty::TyDecl::ConstantDecl(ty::ConstantDecl { decl_id, .. }) => {
-                            let const_decl = decl_engine.get_constant(decl_id);
-                            match const_decl.value {
-                                Some(value) => {
-                                    possibly_nonzero_u64_expression(namespace, decl_engine, &value)
-                                }
+                            let const_decl = ctx.engines.de().get_constant(&decl_id);
+                            match &const_decl.value {
+                                Some(value) => possibly_nonzero_u64_expression(ctx, value),
                                 None => true,
                             }
                         }
@@ -61,12 +61,14 @@ pub fn possibly_nonzero_u64_expression(
         | StructFieldAccess { .. }
         | TupleElemAccess { .. }
         | StorageAccess(_)
-        | WhileLoop { .. } => true,
+        | WhileLoop { .. }
+        | ForLoop { .. } => true,
         // The following expression variants are unreachable, because of the type system
         // but we still consider these as non-zero to be on the safe side
         LazyOperator { .. }
         | Tuple { .. }
-        | Array { .. }
+        | ArrayExplicit { .. }
+        | ArrayRepeat { .. }
         | StructExpression { .. }
         | FunctionParameter
         | EnumInstantiation { .. }
@@ -78,6 +80,9 @@ pub fn possibly_nonzero_u64_expression(
         | Break
         | Continue
         | Reassignment(_)
-        | Return(_) => true,
+        | ImplicitReturn(_)
+        | Return(_)
+        | Ref(_)
+        | Deref(_) => true,
     }
 }

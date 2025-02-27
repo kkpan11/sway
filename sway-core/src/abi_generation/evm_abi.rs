@@ -2,56 +2,40 @@ use sway_types::integer_bits::IntegerBits;
 
 use crate::{
     asm_generation::EvmAbiResult,
-    decl_engine::DeclEngine,
+    decl_engine::DeclId,
     language::ty::{TyFunctionDecl, TyProgram, TyProgramKind},
-    Engines, TypeArgument, TypeEngine, TypeId, TypeInfo,
+    Engines, TypeArgument, TypeId, TypeInfo,
 };
 
 pub fn generate_abi_program(program: &TyProgram, engines: &Engines) -> EvmAbiResult {
-    let type_engine = engines.te();
-    let decl_engine = engines.de();
     match &program.kind {
         TyProgramKind::Contract { abi_entries, .. } => abi_entries
             .iter()
-            .map(|x| generate_abi_function(x, type_engine, decl_engine))
+            .map(|x| generate_abi_function(x, engines))
             .collect(),
-        TyProgramKind::Script { main_function, .. }
-        | TyProgramKind::Predicate { main_function, .. } => {
-            vec![generate_abi_function(
-                main_function,
-                type_engine,
-                decl_engine,
-            )]
+        TyProgramKind::Script { entry_function, .. }
+        | TyProgramKind::Predicate { entry_function, .. } => {
+            vec![generate_abi_function(entry_function, engines)]
         }
         _ => vec![],
     }
 }
 
 /// Gives back a string that represents the type, considering what it resolves to
-fn get_type_str(
-    type_id: &TypeId,
-    type_engine: &TypeEngine,
-    decl_engine: &DeclEngine,
-    resolved_type_id: TypeId,
-) -> String {
-    if type_id.is_generic_parameter(type_engine, decl_engine, resolved_type_id) {
-        format!(
-            "generic {}",
-            abi_str(&type_engine.get(*type_id), type_engine, decl_engine)
-        )
+fn get_type_str(type_id: &TypeId, engines: &Engines, resolved_type_id: TypeId) -> String {
+    let type_engine = engines.te();
+    if type_id.is_generic_parameter(engines, resolved_type_id) {
+        format!("generic {}", abi_str(&type_engine.get(*type_id), engines))
     } else {
-        match (type_engine.get(*type_id), type_engine.get(resolved_type_id)) {
+        match (
+            &*type_engine.get(*type_id),
+            &*type_engine.get(resolved_type_id),
+        ) {
             (TypeInfo::Custom { .. }, TypeInfo::Struct { .. }) => {
-                format!(
-                    "struct {}",
-                    abi_str(&type_engine.get(*type_id), type_engine, decl_engine)
-                )
+                format!("struct {}", abi_str(&type_engine.get(*type_id), engines))
             }
             (TypeInfo::Custom { .. }, TypeInfo::Enum { .. }) => {
-                format!(
-                    "enum {}",
-                    abi_str(&type_engine.get(*type_id), type_engine, decl_engine)
-                )
+                format!("enum {}", abi_str(&type_engine.get(*type_id), engines))
             }
             (TypeInfo::Tuple(fields), TypeInfo::Tuple(resolved_fields)) => {
                 assert_eq!(fields.len(), resolved_fields.len());
@@ -61,29 +45,33 @@ fn get_type_str(
                     .collect::<Vec<String>>();
                 format!("({})", field_strs.join(", "))
             }
-            (TypeInfo::Array(_, count), TypeInfo::Array(_, resolved_count)) => {
-                assert_eq!(count.val(), resolved_count.val());
-                format!("[_; {}]", count.val())
+            (TypeInfo::Array(_, length), TypeInfo::Array(_, resolved_length)) => {
+                assert_eq!(
+                    length.as_literal_val().unwrap(),
+                    resolved_length.as_literal_val().unwrap()
+                );
+                format!("[_; {:?}]", engines.help_out(length))
             }
+            (TypeInfo::Slice(_), TypeInfo::Slice(_)) => "__slice[_]".into(),
             (TypeInfo::Custom { .. }, _) => {
-                format!(
-                    "generic {}",
-                    abi_str(&type_engine.get(*type_id), type_engine, decl_engine)
-                )
+                format!("generic {}", abi_str(&type_engine.get(*type_id), engines))
             }
-            _ => abi_str(&type_engine.get(*type_id), type_engine, decl_engine),
+            _ => abi_str(&type_engine.get(*type_id), engines),
         }
     }
 }
 
-pub fn abi_str(type_info: &TypeInfo, type_engine: &TypeEngine, decl_engine: &DeclEngine) -> String {
+pub fn abi_str(type_info: &TypeInfo, engines: &Engines) -> String {
     use TypeInfo::*;
+    let decl_engine = engines.de();
     match type_info {
         Unknown => "unknown".into(),
+        Never => "never".into(),
         UnknownGeneric { name, .. } => name.to_string(),
         Placeholder(_) => "_".to_string(),
         TypeParam(n) => format!("typeparam({n})"),
-        Str(x) => format!("str[{}]", x.val()),
+        StringSlice => "str".into(),
+        StringArray(x) => format!("str[{}]", x.val()),
         UnsignedInteger(x) => match x {
             IntegerBits::Eight => "uint8",
             IntegerBits::Sixteen => "uint16",
@@ -93,19 +81,29 @@ pub fn abi_str(type_info: &TypeInfo, type_engine: &TypeEngine, decl_engine: &Dec
         }
         .into(),
         Boolean => "bool".into(),
-        Custom { call_path, .. } => call_path.suffix.to_string(),
+        Custom {
+            qualified_call_path: call_path,
+            ..
+        } => call_path.call_path.suffix.to_string(),
         Tuple(fields) => {
             let field_strs = fields
                 .iter()
-                .map(|field| abi_str_type_arg(field, type_engine, decl_engine))
+                .map(|field| abi_str_type_arg(field, engines))
                 .collect::<Vec<String>>();
             format!("({})", field_strs.join(", "))
         }
-        SelfType => "Self".into(),
         B256 => "uint256".into(),
         Numeric => "u64".into(), // u64 is the default
         Contract => "contract".into(),
         ErrorRecovery(_) => "unknown due to error".into(),
+        UntypedEnum(decl_id) => {
+            let decl = engines.pe().get_enum(decl_id);
+            format!("untyped enum {}", decl.name)
+        }
+        UntypedStruct(decl_id) => {
+            let decl = engines.pe().get_struct(decl_id);
+            format!("untyped struct {}", decl.name)
+        }
         Enum(decl_ref) => {
             let decl = decl_engine.get_enum(decl_ref);
             format!("enum {}", decl.call_path.suffix)
@@ -119,32 +117,45 @@ pub fn abi_str(type_info: &TypeInfo, type_engine: &TypeEngine, decl_engine: &Dec
         }
         Array(elem_ty, length) => {
             format!(
-                "{}[{}]",
-                abi_str_type_arg(elem_ty, type_engine, decl_engine),
-                length.val()
+                "{}[{:?}]",
+                abi_str_type_arg(elem_ty, engines),
+                engines.help_out(length),
             )
         }
-        Storage { .. } => "contract storage".into(),
         RawUntypedPtr => "raw untyped ptr".into(),
         RawUntypedSlice => "raw untyped slice".into(),
         Ptr(ty) => {
-            format!("__ptr {}", abi_str_type_arg(ty, type_engine, decl_engine))
+            format!("__ptr {}", abi_str_type_arg(ty, engines))
         }
         Slice(ty) => {
-            format!("__slice {}", abi_str_type_arg(ty, type_engine, decl_engine))
+            format!("__slice {}", abi_str_type_arg(ty, engines))
         }
-        Alias { ty, .. } => abi_str_type_arg(ty, type_engine, decl_engine),
+        Alias { ty, .. } => abi_str_type_arg(ty, engines),
+        TraitType {
+            name,
+            trait_type_id: _,
+        } => format!("trait type {}", name),
+        Ref {
+            to_mutable_value,
+            referenced_type,
+        } => {
+            format!(
+                "__ref {}{}", // TODO-IG: No references in ABIs according to the RFC. Or we want to have them?
+                if *to_mutable_value { "mut " } else { "" },
+                abi_str_type_arg(referenced_type, engines)
+            )
+        }
     }
 }
 
-pub fn abi_param_type(
-    type_info: &TypeInfo,
-    type_engine: &TypeEngine,
-    decl_engine: &DeclEngine,
-) -> ethabi::ParamType {
+pub fn abi_param_type(type_info: &TypeInfo, engines: &Engines) -> ethabi::ParamType {
     use TypeInfo::*;
+    let type_engine = engines.te();
+    let decl_engine = engines.de();
     match type_info {
-        Str(x) => ethabi::ParamType::FixedArray(Box::new(ethabi::ParamType::String), x.val()),
+        StringArray(x) => {
+            ethabi::ParamType::FixedArray(Box::new(ethabi::ParamType::String), x.val())
+        }
         UnsignedInteger(x) => match x {
             IntegerBits::Eight => ethabi::ParamType::Uint(8),
             IntegerBits::Sixteen => ethabi::ParamType::Uint(16),
@@ -159,7 +170,7 @@ pub fn abi_param_type(
         Tuple(fields) => ethabi::ParamType::Tuple(
             fields
                 .iter()
-                .map(|f| abi_param_type(&type_engine.get(f.type_id), type_engine, decl_engine))
+                .map(|f| abi_param_type(&type_engine.get(f.type_id), engines))
                 .collect::<Vec<ethabi::ParamType>>(),
         ),
         Struct(decl_ref) => {
@@ -167,30 +178,24 @@ pub fn abi_param_type(
             ethabi::ParamType::Tuple(
                 decl.fields
                     .iter()
-                    .map(|f| {
-                        abi_param_type(
-                            &type_engine.get(f.type_argument.type_id),
-                            type_engine,
-                            decl_engine,
-                        )
-                    })
+                    .map(|f| abi_param_type(&type_engine.get(f.type_argument.type_id), engines))
                     .collect::<Vec<ethabi::ParamType>>(),
             )
         }
         Array(elem_ty, ..) => ethabi::ParamType::Array(Box::new(abi_param_type(
             &type_engine.get(elem_ty.type_id),
-            type_engine,
-            decl_engine,
+            engines,
         ))),
         _ => panic!("cannot convert type to Solidity ABI param type: {type_info:?}",),
     }
 }
 
 fn generate_abi_function(
-    fn_decl: &TyFunctionDecl,
-    type_engine: &TypeEngine,
-    decl_engine: &DeclEngine,
+    fn_decl_id: &DeclId<TyFunctionDecl>,
+    engines: &Engines,
 ) -> ethabi::operation::Operation {
+    let decl_engine = engines.de();
+    let fn_decl = decl_engine.get_function(fn_decl_id);
     // A list of all `ethabi::Param`s needed for inputs
     let input_types = fn_decl
         .parameters
@@ -200,8 +205,7 @@ fn generate_abi_function(
             kind: ethabi::ParamType::Address,
             internal_type: Some(get_type_str(
                 &x.type_argument.type_id,
-                type_engine,
-                decl_engine,
+                engines,
                 x.type_argument.type_id,
             )),
         })
@@ -213,8 +217,7 @@ fn generate_abi_function(
         kind: ethabi::ParamType::Address,
         internal_type: Some(get_type_str(
             &fn_decl.return_type.type_id,
-            type_engine,
-            decl_engine,
+            engines,
             fn_decl.return_type.type_id,
         )),
     };
@@ -230,10 +233,6 @@ fn generate_abi_function(
     })
 }
 
-fn abi_str_type_arg(
-    type_arg: &TypeArgument,
-    type_engine: &TypeEngine,
-    decl_engine: &DeclEngine,
-) -> String {
-    abi_str(&type_engine.get(type_arg.type_id), type_engine, decl_engine)
+fn abi_str_type_arg(type_arg: &TypeArgument, engines: &Engines) -> String {
+    abi_str(&engines.te().get(type_arg.type_id), engines)
 }

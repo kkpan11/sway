@@ -3,8 +3,11 @@ use crate::{
     utils::map::byte_span::{ByteSpan, LeafSpans},
 };
 use std::fmt::Write;
-use sway_ast::{Statement, StatementLet};
-use sway_types::Spanned;
+use sway_ast::{
+    keywords::{ColonToken, EqToken, Keyword, LetToken, SemicolonToken, Token},
+    Expr, Parens, Punctuated, Statement, StatementLet,
+};
+use sway_types::{Span, Spanned};
 
 impl Format for Statement {
     fn format(
@@ -16,6 +19,56 @@ impl Format for Statement {
         format_statement(self, formatted_code, formatter)?;
 
         Ok(())
+    }
+}
+
+/// Remove arguments from the expression if the expression is a method call if
+/// the method is a simple two path call (foo.bar()). This is needed because in
+/// method calls of two parts they are never broke into multiple lines.
+/// Arguments however can be broken into multiple lines, and that is handled
+/// by `write_function_call_arguments`
+fn remove_arguments_from_expr(expr: Expr) -> Expr {
+    match expr {
+        Expr::MethodCall {
+            target,
+            dot_token,
+            path_seg,
+            contract_args_opt,
+            args,
+        } => {
+            let is_simple_call = matches!(*target, Expr::Path(_));
+            let target = remove_arguments_from_expr(*target);
+            Expr::MethodCall {
+                target: Box::new(target),
+                dot_token,
+                path_seg,
+                contract_args_opt,
+                args: if is_simple_call {
+                    Parens::new(
+                        Punctuated {
+                            value_separator_pairs: vec![],
+                            final_value_opt: None,
+                        },
+                        Span::dummy(),
+                    )
+                } else {
+                    args
+                },
+            }
+        }
+        Expr::FieldProjection {
+            target,
+            dot_token,
+            name,
+        } => {
+            let target = remove_arguments_from_expr(*target);
+            Expr::FieldProjection {
+                target: Box::new(target),
+                dot_token,
+                name,
+            }
+        }
+        _ => expr,
     }
 }
 
@@ -31,17 +84,52 @@ fn format_statement(
             expr,
             semicolon_token_opt,
         } => {
-            expr.format(formatted_code, formatter)?;
-            if formatted_code.ends_with('\n') {
-                formatted_code.pop();
-            }
-            if let Some(semicolon) = semicolon_token_opt {
-                if formatter.shape.code_line.line_style == LineStyle::Inline {
-                    write!(formatted_code, "{}", semicolon.span().as_str())?;
+            let mut temp_expr = FormattedCode::new();
+
+            remove_arguments_from_expr(expr.clone()).format(&mut temp_expr, formatter)?;
+            if temp_expr.len() > formatter.shape.width_heuristics.chain_width {
+                let update_expr_new_line = if !matches!(
+                    expr,
+                    Expr::MethodCall { .. }
+                        | Expr::FuncApp { func: _, args: _ }
+                        | Expr::If(_)
+                        | Expr::While {
+                            while_token: _,
+                            condition: _,
+                            block: _
+                        }
+                ) {
+                    // Method calls, If, While should not tamper with the
+                    // expr_new_line because that would be inherited for all
+                    // statements. That should be applied at the lowest level
+                    // possible (ideally at the expression level)
+                    formatter.shape.code_line.expr_new_line
+                } else if formatter.shape.code_line.expr_new_line {
+                    // already enabled
+                    true
                 } else {
-                    writeln!(formatted_code, "{}", semicolon.span().as_str())?;
+                    formatter.shape.code_line.update_expr_new_line(true);
+                    false
+                };
+                // reformat the expression adding a break
+                expr.format(formatted_code, formatter)?;
+                formatter
+                    .shape
+                    .code_line
+                    .update_expr_new_line(update_expr_new_line);
+            } else {
+                expr.format(formatted_code, formatter)?;
+            }
+            if semicolon_token_opt.is_some() {
+                if formatter.shape.code_line.line_style == LineStyle::Inline {
+                    write!(formatted_code, "{}", SemicolonToken::AS_STR)?;
+                } else {
+                    writeln!(formatted_code, "{}", SemicolonToken::AS_STR)?;
                 }
             }
+        }
+        Statement::Error(_, _) => {
+            return Err(FormatterError::SyntaxError);
         }
     }
 
@@ -55,24 +143,24 @@ impl Format for StatementLet {
         formatter: &mut Formatter,
     ) -> Result<(), FormatterError> {
         // `let `
-        write!(formatted_code, "{} ", self.let_token.span().as_str())?;
+        write!(formatted_code, "{} ", LetToken::AS_STR)?;
         // pattern
         self.pattern.format(formatted_code, formatter)?;
         // `: Ty`
-        if let Some(ty) = &self.ty_opt {
-            write!(formatted_code, "{} ", ty.0.span().as_str())?;
-            ty.1.format(formatted_code, formatter)?;
+        if let Some((_colon_token, ty)) = &self.ty_opt {
+            write!(formatted_code, "{} ", ColonToken::AS_STR)?;
+            ty.format(formatted_code, formatter)?;
         }
         // ` = `
-        write!(formatted_code, " {} ", self.eq_token.span().as_str())?;
+        write!(formatted_code, " {} ", EqToken::AS_STR)?;
         // expr
         self.expr.format(formatted_code, formatter)?;
         if formatter.shape.code_line.line_style == LineStyle::Inline {
             // `;`
-            write!(formatted_code, "{}", self.semicolon_token.span().as_str())?;
+            write!(formatted_code, "{}", SemicolonToken::AS_STR)?;
         } else {
             // `;\n`
-            writeln!(formatted_code, "{}", self.semicolon_token.span().as_str())?;
+            writeln!(formatted_code, "{}", SemicolonToken::AS_STR)?;
         }
 
         Ok(())
@@ -93,6 +181,9 @@ impl LeafSpans for Statement {
                     collected_spans.push(ByteSpan::from(semicolon_token.span()));
                 }
                 collected_spans
+            }
+            Statement::Error(spans, _) => {
+                vec![sway_types::Span::join_all(spans.iter().cloned()).into()]
             }
         }
     }

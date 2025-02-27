@@ -1,19 +1,21 @@
-use std::ops::{BitAnd, BitOr, BitXor};
+use std::{
+    io::Read,
+    ops::{BitAnd, BitOr, BitXor, Not, Rem},
+};
 
 use crate::{
-    asm_generation::from_ir::{ir_type_size_in_bytes, ir_type_str_size_in_bytes},
     engine_threading::*,
     language::{
         ty::{self, TyConstantDecl, TyIntrinsicFunctionKind},
-        CallPath,
+        CallPath, Literal,
     },
     metadata::MetadataManager,
     semantic_analysis::*,
-    UnifyCheck,
+    TypeInfo, UnifyCheck,
 };
 
 use super::{
-    convert::{convert_literal_to_constant, convert_resolved_typeid},
+    convert::{convert_literal_to_constant, convert_resolved_type_id},
     function::FnCompiler,
     types::*,
 };
@@ -21,18 +23,18 @@ use super::{
 use sway_ast::Intrinsic;
 use sway_error::error::CompileError;
 use sway_ir::{
-    constant::{Constant, ConstantValue},
+    constant::{ConstantContent, ConstantValue},
     context::Context,
-    metadata::combine as md_combine,
     module::Module,
     value::Value,
-    Instruction, Type,
+    Constant, InstOp, Instruction, Type, TypeContent,
 };
-use sway_types::{ident::Ident, span::Spanned, Span};
+use sway_types::{ident::Ident, integer_bits::IntegerBits, span::Spanned, Named, Span};
 use sway_utils::mapped_stack::MappedStack;
 
+#[derive(Debug)]
 enum ConstEvalError {
-    CompileError(CompileError),
+    CompileError,
     CannotBeEvaluatedToConst {
         // This is not used at the moment because we do not give detailed description of why a
         // const eval failed.
@@ -70,19 +72,25 @@ pub(crate) fn compile_const_decl(
         {
             found_local = true;
             if let Some(constant) = local_var.get_initializer(env.context) {
-                return Ok(Some(Value::new_constant(env.context, constant.clone())));
+                return Ok(Some(Value::new_constant(env.context, *constant)));
             }
 
             // Check if a constant was stored to a local variable in the current block.
             let mut stored_const_opt: Option<&Constant> = None;
             for ins in fn_compiler.current_block.instruction_iter(env.context) {
-                if let Some(Instruction::Store {
-                    dst_val_ptr: dst_val,
-                    stored_val,
+                if let Some(Instruction {
+                    op:
+                        InstOp::Store {
+                            dst_val_ptr: dst_val,
+                            stored_val,
+                        },
+                    ..
                 }) = ins.get_instruction(env.context)
                 {
-                    if let Some(Instruction::GetLocal(store_dst_var)) =
-                        dst_val.get_instruction(env.context)
+                    if let Some(Instruction {
+                        op: InstOp::GetLocal(store_dst_var),
+                        ..
+                    }) = dst_val.get_instruction(env.context)
                     {
                         if &local_var == store_dst_var {
                             stored_const_opt = stored_val.get_constant(env.context);
@@ -91,7 +99,7 @@ pub(crate) fn compile_const_decl(
                 }
             }
             if let Some(constant) = stored_const_opt {
-                return Ok(Some(Value::new_constant(env.context, constant.clone())));
+                return Ok(Some(Value::new_constant(env.context, *constant)));
             }
         }
 
@@ -111,39 +119,36 @@ pub(crate) fn compile_const_decl(
     match (
         env.module
             .get_global_constant(env.context, &call_path.as_vec_string()),
-        env.module
-            .get_global_configurable(env.context, &call_path.as_vec_string()),
         env.module_ns,
     ) {
-        (Some(const_val), _, _) => Ok(Some(const_val)),
-        (_, Some(config_val), _) => Ok(Some(config_val)),
-        (None, None, Some(module_ns)) => {
+        (Some(const_val), _) => Ok(Some(const_val)),
+        (None, Some(module_ns)) => {
             // See if we it's a global const and whether we can compile it *now*.
-            let decl = module_ns.check_symbol(&call_path.suffix);
+            let decl = module_ns.root_items().check_symbol(&call_path.suffix);
             let const_decl = match const_decl {
                 Some(decl) => Some(decl),
                 None => None,
             };
+
             let const_decl = match decl {
-                Ok(decl) => match decl {
+                Ok(decl) => match decl.expect_typed() {
                     ty::TyDecl::ConstantDecl(ty::ConstantDecl { decl_id, .. }) => {
-                        Some(env.engines.de().get_constant(decl_id))
+                        Some((*env.engines.de().get_constant(&decl_id)).clone())
                     }
                     _otherwise => const_decl.cloned(),
                 },
                 Err(_) => const_decl.cloned(),
             };
+
             match const_decl {
                 Some(const_decl) => {
                     let ty::TyConstantDecl {
-                        call_path,
-                        value,
-                        is_configurable,
-                        ..
+                        call_path, value, ..
                     } = const_decl;
-                    if value.is_none() {
+
+                    let Some(value) = value else {
                         return Ok(None);
-                    }
+                    };
 
                     let const_val = compile_constant_expression(
                         env.engines,
@@ -153,23 +158,15 @@ pub(crate) fn compile_const_decl(
                         env.module_ns,
                         env.function_compiler,
                         &call_path,
-                        &value.unwrap(),
-                        is_configurable,
+                        &value,
                     )?;
 
-                    if !is_configurable {
-                        env.module.add_global_constant(
-                            env.context,
-                            call_path.as_vec_string().to_vec(),
-                            const_val,
-                        );
-                    } else {
-                        env.module.add_global_configurable(
-                            env.context,
-                            call_path.as_vec_string().to_vec(),
-                            const_val,
-                        );
-                    }
+                    env.module.add_global_constant(
+                        env.context,
+                        call_path.as_vec_string().to_vec(),
+                        const_val,
+                    );
+
                     Ok(Some(const_val))
                 }
                 None => Ok(None),
@@ -187,9 +184,8 @@ pub(super) fn compile_constant_expression(
     module: Module,
     module_ns: Option<&namespace::Module>,
     function_compiler: Option<&FnCompiler>,
-    call_path: &CallPath,
+    _call_path: &CallPath,
     const_expr: &ty::TyExpression,
-    is_configurable: bool,
 ) -> Result<Value, CompileError> {
     let span_id_idx = md_mgr.span_to_md(context, &const_expr.span);
 
@@ -203,14 +199,7 @@ pub(super) fn compile_constant_expression(
         const_expr,
     )?;
 
-    if !is_configurable {
-        Ok(Value::new_constant(context, constant_evaluated).add_metadatum(context, span_id_idx))
-    } else {
-        let config_const_name =
-            md_mgr.config_const_name_to_md(context, &std::rc::Rc::from(call_path.suffix.as_str()));
-        let metadata = md_combine(context, &span_id_idx, &config_const_name);
-        Ok(Value::new_configurable(context, constant_evaluated).add_metadatum(context, metadata))
-    }
+    Ok(Value::new_constant(context, constant_evaluated).add_metadatum(context, span_id_idx))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -237,9 +226,13 @@ pub(crate) fn compile_constant_expression_to_constant(
         // Special case functions because the span in `const_expr` is to the inlined function
         // definition, rather than the actual call site.
         ty::TyExpressionVariant::FunctionApplication { call_path, .. } => {
-            Err(CompileError::NonConstantDeclValue {
-                span: call_path.span(),
-            })
+            let span = call_path.span();
+            let span = if span.is_dummy() {
+                const_expr.span.clone()
+            } else {
+                span
+            };
+            Err(CompileError::NonConstantDeclValue { span })
         }
         _otherwise => Err(CompileError::NonConstantDeclValue {
             span: const_expr.span.clone(),
@@ -249,8 +242,44 @@ pub(crate) fn compile_constant_expression_to_constant(
 
     match const_eval_typed_expr(lookup, &mut known_consts, const_expr) {
         Ok(Some(constant)) => Ok(constant),
-        _ => err,
+        Ok(None) => err,
+        Err(_) => err,
     }
+}
+
+fn create_array_from_vec(
+    lookup: &mut LookupEnv,
+    elem_type: crate::TypeId,
+    element_typs: Vec<crate::TypeId>,
+    element_vals: Vec<Constant>,
+) -> Option<Constant> {
+    let te = lookup.engines.te();
+    assert!({
+        let unify_check = UnifyCheck::coercion(lookup.engines);
+        element_typs
+            .iter()
+            .all(|tid| unify_check.check(*tid, elem_type))
+    });
+
+    let arr = create_array_aggregate(
+        te,
+        lookup.engines.de(),
+        lookup.context,
+        elem_type,
+        element_typs.len().try_into().unwrap(),
+    )
+    .map_or(None, |array_ty| {
+        Some(ConstantContent::new_array(
+            lookup.context,
+            array_ty.get_array_elem_type(lookup.context).unwrap(),
+            element_vals
+                .iter()
+                .map(|f| f.get_content(lookup.context).clone())
+                .collect(),
+        ))
+    });
+
+    arr.map(|c| Constant::unique(lookup.context, c))
 }
 
 /// Given an environment mapping names to constants,
@@ -260,7 +289,20 @@ fn const_eval_typed_expr(
     known_consts: &mut MappedStack<Ident, Constant>,
     expr: &ty::TyExpression,
 ) -> Result<Option<Constant>, ConstEvalError> {
+    if let TypeInfo::ErrorRecovery(_) = &*lookup.engines.te().get(expr.return_type) {
+        return Err(ConstEvalError::CannotBeEvaluatedToConst {
+            span: expr.span.clone(),
+        });
+    }
+
     Ok(match &expr.expression {
+        ty::TyExpressionVariant::Literal(Literal::Numeric(n)) => {
+            let implied_lit = match &*lookup.engines.te().get(expr.return_type) {
+                TypeInfo::UnsignedInteger(IntegerBits::Eight) => Literal::U8(*n as u8),
+                _ => Literal::U64(*n),
+            };
+            Some(convert_literal_to_constant(lookup.context, &implied_lit))
+        }
         ty::TyExpressionVariant::Literal(l) => Some(convert_literal_to_constant(lookup.context, l)),
         ty::TyExpressionVariant::FunctionApplication {
             arguments,
@@ -299,27 +341,32 @@ fn const_eval_typed_expr(
 
             res?
         }
-        ty::TyExpressionVariant::ConstantExpression { const_decl, .. } => {
+        ty::TyExpressionVariant::ConstantExpression {
+            decl: const_decl, ..
+        } => {
             let call_path = &const_decl.call_path;
             let name = &call_path.suffix;
 
             match known_consts.get(name) {
                 // 1. Check if name/call_path is in known_consts.
-                Some(cvs) => Some(cvs.clone()),
+                Some(cvs) => Some(*cvs),
                 None => {
                     // 2. Check if name is a global constant.
                     (lookup.lookup)(lookup, call_path, &Some(*const_decl.clone()))
                         .ok()
                         .flatten()
-                        .and_then(|v| v.get_constant_or_configurable(lookup.context).cloned())
+                        .and_then(|v| v.get_constant(lookup.context).cloned())
                 }
             }
+        }
+        ty::TyExpressionVariant::ConfigurableExpression { span, .. } => {
+            return Err(ConstEvalError::CannotBeEvaluatedToConst { span: span.clone() });
         }
         ty::TyExpressionVariant::VariableExpression {
             name, call_path, ..
         } => match known_consts.get(name) {
             // 1. Check if name/call_path is in known_consts.
-            Some(cvs) => Some(cvs.clone()),
+            Some(cvs) => Some(*cvs),
             None => {
                 let call_path = match call_path {
                     Some(call_path) => call_path.clone(),
@@ -362,11 +409,16 @@ fn const_eval_typed_expr(
                 &field_typs,
             )
             .map_or(None, |struct_ty| {
-                Some(Constant::new_struct(
+                let c = ConstantContent::new_struct(
                     lookup.context,
                     struct_ty.get_field_types(lookup.context),
-                    field_vals,
-                ))
+                    field_vals
+                        .iter()
+                        .map(|fv| fv.get_content(lookup.context).clone())
+                        .collect(),
+                );
+                let c = Constant::unique(lookup.context, c);
+                Some(c)
             })
         }
         ty::TyExpressionVariant::Tuple { fields } => {
@@ -391,17 +443,22 @@ fn const_eval_typed_expr(
                 lookup.engines.te(),
                 lookup.engines.de(),
                 lookup.context,
-                field_typs,
+                &field_typs,
             )
             .map_or(None, |tuple_ty| {
-                Some(Constant::new_struct(
+                let c = ConstantContent::new_struct(
                     lookup.context,
                     tuple_ty.get_field_types(lookup.context),
-                    field_vals,
-                ))
+                    field_vals
+                        .iter()
+                        .map(|fv| fv.get_content(lookup.context).clone())
+                        .collect(),
+                );
+                let c = Constant::unique(lookup.context, c);
+                Some(c)
             })
         }
-        ty::TyExpressionVariant::Array {
+        ty::TyExpressionVariant::ArrayExplicit {
             elem_type,
             contents,
         } => {
@@ -422,29 +479,26 @@ fn const_eval_typed_expr(
             assert!(element_typs.len() == contents.len());
             assert!(element_vals.len() == contents.len());
 
-            let te = lookup.engines.te();
+            create_array_from_vec(lookup, *elem_type, element_typs, element_vals)
+        }
+        ty::TyExpressionVariant::ArrayRepeat {
+            elem_type,
+            value,
+            length,
+        } => {
+            let constant = const_eval_typed_expr(lookup, known_consts, value)?.unwrap();
+            let length = const_eval_typed_expr(lookup, known_consts, length)?
+                .unwrap()
+                .get_content(lookup.context)
+                .as_uint()
+                .unwrap() as usize;
+            let element_vals = (0..length).map(|_| constant).collect::<Vec<_>>();
+            let element_typs = (0..length).map(|_| value.return_type).collect::<Vec<_>>();
 
-            assert!({
-                let unify_check = UnifyCheck::coercion(lookup.engines);
-                element_typs
-                    .iter()
-                    .all(|tid| unify_check.check(*tid, *elem_type))
-            });
+            assert!(element_typs.len() == length);
+            assert!(element_vals.len() == length);
 
-            create_array_aggregate(
-                te,
-                lookup.engines.de(),
-                lookup.context,
-                *elem_type,
-                element_typs.len().try_into().unwrap(),
-            )
-            .map_or(None, |array_ty| {
-                Some(Constant::new_array(
-                    lookup.context,
-                    array_ty.get_array_elem_type(lookup.context).unwrap(),
-                    element_vals,
-                ))
-            })
+            create_array_from_vec(lookup, *elem_type, element_typs, element_vals)
         }
         ty::TyExpressionVariant::EnumInstantiation {
             enum_ref,
@@ -462,23 +516,25 @@ fn const_eval_typed_expr(
             );
 
             if let Ok(enum_ty) = aggregate {
-                let tag_value = Constant::new_uint(lookup.context, 64, *tag as u64);
-                let mut fields: Vec<Constant> = vec![tag_value];
+                let tag_value = ConstantContent::new_uint(lookup.context, 64, *tag as u64);
+                let mut fields: Vec<ConstantContent> = vec![tag_value];
 
                 match contents {
-                    None => fields.push(Constant::new_unit(lookup.context)),
+                    None => fields.push(ConstantContent::new_unit(lookup.context)),
                     Some(subexpr) => match const_eval_typed_expr(lookup, known_consts, subexpr)? {
-                        Some(constant) => fields.push(constant),
+                        Some(constant) => fields.push(constant.get_content(lookup.context).clone()),
                         None => {
                             return Err(ConstEvalError::CannotBeEvaluatedToConst {
                                 span: variant_instantiation_span.clone(),
-                            })
+                            });
                         }
                     },
                 }
 
                 let fields_tys = enum_ty.get_field_types(lookup.context);
-                Some(Constant::new_struct(lookup.context, fields_tys, fields))
+                let c = ConstantContent::new_struct(lookup.context, fields_tys, fields);
+                let c = Constant::unique(lookup.context, c);
+                Some(c)
             } else {
                 return Err(ConstEvalError::CannotBeEvaluatedToConst {
                     span: expr.span.clone(),
@@ -490,8 +546,10 @@ fn const_eval_typed_expr(
             field_to_access,
             resolved_type_of_parent,
             ..
-        } => match const_eval_typed_expr(lookup, known_consts, prefix)? {
-            Some(Constant {
+        } => match const_eval_typed_expr(lookup, known_consts, prefix)?
+            .map(|c| c.get_content(lookup.context).clone())
+        {
+            Some(ConstantContent {
                 value: ConstantValue::Struct(fields),
                 ..
             }) => {
@@ -507,29 +565,48 @@ fn const_eval_typed_expr(
                 .and_then(|(_struct_name, field_idx_and_type_opt)| {
                     field_idx_and_type_opt.map(|(field_idx, _field_type)| field_idx)
                 })
-                .and_then(|field_idx| fields.get(field_idx as usize).cloned())
+                .and_then(|field_idx| {
+                    fields
+                        .get(field_idx as usize)
+                        .cloned()
+                        .map(|c| Constant::unique(lookup.context, c))
+                })
             }
             _ => {
                 return Err(ConstEvalError::CannotBeEvaluatedToConst {
                     span: expr.span.clone(),
-                })
+                });
             }
         },
         ty::TyExpressionVariant::TupleElemAccess {
             prefix,
             elem_to_access_num,
             ..
-        } => match const_eval_typed_expr(lookup, known_consts, prefix)? {
-            Some(Constant {
+        } => match const_eval_typed_expr(lookup, known_consts, prefix)?
+            .map(|c| c.get_content(lookup.context))
+        {
+            Some(ConstantContent {
                 value: ConstantValue::Struct(fields),
                 ..
-            }) => fields.get(*elem_to_access_num).cloned(),
+            }) => fields
+                .get(*elem_to_access_num)
+                .cloned()
+                .map(|c| Constant::unique(lookup.context, c)),
             _ => {
                 return Err(ConstEvalError::CannotBeEvaluatedToConst {
                     span: expr.span.clone(),
-                })
+                });
             }
         },
+        ty::TyExpressionVariant::ImplicitReturn(e) => {
+            if let Ok(Some(constant)) = const_eval_typed_expr(lookup, known_consts, e) {
+                Some(constant)
+            } else {
+                return Err(ConstEvalError::CannotBeEvaluatedToConst {
+                    span: e.span.clone(),
+                });
+            }
+        }
         // we could allow non-local control flow in pure functions, but it would
         // require some more work and at this point it's not clear if it is too useful
         // for constant initializers -- the user can always refactor their pure functions
@@ -537,7 +614,7 @@ fn const_eval_typed_expr(
         ty::TyExpressionVariant::Return(exp) => {
             return Err(ConstEvalError::CannotBeEvaluatedToConst {
                 span: exp.span.clone(),
-            })
+            });
         }
         ty::TyExpressionVariant::MatchExp { desugared, .. } => {
             const_eval_typed_expr(lookup, known_consts, desugared)?
@@ -550,12 +627,14 @@ fn const_eval_typed_expr(
             then,
             r#else,
         } => {
-            match const_eval_typed_expr(lookup, known_consts, condition)? {
-                Some(Constant {
+            match const_eval_typed_expr(lookup, known_consts, condition)?
+                .map(|c| c.get_content(lookup.context))
+            {
+                Some(ConstantContent {
                     value: ConstantValue::Bool(cond),
                     ..
                 }) => {
-                    if cond {
+                    if *cond {
                         const_eval_typed_expr(lookup, known_consts, then)?
                     } else if let Some(r#else) = r#else {
                         const_eval_typed_expr(lookup, known_consts, r#else)?
@@ -569,7 +648,7 @@ fn const_eval_typed_expr(
                 _ => {
                     return Err(ConstEvalError::CannotBeEvaluatedToConst {
                         span: expr.span.clone(),
-                    })
+                    });
                 }
             }
         }
@@ -577,54 +656,139 @@ fn const_eval_typed_expr(
             const_eval_codeblock(lookup, known_consts, codeblock)?
         }
         ty::TyExpressionVariant::ArrayIndex { prefix, index } => {
-            let prefix = const_eval_typed_expr(lookup, known_consts, prefix)?;
-            let index = const_eval_typed_expr(lookup, known_consts, index)?;
+            let prefix = const_eval_typed_expr(lookup, known_consts, prefix)?
+                .map(|c| c.get_content(lookup.context).clone());
+            let index = const_eval_typed_expr(lookup, known_consts, index)?
+                .map(|c| c.get_content(lookup.context));
             match (prefix, index) {
                 (
-                    Some(Constant {
+                    Some(ConstantContent {
                         value: ConstantValue::Array(items),
                         ..
                     }),
-                    Some(Constant {
+                    Some(ConstantContent {
                         value: ConstantValue::Uint(index),
                         ..
                     }),
                 ) => {
                     let count = items.len() as u64;
-                    if index < count {
-                        Some(items[index as usize].clone())
+                    if *index < count {
+                        let c = Constant::unique(lookup.context, items[*index as usize].clone());
+                        Some(c)
                     } else {
-                        return Err(ConstEvalError::CompileError(
-                            CompileError::ArrayOutOfBounds {
-                                index,
-                                count,
-                                span: expr.span.clone(),
-                            },
-                        ));
+                        return Err(ConstEvalError::CompileError);
                     }
                 }
                 _ => {
                     return Err(ConstEvalError::CannotBeEvaluatedToConst {
                         span: expr.span.clone(),
-                    })
+                    });
                 }
             }
         }
-        ty::TyExpressionVariant::Reassignment(_)
-        | ty::TyExpressionVariant::FunctionParameter
+        ty::TyExpressionVariant::Ref(_) => {
+            return Err(ConstEvalError::CompileError);
+        }
+        // We support *__elem_at(...)
+        ty::TyExpressionVariant::Deref(expr) => {
+            let value = expr
+                .as_intrinsic()
+                .filter(|x| matches!(x.kind, Intrinsic::ElemAt))
+                .ok_or(ConstEvalError::CompileError)
+                .and_then(|kind| {
+                    const_eval_intrinsic(lookup, known_consts, kind)
+                        .map(|c| c.map(|c| c.get_content(lookup.context).clone()))
+                });
+            if let Ok(Some(ConstantContent {
+                value: ConstantValue::Reference(value),
+                ..
+            })) = value
+            {
+                let c = Constant::unique(lookup.context, *value.clone());
+                Some(c)
+            } else {
+                return Err(ConstEvalError::CompileError);
+            }
+        }
+        ty::TyExpressionVariant::EnumTag { exp } => {
+            let value = const_eval_typed_expr(lookup, known_consts, exp)?
+                .map(|x| x.get_content(lookup.context).value.clone());
+            if let Some(ConstantValue::Struct(fields)) = value {
+                Some(Constant::unique(lookup.context, fields[0].clone()))
+            } else {
+                return Err(ConstEvalError::CompileError);
+            }
+        }
+        ty::TyExpressionVariant::UnsafeDowncast { exp, .. } => {
+            let value = const_eval_typed_expr(lookup, known_consts, exp)?
+                .map(|x| x.get_content(lookup.context).value.clone());
+            if let Some(ConstantValue::Struct(fields)) = value {
+                Some(Constant::unique(lookup.context, fields[1].clone()))
+            } else {
+                return Err(ConstEvalError::CompileError);
+            }
+        }
+        ty::TyExpressionVariant::WhileLoop {
+            condition, body, ..
+        } => {
+            // Arbitrary limit of iterations to avoid infinite loops like
+            // while true {}
+            let mut limit = 1_000_000;
+
+            while limit >= 0 {
+                limit -= 1;
+
+                let condition = const_eval_typed_expr(lookup, known_consts, condition)?;
+                match condition.map(|x| x.get_content(lookup.context).value.clone()) {
+                    Some(ConstantValue::Bool(true)) => {
+                        // Break and continue are not implemented, so there is need for flow control here
+                        let _ = const_eval_codeblock(lookup, known_consts, body)?;
+                    }
+                    _ => break,
+                }
+            }
+
+            None
+        }
+        ty::TyExpressionVariant::Reassignment(r) => {
+            let rhs = const_eval_typed_expr(lookup, known_consts, &r.rhs)?.unwrap();
+            match &r.lhs {
+                ty::TyReassignmentTarget::ElementAccess {
+                    base_name, indices, ..
+                } => {
+                    if !indices.is_empty() {
+                        return Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: expr.span.clone(),
+                        });
+                    }
+                    if let Some(lhs) = known_consts.get_mut(base_name) {
+                        *lhs = rhs;
+                        return Ok(None);
+                    } else {
+                        return Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: expr.span.clone(),
+                        });
+                    }
+                }
+                ty::TyReassignmentTarget::Deref(_) => {
+                    return Err(ConstEvalError::CannotBeEvaluatedToConst {
+                        span: expr.span.clone(),
+                    });
+                }
+            }
+        }
+        ty::TyExpressionVariant::FunctionParameter
         | ty::TyExpressionVariant::AsmExpression { .. }
         | ty::TyExpressionVariant::LazyOperator { .. }
         | ty::TyExpressionVariant::AbiCast { .. }
         | ty::TyExpressionVariant::StorageAccess(_)
         | ty::TyExpressionVariant::AbiName(_)
-        | ty::TyExpressionVariant::EnumTag { .. }
-        | ty::TyExpressionVariant::UnsafeDowncast { .. }
         | ty::TyExpressionVariant::Break
         | ty::TyExpressionVariant::Continue
-        | ty::TyExpressionVariant::WhileLoop { .. } => {
+        | ty::TyExpressionVariant::ForLoop { .. } => {
             return Err(ConstEvalError::CannotBeEvaluatedToConst {
                 span: expr.span.clone(),
-            })
+            });
         }
     })
 }
@@ -651,7 +815,7 @@ fn const_eval_codeblock(
                     Ok(None)
                 } else {
                     Err(ConstEvalError::CannotBeEvaluatedToConst {
-                        span: decl.span().clone(),
+                        span: decl.span(lookup.engines).clone(),
                     })
                 }
             }
@@ -659,38 +823,44 @@ fn const_eval_codeblock(
                 let ty_const_decl = lookup.engines.de().get_constant(&const_decl.decl_id);
                 if let Some(constant) = ty_const_decl
                     .value
+                    .clone()
                     .and_then(|expr| const_eval_typed_expr(lookup, known_consts, &expr).ok())
                     .flatten()
                 {
-                    known_consts.push(const_decl.name.clone(), constant);
-                    bindings.push(const_decl.name.clone());
+                    known_consts.push(ty_const_decl.name().clone(), constant);
+                    bindings.push(ty_const_decl.name().clone());
                     Ok(None)
                 } else {
                     Err(ConstEvalError::CannotBeEvaluatedToConst {
-                        span: const_decl.decl_span.clone(),
+                        span: ty_const_decl.span.clone(),
                     })
                 }
             }
             ty::TyAstNodeContent::Declaration(_) => Ok(None),
-            ty::TyAstNodeContent::Expression(e) => {
-                if const_eval_typed_expr(lookup, known_consts, e).is_err() {
-                    Err(ConstEvalError::CannotBeEvaluatedToConst {
-                        span: e.span.clone(),
-                    })
-                } else {
-                    Ok(None)
+            ty::TyAstNodeContent::Expression(e) => match e.expression {
+                ty::TyExpressionVariant::ImplicitReturn(_) => {
+                    if let Ok(Some(constant)) = const_eval_typed_expr(lookup, known_consts, e) {
+                        Ok(Some(constant))
+                    } else {
+                        Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: e.span.clone(),
+                        })
+                    }
                 }
-            }
-            ty::TyAstNodeContent::ImplicitReturnExpression(e) => {
-                if let Ok(Some(constant)) = const_eval_typed_expr(lookup, known_consts, e) {
-                    Ok(Some(constant))
-                } else {
-                    Err(ConstEvalError::CannotBeEvaluatedToConst {
-                        span: e.span.clone(),
-                    })
+                _ => {
+                    if const_eval_typed_expr(lookup, known_consts, e).is_err() {
+                        Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: e.span.clone(),
+                        })
+                    } else {
+                        Ok(None)
+                    }
                 }
-            }
+            },
             ty::TyAstNodeContent::SideEffect(_) => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                span: ast_node.span.clone(),
+            }),
+            ty::TyAstNodeContent::Error(_, _) => Err(ConstEvalError::CannotBeEvaluatedToConst {
                 span: ast_node.span.clone(),
             }),
         };
@@ -706,6 +876,46 @@ fn const_eval_codeblock(
     }
 
     result
+}
+
+fn as_encode_buffer<'a>(context: &'a Context, buffer: &Constant) -> Option<(&'a Vec<u8>, u64)> {
+    match &buffer.get_content(context).value {
+        ConstantValue::Struct(fields) => {
+            let slice = match &fields[0].value {
+                ConstantValue::RawUntypedSlice(bytes) => bytes,
+                _ => return None,
+            };
+            let len = match fields[1].value {
+                ConstantValue::Uint(v) => v,
+                _ => return None,
+            };
+            Some((slice, len))
+        }
+        _ => None,
+    }
+}
+
+fn to_encode_buffer(lookup: &mut LookupEnv, bytes: Vec<u8>, len: u64) -> Constant {
+    let c = ConstantContent {
+        ty: Type::new_struct(
+            lookup.context,
+            vec![
+                Type::get_slice(lookup.context),
+                Type::get_uint64(lookup.context),
+            ],
+        ),
+        value: ConstantValue::Struct(vec![
+            ConstantContent {
+                ty: Type::get_slice(lookup.context),
+                value: ConstantValue::RawUntypedSlice(bytes),
+            },
+            ConstantContent {
+                ty: Type::get_uint64(lookup.context),
+                value: ConstantValue::Uint(len),
+            },
+        ]),
+    };
+    Constant::unique(lookup.context, c)
 }
 
 fn const_eval_intrinsic(
@@ -727,198 +937,728 @@ fn const_eval_intrinsic(
     assert!(args.len() == intrinsic.arguments.len());
 
     match intrinsic.kind {
-        sway_ast::Intrinsic::Add
-        | sway_ast::Intrinsic::Sub
-        | sway_ast::Intrinsic::Mul
-        | sway_ast::Intrinsic::Div
-        | sway_ast::Intrinsic::And
-        | sway_ast::Intrinsic::Or
-        | sway_ast::Intrinsic::Xor
-        | sway_ast::Intrinsic::Mod => {
-            let ty = args[0].ty;
+        Intrinsic::Add | Intrinsic::Sub | Intrinsic::Mul | Intrinsic::Div | Intrinsic::Mod => {
+            let ty = args[0].get_content(lookup.context).ty;
             assert!(
-                args.len() == 2 && ty.is_uint(lookup.context) && ty.eq(lookup.context, &args[1].ty)
-            );
-            let (ConstantValue::Uint(arg1), ConstantValue::Uint(ref arg2)) =
-                (&args[0].value, &args[1].value)
-            else {
-                panic!("Type checker allowed incorrect args to binary op");
-            };
-
-            // All arithmetic is done as if it were u64
-            let result = match intrinsic.kind {
-                Intrinsic::Add => arg1.checked_add(*arg2),
-                Intrinsic::Sub => arg1.checked_sub(*arg2),
-                Intrinsic::Mul => arg1.checked_mul(*arg2),
-                Intrinsic::Div => arg1.checked_div(*arg2),
-                Intrinsic::And => Some(arg1.bitand(arg2)),
-                Intrinsic::Or => Some(arg1.bitor(*arg2)),
-                Intrinsic::Xor => Some(arg1.bitxor(*arg2)),
-                Intrinsic::Mod => arg1.checked_rem(*arg2),
-                _ => unreachable!(),
-            };
-
-            match result {
-                Some(sum) => Ok(Some(Constant {
-                    ty,
-                    value: ConstantValue::Uint(sum),
-                })),
-                None => Err(ConstEvalError::CannotBeEvaluatedToConst {
-                    span: intrinsic.span.clone(),
-                }),
-            }
-        }
-        sway_ast::Intrinsic::Lsh | sway_ast::Intrinsic::Rsh => {
-            let ty = args[0].ty;
-            assert!(
-                args.len() == 2
-                    && ty.is_uint(lookup.context)
-                    && args[1].ty.is_uint64(lookup.context)
+                args.len() == 2 && ty.eq(lookup.context, &args[1].get_content(lookup.context).ty)
             );
 
-            let (ConstantValue::Uint(arg1), ConstantValue::Uint(ref arg2)) =
-                (&args[0].value, &args[1].value)
-            else {
-                panic!("Type checker allowed incorrect args to binary op");
-            };
+            use ConstantValue::*;
+            let c = match (
+                &args[0].get_content(lookup.context).value,
+                &args[1].get_content(lookup.context).value,
+            ) {
+                (Uint(arg1), Uint(ref arg2)) => {
+                    // All arithmetic is done as if it were u64
+                    let result = match intrinsic.kind {
+                        Intrinsic::Add => arg1.checked_add(*arg2),
+                        Intrinsic::Sub => arg1.checked_sub(*arg2),
+                        Intrinsic::Mul => arg1.checked_mul(*arg2),
+                        Intrinsic::Div => arg1.checked_div(*arg2),
+                        Intrinsic::Mod => arg1.checked_rem(*arg2),
+                        _ => unreachable!(),
+                    };
 
-            let result = match intrinsic.kind {
-                Intrinsic::Lsh => u32::try_from(*arg2)
-                    .ok()
-                    .and_then(|arg2| arg1.checked_shl(arg2)),
-                Intrinsic::Rsh => u32::try_from(*arg2)
-                    .ok()
-                    .and_then(|arg2| arg1.checked_shr(arg2)),
-                _ => unreachable!(),
-            };
+                    match result {
+                        Some(result) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::Uint(result),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                (U256(arg1), U256(arg2)) => {
+                    let result = match intrinsic.kind {
+                        Intrinsic::Add => arg1.checked_add(arg2),
+                        Intrinsic::Sub => arg1.checked_sub(arg2),
+                        Intrinsic::Mul => arg1.checked_mul(arg2),
+                        Intrinsic::Div => arg1.checked_div(arg2),
+                        Intrinsic::Mod => Some(arg1.rem(arg2)),
+                        _ => unreachable!(),
+                    };
 
-            match result {
-                Some(sum) => Ok(Some(Constant {
-                    ty,
-                    value: ConstantValue::Uint(sum),
-                })),
-                None => Err(ConstEvalError::CannotBeEvaluatedToConst {
-                    span: intrinsic.span.clone(),
-                }),
-            }
+                    match result {
+                        Some(result) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::U256(result),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                _ => {
+                    panic!("Type checker allowed incorrect args to binary op");
+                }
+            };
+            c.map(|c| c.map(|c| Constant::unique(lookup.context, c)))
         }
-        sway_ast::Intrinsic::SizeOfType => {
+        Intrinsic::And | Intrinsic::Or | Intrinsic::Xor => {
+            let ty = args[0].get_content(lookup.context).ty;
+            assert!(
+                args.len() == 2 && ty.eq(lookup.context, &args[1].get_content(lookup.context).ty)
+            );
+
+            use ConstantValue::*;
+            let c = match (
+                &args[0].get_content(lookup.context).value,
+                &args[1].get_content(lookup.context).value,
+            ) {
+                (Uint(arg1), Uint(ref arg2)) => {
+                    // All arithmetic is done as if it were u64
+                    let result = match intrinsic.kind {
+                        Intrinsic::And => Some(arg1.bitand(arg2)),
+                        Intrinsic::Or => Some(arg1.bitor(*arg2)),
+                        Intrinsic::Xor => Some(arg1.bitxor(*arg2)),
+                        _ => unreachable!(),
+                    };
+
+                    match result {
+                        Some(sum) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::Uint(sum),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                (U256(arg1), U256(arg2)) => {
+                    let result = match intrinsic.kind {
+                        Intrinsic::And => Some(arg1.bitand(arg2)),
+                        Intrinsic::Or => Some(arg1.bitor(arg2)),
+                        Intrinsic::Xor => Some(arg1.bitxor(arg2)),
+                        _ => unreachable!(),
+                    };
+
+                    match result {
+                        Some(sum) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::U256(sum),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                (B256(arg1), B256(arg2)) => {
+                    let result = match intrinsic.kind {
+                        Intrinsic::And => Some(arg1.bitand(arg2)),
+                        Intrinsic::Or => Some(arg1.bitor(arg2)),
+                        Intrinsic::Xor => Some(arg1.bitxor(arg2)),
+                        _ => unreachable!(),
+                    };
+
+                    match result {
+                        Some(result) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::B256(result),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                _ => {
+                    panic!("Type checker allowed incorrect args to binary op");
+                }
+            };
+            c.map(|c| c.map(|c| Constant::unique(lookup.context, c)))
+        }
+        Intrinsic::Lsh | Intrinsic::Rsh => {
+            assert!(args.len() == 2);
+            assert!(
+                args[0]
+                    .get_content(lookup.context)
+                    .ty
+                    .is_uint(lookup.context)
+                    || args[0]
+                        .get_content(lookup.context)
+                        .ty
+                        .is_b256(lookup.context)
+            );
+            assert!(args[1]
+                .get_content(lookup.context)
+                .ty
+                .is_uint64(lookup.context));
+
+            let ty = args[0].get_content(lookup.context).ty;
+
+            use ConstantValue::*;
+            let c = match (
+                &args[0].get_content(lookup.context).value,
+                &args[1].get_content(lookup.context).value,
+            ) {
+                (Uint(arg1), Uint(ref arg2)) => {
+                    let result = match intrinsic.kind {
+                        Intrinsic::Lsh => u32::try_from(*arg2)
+                            .ok()
+                            .and_then(|arg2| arg1.checked_shl(arg2)),
+                        Intrinsic::Rsh => u32::try_from(*arg2)
+                            .ok()
+                            .and_then(|arg2| arg1.checked_shr(arg2)),
+                        _ => unreachable!(),
+                    };
+
+                    match result {
+                        Some(sum) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::Uint(sum),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                (U256(arg1), Uint(ref arg2)) => {
+                    let result = match intrinsic.kind {
+                        Intrinsic::Lsh => arg1.checked_shl(arg2),
+                        Intrinsic::Rsh => Some(arg1.shr(arg2)),
+                        _ => unreachable!(),
+                    };
+
+                    match result {
+                        Some(value) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::U256(value),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                (B256(arg1), Uint(ref arg2)) => {
+                    let result = match intrinsic.kind {
+                        Intrinsic::Lsh => arg1.checked_shl(arg2),
+                        Intrinsic::Rsh => Some(arg1.shr(arg2)),
+                        _ => unreachable!(),
+                    };
+
+                    match result {
+                        Some(result) => Ok(Some(ConstantContent {
+                            ty,
+                            value: ConstantValue::B256(result),
+                        })),
+                        None => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                            span: intrinsic.span.clone(),
+                        }),
+                    }
+                }
+                _ => {
+                    panic!("Type checker allowed incorrect args to binary op");
+                }
+            };
+            c.map(|c| c.map(|c| Constant::unique(lookup.context, c)))
+        }
+        Intrinsic::SizeOfType => {
             let targ = &intrinsic.type_arguments[0];
-            let ir_type = convert_resolved_typeid(
+            let ir_type = convert_resolved_type_id(
                 lookup.engines.te(),
                 lookup.engines.de(),
                 lookup.context,
-                &targ.type_id,
+                targ.type_id,
                 &targ.span,
             )
-            .map_err(ConstEvalError::CompileError)?;
-            Ok(Some(Constant {
+            .map_err(|_| ConstEvalError::CompileError)?;
+            let c = ConstantContent {
                 ty: Type::get_uint64(lookup.context),
-                value: ConstantValue::Uint(ir_type_size_in_bytes(lookup.context, &ir_type)),
-            }))
+                value: ConstantValue::Uint(ir_type.size(lookup.context).in_bytes()),
+            };
+
+            Ok(Some(Constant::unique(lookup.context, c)))
         }
-        sway_ast::Intrinsic::SizeOfVal => {
+        Intrinsic::SizeOfVal => {
             let val = &intrinsic.arguments[0];
             let type_id = val.return_type;
-            let ir_type = convert_resolved_typeid(
+            let ir_type = convert_resolved_type_id(
                 lookup.engines.te(),
                 lookup.engines.de(),
                 lookup.context,
-                &type_id,
+                type_id,
                 &val.span,
             )
-            .map_err(ConstEvalError::CompileError)?;
-            Ok(Some(Constant {
+            .map_err(|_| ConstEvalError::CompileError)?;
+            let c = ConstantContent {
                 ty: Type::get_uint64(lookup.context),
-                value: ConstantValue::Uint(ir_type_size_in_bytes(lookup.context, &ir_type)),
-            }))
+                value: ConstantValue::Uint(ir_type.size(lookup.context).in_bytes()),
+            };
+            Ok(Some(Constant::unique(lookup.context, c)))
         }
-        sway_ast::Intrinsic::SizeOfStr => {
+        Intrinsic::SizeOfStr => {
             let targ = &intrinsic.type_arguments[0];
-            let ir_type = convert_resolved_typeid(
+            let ir_type = convert_resolved_type_id(
                 lookup.engines.te(),
                 lookup.engines.de(),
                 lookup.context,
-                &targ.type_id,
+                targ.type_id,
                 &targ.span,
             )
-            .map_err(ConstEvalError::CompileError)?;
-            Ok(Some(Constant {
+            .map_err(|_| ConstEvalError::CompileError)?;
+            let c = ConstantContent {
                 ty: Type::get_uint64(lookup.context),
-                value: ConstantValue::Uint(ir_type_str_size_in_bytes(lookup.context, &ir_type)),
-            }))
+                value: ConstantValue::Uint(
+                    ir_type.get_string_len(lookup.context).unwrap_or_default(),
+                ),
+            };
+            Ok(Some(Constant::unique(lookup.context, c)))
         }
-        sway_ast::Intrinsic::Eq => {
+        Intrinsic::AssertIsStrArray => {
+            let targ = &intrinsic.type_arguments[0];
+            let ir_type = convert_resolved_type_id(
+                lookup.engines.te(),
+                lookup.engines.de(),
+                lookup.context,
+                targ.type_id,
+                &targ.span,
+            )
+            .map_err(|_| ConstEvalError::CompileError)?;
+            match ir_type.get_content(lookup.context) {
+                TypeContent::StringSlice | TypeContent::StringArray(_) => {
+                    let c = ConstantContent {
+                        ty: Type::get_unit(lookup.context),
+                        value: ConstantValue::Unit,
+                    };
+                    Ok(Some(Constant::unique(lookup.context, c)))
+                }
+                _ => Err(ConstEvalError::CompileError),
+            }
+        }
+        Intrinsic::ToStrArray => {
+            assert!(args.len() == 1);
+            match &args[0].get_content(lookup.context).value {
+                ConstantValue::String(s) => {
+                    let c = ConstantContent::new_string(lookup.context, s.to_vec());
+                    Ok(Some(Constant::unique(lookup.context, c)))
+                }
+                _ => {
+                    unreachable!("Type checker allowed non string value for ToStrArray")
+                }
+            }
+        }
+        Intrinsic::Eq => {
             assert!(args.len() == 2);
-            Ok(Some(Constant {
+            let c = ConstantContent {
                 ty: Type::get_bool(lookup.context),
-                value: ConstantValue::Bool(args[0].eq(lookup.context, &args[1])),
-            }))
+                value: ConstantValue::Bool(args[0] == args[1]),
+            };
+            Ok(Some(Constant::unique(lookup.context, c)))
         }
-        sway_ast::Intrinsic::Gt => {
-            let (ConstantValue::Uint(val1), ConstantValue::Uint(val2)) =
-                (&args[0].value, &args[1].value)
-            else {
+        Intrinsic::Gt => match (
+            &args[0].get_content(lookup.context).value,
+            &args[1].get_content(lookup.context).value,
+        ) {
+            (ConstantValue::Uint(val1), ConstantValue::Uint(val2)) => {
+                let c = ConstantContent {
+                    ty: Type::get_bool(lookup.context),
+                    value: ConstantValue::Bool(val1 > val2),
+                };
+                Ok(Some(Constant::unique(lookup.context, c)))
+            }
+            (ConstantValue::U256(val1), ConstantValue::U256(val2)) => {
+                let c = ConstantContent {
+                    ty: Type::get_bool(lookup.context),
+                    value: ConstantValue::Bool(val1 > val2),
+                };
+                Ok(Some(Constant::unique(lookup.context, c)))
+            }
+            _ => {
                 unreachable!("Type checker allowed non integer value for GreaterThan")
-            };
-            Ok(Some(Constant {
-                ty: Type::get_bool(lookup.context),
-                value: ConstantValue::Bool(val1 > val2),
-            }))
-        }
-        sway_ast::Intrinsic::Lt => {
-            let (ConstantValue::Uint(val1), ConstantValue::Uint(val2)) =
-                (&args[0].value, &args[1].value)
-            else {
+            }
+        },
+        Intrinsic::Lt => match (
+            &args[0].get_content(lookup.context).value,
+            &args[1].get_content(lookup.context).value,
+        ) {
+            (ConstantValue::Uint(val1), ConstantValue::Uint(val2)) => {
+                let c = ConstantContent {
+                    ty: Type::get_bool(lookup.context),
+                    value: ConstantValue::Bool(val1 < val2),
+                };
+                Ok(Some(Constant::unique(lookup.context, c)))
+            }
+            (ConstantValue::U256(val1), ConstantValue::U256(val2)) => {
+                let c = ConstantContent {
+                    ty: Type::get_bool(lookup.context),
+                    value: ConstantValue::Bool(val1 < val2),
+                };
+                Ok(Some(Constant::unique(lookup.context, c)))
+            }
+            _ => {
                 unreachable!("Type checker allowed non integer value for LessThan")
-            };
-            Ok(Some(Constant {
-                ty: Type::get_bool(lookup.context),
-                value: ConstantValue::Bool(val1 < val2),
-            }))
-        }
-        sway_ast::Intrinsic::AddrOf
-        | sway_ast::Intrinsic::PtrAdd
-        | sway_ast::Intrinsic::PtrSub
-        | sway_ast::Intrinsic::IsReferenceType
-        | sway_ast::Intrinsic::IsStrType
-        | sway_ast::Intrinsic::Gtf
-        | sway_ast::Intrinsic::StateClear
-        | sway_ast::Intrinsic::StateLoadWord
-        | sway_ast::Intrinsic::StateStoreWord
-        | sway_ast::Intrinsic::StateLoadQuad
-        | sway_ast::Intrinsic::StateStoreQuad
-        | sway_ast::Intrinsic::Log
-        | sway_ast::Intrinsic::Revert
-        | sway_ast::Intrinsic::Smo => Err(ConstEvalError::CannotBeEvaluatedToConst {
+            }
+        },
+        Intrinsic::AddrOf
+        | Intrinsic::PtrAdd
+        | Intrinsic::PtrSub
+        | Intrinsic::IsReferenceType
+        | Intrinsic::IsStrArray
+        | Intrinsic::Gtf
+        | Intrinsic::StateClear
+        | Intrinsic::StateLoadWord
+        | Intrinsic::StateStoreWord
+        | Intrinsic::StateLoadQuad
+        | Intrinsic::StateStoreQuad
+        | Intrinsic::Log
+        | Intrinsic::Revert
+        | Intrinsic::JmpMem
+        | Intrinsic::Smo => Err(ConstEvalError::CannotBeEvaluatedToConst {
             span: intrinsic.span.clone(),
         }),
-        sway_ast::Intrinsic::Not => {
-            // Not works only with uint at the moment
+        Intrinsic::Not => {
+            // `not` works only with uint/u256/b256 at the moment
             // `bool` ops::Not implementation uses `__eq`.
 
-            assert!(args.len() == 1 && args[0].ty.is_uint(lookup.context));
+            assert!(args.len() == 1);
+            assert!(
+                args[0]
+                    .get_content(lookup.context)
+                    .ty
+                    .is_uint(lookup.context)
+                    || args[0]
+                        .get_content(lookup.context)
+                        .ty
+                        .is_b256(lookup.context)
+            );
 
             let Some(arg) = args.into_iter().next() else {
                 unreachable!("Unexpected 'not' without any arguments");
             };
 
-            let ConstantValue::Uint(v) = arg.value else {
-                unreachable!("Type checker allowed non integer value for Not");
+            let c = match &arg.get_content(lookup.context).value {
+                ConstantValue::Uint(n) => {
+                    let n = match arg
+                        .get_content(lookup.context)
+                        .ty
+                        .get_uint_width(lookup.context)
+                    {
+                        Some(8) => !(*n as u8) as u64,
+                        Some(16) => !(*n as u16) as u64,
+                        Some(32) => !(*n as u32) as u64,
+                        Some(64) => !n,
+                        _ => unreachable!("Invalid unsigned integer width"),
+                    };
+                    Ok(Some(ConstantContent {
+                        ty: arg.get_content(lookup.context).ty,
+                        value: ConstantValue::Uint(n),
+                    }))
+                }
+                ConstantValue::U256(n) => Ok(Some(ConstantContent {
+                    ty: arg.get_content(lookup.context).ty,
+                    value: ConstantValue::U256(n.not()),
+                })),
+                ConstantValue::B256(v) => Ok(Some(ConstantContent {
+                    ty: arg.get_content(lookup.context).ty,
+                    value: ConstantValue::B256(v.not()),
+                })),
+                _ => {
+                    unreachable!("Type checker allowed non integer value for Not");
+                }
             };
+            c.map(|c| c.map(|c| Constant::unique(lookup.context, c)))
+        }
+        Intrinsic::ContractCall | Intrinsic::ContractRet => {
+            Err(ConstEvalError::CannotBeEvaluatedToConst {
+                span: intrinsic.span.clone(),
+            })
+        }
+        Intrinsic::EncodeBufferEmpty => Ok(Some(to_encode_buffer(lookup, vec![], 0))),
+        Intrinsic::EncodeBufferAppend => {
+            assert!(args.len() == 2);
 
-            let v = match arg.ty.get_uint_width(lookup.context) {
-                Some(8) => !(v as u8) as u64,
-                Some(16) => !(v as u16) as u64,
-                Some(32) => !(v as u32) as u64,
-                Some(64) => !v,
-                _ => unreachable!("Invalid unsigned integer width"),
+            let (slice, mut len) = as_encode_buffer(lookup.context, &args[0]).unwrap();
+            let mut bytes = slice.clone();
+
+            use ConstantValue::*;
+            match &args[1].get_content(lookup.context).value {
+                Bool(v) => {
+                    bytes.extend(if *v { [1] } else { [0] });
+                    len += 1;
+                    Ok(Some(to_encode_buffer(lookup, bytes, len)))
+                }
+                Uint(v) => {
+                    match &*lookup.engines.te().get(intrinsic.arguments[1].return_type) {
+                        TypeInfo::UnsignedInteger(IntegerBits::Eight) => {
+                            bytes.extend((*v as u8).to_be_bytes());
+                            len += 1;
+                        }
+                        TypeInfo::UnsignedInteger(IntegerBits::Sixteen) => {
+                            bytes.extend((*v as u16).to_be_bytes());
+                            len += 2;
+                        }
+                        TypeInfo::UnsignedInteger(IntegerBits::ThirtyTwo) => {
+                            bytes.extend((*v as u32).to_be_bytes());
+                            len += 4;
+                        }
+                        TypeInfo::UnsignedInteger(IntegerBits::SixtyFour) => {
+                            bytes.extend(v.to_be_bytes());
+                            len += 8;
+                        }
+                        _ => {
+                            return Err(ConstEvalError::CannotBeEvaluatedToConst {
+                                span: intrinsic.span.clone(),
+                            });
+                        }
+                    };
+                    Ok(Some(to_encode_buffer(lookup, bytes, len)))
+                }
+                U256(v) => {
+                    bytes.extend(v.to_be_bytes());
+                    len += 32;
+                    Ok(Some(to_encode_buffer(lookup, bytes, len)))
+                }
+                B256(v) => {
+                    bytes.extend(v.to_be_bytes());
+                    len += 32;
+                    Ok(Some(to_encode_buffer(lookup, bytes, len)))
+                }
+                String(v) => {
+                    if let TypeInfo::StringSlice =
+                        &*lookup.engines.te().get(intrinsic.arguments[1].return_type)
+                    {
+                        let l = v.len() as u64;
+                        bytes.extend(l.to_be_bytes());
+                        len += 8;
+                    }
+
+                    bytes.extend(v);
+                    len += v.len() as u64;
+
+                    Ok(Some(to_encode_buffer(lookup, bytes, len)))
+                }
+                _ => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                    span: intrinsic.span.clone(),
+                }),
+            }
+        }
+        Intrinsic::EncodeBufferAsRawSlice => {
+            assert!(args.len() == 1);
+
+            let (slice, len) = as_encode_buffer(lookup.context, &args[0]).unwrap();
+            let bytes = slice.clone();
+
+            let c = ConstantContent {
+                ty: Type::get_slice(lookup.context),
+                value: ConstantValue::RawUntypedSlice(bytes[0..(len as usize)].to_vec()),
             };
+            Ok(Some(Constant::unique(lookup.context, c)))
+        }
+        Intrinsic::Slice => {
+            let start = args[1]
+                .get_content(lookup.context)
+                .as_uint()
+                .expect("Type check allowed non u64") as usize;
+            let end = args[2]
+                .get_content(lookup.context)
+                .as_uint()
+                .expect("Type check allowed non u64") as usize;
 
-            Ok(Some(Constant {
-                ty: arg.ty,
-                value: ConstantValue::Uint(v),
-            }))
+            match &args[0].get_content(lookup.context).value {
+                ConstantValue::Array(elements) => {
+                    let slice = elements
+                        .get(start..end)
+                        .ok_or(ConstEvalError::CompileError)?;
+                    let elem_type = args[0]
+                        .get_content(lookup.context)
+                        .ty
+                        .get_array_elem_type(lookup.context)
+                        .expect("unexpected non array");
+                    let s = slice.to_vec();
+                    let c = ConstantContent {
+                        ty: Type::get_typed_slice(lookup.context, elem_type),
+                        value: ConstantValue::Slice(s),
+                    };
+                    Ok(Some(Constant::unique(lookup.context, c)))
+                }
+                ConstantValue::Reference(r) => match &r.value {
+                    ConstantValue::Slice(elements) => {
+                        let slice = elements
+                            .get(start..end)
+                            .ok_or(ConstEvalError::CompileError)?;
+                        let elem_type = args[0]
+                            .get_content(lookup.context)
+                            .ty
+                            .get_typed_slice_elem_type(lookup.context)
+                            .expect("unexpected non slice");
+                        let s = slice.to_vec();
+                        let c = ConstantContent {
+                            ty: Type::get_typed_slice(lookup.context, elem_type),
+                            value: ConstantValue::Slice(s),
+                        };
+                        Ok(Some(Constant::unique(lookup.context, c)))
+                    }
+                    _ => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                        span: intrinsic.span.clone(),
+                    }),
+                },
+                _ => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                    span: intrinsic.span.clone(),
+                }),
+            }
+        }
+        Intrinsic::ElemAt => {
+            let idx = args[1]
+                .get_content(lookup.context)
+                .as_uint()
+                .expect("Type check allowed non u64") as usize;
+
+            match &args[0].get_content(lookup.context).value {
+                ConstantValue::Reference(r) => match &r.value {
+                    ConstantValue::Slice(elements) => {
+                        let v = elements[idx].clone();
+                        let c = ConstantContent {
+                            ty: Type::new_ptr(lookup.context, v.ty),
+                            value: ConstantValue::Reference(Box::new(v)),
+                        };
+                        Ok(Some(Constant::unique(lookup.context, c)))
+                    }
+                    _ => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                        span: intrinsic.span.clone(),
+                    }),
+                },
+                _ => Err(ConstEvalError::CannotBeEvaluatedToConst {
+                    span: intrinsic.span.clone(),
+                }),
+            }
+        }
+        Intrinsic::Transmute => {
+            let src_type = &intrinsic.type_arguments[0];
+            let src_ir_type = convert_resolved_type_id(
+                lookup.engines.te(),
+                lookup.engines.de(),
+                lookup.context,
+                src_type.type_id,
+                &src_type.span,
+            )
+            .unwrap();
+
+            let dst_type = &intrinsic.type_arguments[1];
+            let dst_ir_type = convert_resolved_type_id(
+                lookup.engines.te(),
+                lookup.engines.de(),
+                lookup.context,
+                dst_type.type_id,
+                &dst_type.span,
+            )
+            .unwrap();
+
+            // check IR sizes match
+            let src_ir_type_in_bytes = src_ir_type.size(lookup.context).in_bytes();
+            let dst_ir_type_in_bytes = dst_ir_type.size(lookup.context).in_bytes();
+            if src_ir_type_in_bytes != dst_ir_type_in_bytes {
+                return Err(ConstEvalError::CompileError);
+            }
+
+            fn append_bytes(
+                ctx: &Context<'_>,
+                bytes: &mut Vec<u8>,
+                t: &Type,
+                value: &ConstantValue,
+            ) -> Result<(), ConstEvalError> {
+                match t.get_content(ctx) {
+                    TypeContent::Struct(fields) => match value {
+                        ConstantValue::Struct(constants) => {
+                            for (field_type, field) in fields.iter().zip(constants.iter()) {
+                                append_bytes(ctx, bytes, field_type, &field.value)?;
+                            }
+                        }
+                        _ => unreachable!(),
+                    },
+                    TypeContent::Array(item_type, size) => match value {
+                        ConstantValue::Array(items) => {
+                            assert!(*size as usize == items.len());
+                            for item in items {
+                                append_bytes(ctx, bytes, item_type, &item.value)?;
+                            }
+                        }
+                        _ => unreachable!(),
+                    },
+                    TypeContent::Uint(8) => match value {
+                        ConstantValue::Uint(v) => {
+                            bytes.extend((*v as u8).to_be_bytes());
+                        }
+                        _ => unreachable!(),
+                    },
+                    TypeContent::Uint(16) => match value {
+                        ConstantValue::Uint(v) => {
+                            bytes.extend([0u8, 0u8, 0u8, 0u8, 0u8, 0u8]);
+                            bytes.extend((*v as u16).to_be_bytes());
+                        }
+                        _ => unreachable!(),
+                    },
+                    TypeContent::Uint(32) => match value {
+                        ConstantValue::Uint(v) => {
+                            bytes.extend([0u8, 0u8, 0u8, 0u8]);
+                            bytes.extend((*v as u32).to_be_bytes());
+                        }
+                        _ => unreachable!(),
+                    },
+                    TypeContent::Uint(64) => match value {
+                        ConstantValue::Uint(v) => {
+                            bytes.extend((*v).to_be_bytes());
+                        }
+                        _ => unreachable!(),
+                    },
+                    _ => return Err(ConstEvalError::CompileError),
+                }
+                Ok(())
+            }
+
+            fn transmute_bytes(
+                ctx: &Context<'_>,
+                bytes: &mut std::io::Cursor<Vec<u8>>,
+                t: &Type,
+            ) -> Result<ConstantContent, ConstEvalError> {
+                Ok(match t.get_content(ctx) {
+                    TypeContent::Uint(8) => {
+                        let mut buffer = [0u8];
+                        let _ = bytes.read_exact(&mut buffer);
+                        ConstantContent {
+                            ty: Type::get_uint8(ctx),
+                            value: ConstantValue::Uint(buffer[0] as u64),
+                        }
+                    }
+                    TypeContent::Uint(16) => {
+                        let mut buffer = [0u8; 8]; // u16 = u64 at runtime
+                        let _ = bytes.read_exact(&mut buffer);
+                        let buffer = [buffer[6], buffer[7]];
+                        ConstantContent {
+                            ty: Type::get_uint16(ctx),
+                            value: ConstantValue::Uint(u16::from_be_bytes(buffer) as u64),
+                        }
+                    }
+                    TypeContent::Uint(32) => {
+                        let mut buffer = [0u8; 8]; // u32 = u64 at runtime
+                        let _ = bytes.read_exact(&mut buffer);
+                        let buffer = [buffer[4], buffer[5], buffer[6], buffer[7]];
+                        ConstantContent {
+                            ty: Type::get_uint32(ctx),
+                            value: ConstantValue::Uint(u32::from_be_bytes(buffer) as u64),
+                        }
+                    }
+                    TypeContent::Uint(64) => {
+                        let mut buffer = [0u8; 8];
+                        let _ = bytes.read_exact(&mut buffer);
+                        ConstantContent {
+                            ty: Type::get_uint64(ctx),
+                            value: ConstantValue::Uint(u64::from_be_bytes(buffer)),
+                        }
+                    }
+                    _ => return Err(ConstEvalError::CompileError),
+                })
+            }
+
+            let mut runtime_bytes = vec![];
+            append_bytes(
+                lookup.context,
+                &mut runtime_bytes,
+                &src_ir_type,
+                &args[0].get_content(lookup.context).value,
+            )?;
+            let mut cursor = std::io::Cursor::new(runtime_bytes);
+            let c = transmute_bytes(lookup.context, &mut cursor, &dst_ir_type)?;
+            Ok(Some(Constant::unique(lookup.context, c)))
         }
     }
 }
@@ -927,7 +1667,9 @@ fn const_eval_intrinsic(
 mod tests {
     use super::*;
     use sway_error::handler::Handler;
+    use sway_features::ExperimentalFeatures;
     use sway_ir::Kind;
+    use sway_types::ProgramId;
 
     /// This function validates if an expression can be converted to [Constant].
     ///
@@ -945,11 +1687,14 @@ mod tests {
     fn assert_is_constant(is_constant: bool, prefix: &str, expr: &str) {
         let engines = Engines::default();
         let handler = Handler::default();
-        let mut context = Context::new(engines.se());
+        let mut context = Context::new(engines.se(), ExperimentalFeatures::default());
         let mut md_mgr = MetadataManager::default();
-        let core_lib = namespace::Module::default();
-
-        let mut performance_data = sway_utils::PerformanceData::default();
+        let core_lib = namespace::Root::new(
+            sway_types::Ident::new_no_span("assert_is_constant_test".to_string()),
+            None,
+            ProgramId::new(0),
+            false,
+        );
 
         let r = crate::compile_to_ast(
             &handler,
@@ -958,7 +1703,8 @@ mod tests {
             core_lib,
             None,
             "test",
-            &mut performance_data,
+            None,
+            ExperimentalFeatures::default(),
         );
 
         let (errors, _warnings) = handler.consume();
@@ -974,7 +1720,13 @@ mod tests {
             .declarations
             .iter()
             .find_map(|x| match x {
-                ty::TyDecl::FunctionDecl(x) if x.name.as_str() == "f" => Some(x),
+                ty::TyDecl::FunctionDecl(x) => {
+                    if engines.de().get_function(&x.decl_id).name.as_str() == "f" {
+                        Some(x)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             })
             .expect("An function named `f` was not found.");
@@ -986,7 +1738,7 @@ mod tests {
             ty::TyAstNodeContent::Expression(expr_under_test) => expr_under_test.clone(),
             ty::TyAstNodeContent::Declaration(crate::language::ty::TyDecl::ConstantDecl(decl)) => {
                 let decl = engines.de().get_constant(&decl.decl_id);
-                decl.value.unwrap()
+                decl.value.clone().unwrap()
             }
             x => todo!("{x:?}"),
         };
@@ -1025,9 +1777,51 @@ mod tests {
         assert_is_constant(true, "enum Color { Blue: u64 }", "Color::Blue(1)");
         assert_is_constant(true, "struct Person { age: u64 }", "Person { age: 1 }");
         assert_is_constant(true, "struct Person { age: u64 }", "Person { age: 1 }.age");
+        assert_is_constant(
+            true,
+            "struct Person { age: u64 }",
+            "Person { age: { let mut x = 0; x = 1; 1 } }",
+        );
         assert_is_constant(true, "", "if true { 1 } else { 0 }");
         assert_is_constant(true, "", "(0,1).0");
         assert_is_constant(true, "", "[0,1][0]");
+
+        // u256
+        assert_is_constant(
+            true,
+            "",
+            "0x0000000000000000000000000000000000000000000000000000000000000001u256",
+        );
+        assert_is_constant(
+            true,
+            "",
+            "__add(0x0000000000000000000000000000000000000000000000000000000000000001u256, 0x0000000000000000000000000000000000000000000000000000000000000001u256)",
+        );
+        assert_is_constant(
+            true,
+            "",
+            "__eq(0x0000000000000000000000000000000000000000000000000000000000000001u256, 0x0000000000000000000000000000000000000000000000000000000000000001u256)",
+        );
+        assert_is_constant(
+            true,
+            "",
+            "__gt(0x0000000000000000000000000000000000000000000000000000000000000001u256, 0x0000000000000000000000000000000000000000000000000000000000000001u256)",
+        );
+        assert_is_constant(
+            true,
+            "",
+            "__lt(0x0000000000000000000000000000000000000000000000000000000000000001u256, 0x0000000000000000000000000000000000000000000000000000000000000001u256)",
+        );
+        assert_is_constant(
+            true,
+            "",
+            "__lsh(0x0000000000000000000000000000000000000000000000000000000000000001u256, 2)",
+        );
+        assert_is_constant(
+            true,
+            "",
+            "__not(0x0000000000000000000000000000000000000000000000000000000000000001u256)",
+        );
 
         // Expressions that cannot be converted to constant
         assert_is_constant(false, "", "{ return 1; }");
@@ -1042,11 +1836,7 @@ mod tests {
             "struct Person { age: u64 }",
             "Person { age: { return 1; 1} }",
         );
-        assert_is_constant(
-            false,
-            "struct Person { age: u64 }",
-            "Person { age: { let mut x = 0; x = 1; 1} }",
-        );
+
         // At the moment this is not constant because of the "return"
         assert_is_constant(false, "fn id(x: u64) -> u64 { return x; }", "id(1)");
         assert_is_constant(false, "", "[0,1][2]");

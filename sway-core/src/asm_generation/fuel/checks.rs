@@ -7,18 +7,15 @@ use sway_error::{
 };
 use sway_types::Span;
 
-use crate::asm_lang::{
-    allocated_ops::{AllocatedOp, AllocatedOpcode},
-    VirtualImmediate18,
-};
+use crate::asm_lang::allocated_ops::{AllocatedOp, AllocatedOpcode};
 
 /// Checks if an opcode is one that cannot be executed from within a script.
 /// If so, throw an error.
 /// One example of disallowed code is as follows:
 /// ```ignore
-/// pub fn burn(amount: u64) {
-///   asm(r1: amount) {
-///     burn r1;
+/// pub fn burn(sub_id: SubId, amount: u64) {
+///   asm(r1: amount, r2: sub_id) {
+///     burn r1 r2;
 ///   }
 /// }
 /// ```
@@ -31,8 +28,8 @@ pub(crate) fn check_script_opcodes(
     // Preemptively avoids the creation of scripts with opcodes not allowed at runtime.
     handler.scope(|handler| {
         for op in ops {
-            match op.opcode {
-                GM(_, VirtualImmediate18 { value: 1..=2 }) => {
+            match &op.opcode {
+                GM(_, imm) if (1..=2).contains(&imm.value()) => {
                     handler.emit_err(CompileError::GMFromExternalContext {
                         span: get_op_span(op),
                     });
@@ -65,7 +62,7 @@ pub(crate) fn check_script_opcodes(
 /// All contract opcodes are not allowed in predicates. Except for RVRT that can
 /// be used to abort the predicate. One example of disallowed code is as follows:
 /// ```ignore
-/// pub fn burn(amount: u64) {
+/// pub fn burn(sub_id: SubId, amount: u64) {
 ///   asm(r1: amount) {
 ///     burn r1;
 ///   }
@@ -102,12 +99,11 @@ pub(crate) fn check_predicate_opcodes(
                 CCP(..) => invalid_opcode("CCP"),
                 CROO(..) => invalid_opcode("CROO"),
                 CSIZ(..) => invalid_opcode("CSIZ"),
-                GM(_, VirtualImmediate18 { value: 1..=2 }) => {
+                GM(_, imm) if (1..=2).contains(&imm.value()) => {
                     handler.emit_err(CompileError::GMFromExternalContext {
                         span: get_op_span(op),
                     });
                 }
-                LDC(..) => invalid_opcode("LDC"),
                 LOG(..) => invalid_opcode("LOG"),
                 LOGD(..) => invalid_opcode("LOGD"),
                 MINT(..) => invalid_opcode("MINT"),

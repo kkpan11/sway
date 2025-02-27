@@ -1,8 +1,43 @@
 library;
 
 use ::primitives::*;
+use ::slice::*;
 
+/// Trait for the addition of two values.
 pub trait Add {
+    /// Add two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value to add to self.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the two values added.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Add for MyStruct {
+    ///     fn add(self, other: Self) -> Self {
+    ///         let val = self.val + other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 1 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result_struct = struct1 + struct2;
+    ///     assert(result_struct.val == 3);
+    /// }
+    /// ```
     fn add(self, other: Self) -> Self;
 }
 
@@ -24,9 +59,15 @@ impl Add for u32 {
         // any non-64-bit value is compiled to a u64 value under-the-hood
         // constants (like Self::max() below) are also automatically promoted to u64
         let res = __add(self, other);
+        // integer overflow
         if __gt(res, Self::max()) {
-            // integer overflow
-            __revert(0)
+            if panic_on_overflow_is_enabled() {
+                __revert(0)
+            } else {
+                // overflow enabled
+                // res % (Self::max() + 1)
+                __mod(res, __add(Self::max(), 1))
+            }
         } else {
             // no overflow
             res
@@ -38,7 +79,13 @@ impl Add for u16 {
     fn add(self, other: Self) -> Self {
         let res = __add(self, other);
         if __gt(res, Self::max()) {
-            __revert(0)
+            if panic_on_overflow_is_enabled() {
+                __revert(0)
+            } else {
+                // overflow enabled
+                // res % (Self::max() + 1)
+                __mod(res, __add(Self::max(), 1))
+            }
         } else {
             res
         }
@@ -47,16 +94,70 @@ impl Add for u16 {
 
 impl Add for u8 {
     fn add(self, other: Self) -> Self {
-        let res = __add(self, other);
-        if __gt(res, Self::max()) {
-            __revert(0)
+        let self_u64 = asm(input: self) {
+            input: u64
+        };
+        let other_u64 = asm(input: other) {
+            input: u64
+        };
+        let res_u64 = __add(self_u64, other_u64);
+        let max_u8_u64 = asm(input: Self::max()) {
+            input: u64
+        };
+        if __gt(res_u64, max_u8_u64) {
+            if panic_on_overflow_is_enabled() {
+                __revert(0)
+            } else {
+                // overflow enabled
+                // res % (Self::max() + 1)
+                let res_u64 = __mod(res_u64, __add(max_u8_u64, 1));
+                asm(input: res_u64) {
+                    input: u8
+                }
+            }
         } else {
-            res
+            asm(input: res_u64) {
+                input: u8
+            }
         }
     }
 }
 
+/// Trait for the subtraction of two values.
 pub trait Subtract {
+    /// Subtract two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value to subtract from self.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the two values subtracted.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Subtract for MyStruct {
+    ///     fn subtract(self, other: Self) -> Self {
+    ///         let val = self.val - other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 3 };
+    ///     let struct2 = MyStruct { val: 1 };
+    ///     let result_struct = struct1 - struct2;
+    ///     assert(result_struct.val == 2);
+    /// }
+    /// ```
     fn subtract(self, other: Self) -> Self;
 }
 
@@ -92,7 +193,41 @@ impl Subtract for u8 {
     }
 }
 
+/// Trait for the multiplication of two values.
 pub trait Multiply {
+    /// Multiply two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value to multiply with self.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the two values multiplied.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Multiply for MyStruct {
+    ///     fn multiply(self, other: Self) -> Self {
+    ///         let val = self.val * other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 3 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result_struct = struct1 * struct2;
+    ///     assert(result_struct.val == 6);
+    /// }
+    /// ```
     fn multiply(self, other: Self) -> Self;
 }
 
@@ -115,8 +250,14 @@ impl Multiply for u32 {
         // constants (like Self::max() below) are also automatically promoted to u64
         let res = __mul(self, other);
         if __gt(res, Self::max()) {
-            // integer overflow
-            __revert(0)
+            if panic_on_overflow_is_enabled() {
+                // integer overflow
+                __revert(0)
+            } else {
+                // overflow enabled
+                // res % (Self::max() + 1)
+                __mod(res, __add(Self::max(), 1))
+            }
         } else {
             // no overflow
             res
@@ -128,7 +269,11 @@ impl Multiply for u16 {
     fn multiply(self, other: Self) -> Self {
         let res = __mul(self, other);
         if __gt(res, Self::max()) {
-            __revert(0)
+            if panic_on_overflow_is_enabled() {
+                __revert(0)
+            } else {
+                __mod(res, __add(Self::max(), 1))
+            }
         } else {
             res
         }
@@ -137,16 +282,70 @@ impl Multiply for u16 {
 
 impl Multiply for u8 {
     fn multiply(self, other: Self) -> Self {
-        let res = __mul(self, other);
-        if __gt(res, Self::max()) {
-            __revert(0)
+        let self_u64 = asm(input: self) {
+            input: u64
+        };
+        let other_u64 = asm(input: other) {
+            input: u64
+        };
+        let res_u64 = __mul(self_u64, other_u64);
+        let max_u8_u64 = asm(input: Self::max()) {
+            input: u64
+        };
+        if __gt(res_u64, max_u8_u64) {
+            if panic_on_overflow_is_enabled() {
+                __revert(0)
+            } else {
+                // overflow enabled
+                // res % (Self::max() + 1)
+                let res_u64 = __mod(res_u64, __add(max_u8_u64, 1));
+                asm(input: res_u64) {
+                    input: u8
+                }
+            }
         } else {
-            res
+            asm(input: res_u64) {
+                input: u8
+            }
         }
     }
 }
 
+/// Trait for the division of two values.
 pub trait Divide {
+    /// Divide two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value to divide with self.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the two values divided.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Divide for MyStruct {
+    ///     fn divide(self, other: Self) -> Self {
+    ///         let val = self.val / other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result_struct = struct1 / struct2;
+    ///     assert(result_struct.val == 5);
+    /// }
+    /// ```
     fn divide(self, other: Self) -> Self;
 }
 
@@ -184,7 +383,41 @@ impl Divide for u8 {
     }
 }
 
+/// Trait for the modulo of two values.
 pub trait Mod {
+    /// Modulo two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value to mod with self.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The modulo of the two values.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Mod for MyStruct {
+    ///     fn modulo(self, other: Self) -> Self {
+    ///         let val = self.val % other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result_struct = struct1 % struct2;
+    ///     assert(result_struct.val == 0);
+    /// }
+    /// ```
     fn modulo(self, other: Self) -> Self;
 }
 
@@ -218,7 +451,35 @@ impl Mod for u8 {
     }
 }
 
+/// Trait to invert a type.
 pub trait Not {
+    /// Inverts the value of the type.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the inverse.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: bool,
+    /// }
+    ///
+    /// impl Not for MyStruct {
+    ///     fn not(self) -> Self {
+    ///         Self {
+    ///             val: !self.val,
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct = MyStruct { val: true };
+    ///     let result_struct = !struct;
+    ///     assert(!result_struct.val);
+    /// }
+    /// ```
     fn not(self) -> Self;
 }
 
@@ -234,70 +495,439 @@ impl Not for u256 {
     }
 }
 
+impl Not for b256 {
+    fn not(self) -> Self {
+        __not(self)
+    }
+}
+
+impl Not for u64 {
+    fn not(self) -> Self {
+        __not(self)
+    }
+}
+
+impl Not for u32 {
+    fn not(self) -> Self {
+        let v = __not(self);
+        __and(v, u32::max())
+    }
+}
+
+impl Not for u16 {
+    fn not(self) -> Self {
+        let v = __not(self);
+        __and(v, u16::max())
+    }
+}
+
+impl Not for u8 {
+    fn not(self) -> Self {
+        let v = __not(self);
+        __and(v, u8::max())
+    }
+}
+
+/// Trait to evaluate if two types are equal.
+#[cfg(experimental_partial_eq = false)]
 pub trait Eq {
+    /// Evaluates if two values of the same type are equal.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if the values are equal, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Eq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///         self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 2 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result = struct1 == struct2;
+    ///     assert(result);
+    /// }
+    /// ```
     fn eq(self, other: Self) -> bool;
 } {
+    /// Evaluates if two values of the same type are not equal.
+    ///
+    /// # Additional Information
+    ///
+    /// This function is inherited when `eq()` is implemented.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if the two values are not equal, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Eq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///          self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result = struct1 != struct2;
+    ///     assert(result);
+    /// }
+    /// ```
     fn neq(self, other: Self) -> bool {
         (self.eq(other)).not()
     }
 }
 
+/// Trait for comparing type instances corresponding to equivalence relations.
+///
+/// The difference between [Eq] and [PartialEq] is the additional requirement for reflexivity.
+/// [PartialEq] guarantees symmetry and transitivity, but not reflexivity.
+///
+/// E.g., a type that implements [PartialEq] guarantees that for all `a`, `b`, and `c`:
+/// - `a == b` implies `b == a` (symmetry)
+/// - `a == b` and `b == c` implies `a == c` (transitivity)
+///
+/// [Eq], additionally implies:
+/// - `a == a` for every `a` (reflexivity)
+///
+/// Reflexivity property cannot be checked by the compiler, and therefore `Eq`
+/// does not have any methods, but only [PartialEq] as a supertrait.
+///
+/// **Implementing [Eq] for a type that does not have reflexivity property is a logic error**.
+#[cfg(experimental_partial_eq = true)]
+pub trait Eq: PartialEq {
+}
+
+/// Trait for comparing type instances using the equality operator.
+///
+/// Implementing this trait provides `==` and `!=` operators on a type.
+///
+/// This trait allows comparisons for types that do not have a full equivalence relation.
+/// In other words, it is not required that each instance of the type must be
+/// equal to itself. While most of the types used in blockchain development do have this
+/// property, called reflexivity, we can encounter types that are not reflexive.
+///
+/// A typical example of a type supporting partial equivalence, but not equivalence,
+/// is a floating point number, where `NaN` is different from any other number,
+/// including itself: `NaN != NaN`.
+#[cfg(experimental_partial_eq = true)]
+pub trait PartialEq {
+    /// Evaluates if two values of the same type are equal.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if the values are equal, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl PartialEq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///         self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 2 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result = struct1 == struct2;
+    ///     assert(result);
+    /// }
+    /// ```
+    fn eq(self, other: Self) -> bool;
+} {
+    /// Evaluates if two values of the same type are not equal.
+    ///
+    /// # Additional Information
+    ///
+    /// This function is inherited when `eq()` is implemented.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if the two values are not equal, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl PartialEq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///          self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result = struct1 != struct2;
+    ///     assert(result);
+    /// }
+    /// ```
+    fn neq(self, other: Self) -> bool {
+        (self.eq(other)).not()
+    }
+}
+
+#[cfg(experimental_partial_eq = false)]
 impl Eq for bool {
     fn eq(self, other: Self) -> bool {
         __eq(self, other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for bool {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for bool {}
+
+#[cfg(experimental_partial_eq = false)]
 impl Eq for u256 {
     fn eq(self, other: Self) -> bool {
         __eq(self, other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for u256 {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for u256 {}
+
+#[cfg(experimental_partial_eq = false)]
+impl Eq for b256 {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for b256 {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for b256 {}
+
+#[cfg(experimental_partial_eq = false)]
 impl Eq for u64 {
     fn eq(self, other: Self) -> bool {
         __eq(self, other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for u64 {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for u64 {}
+
+#[cfg(experimental_partial_eq = false)]
 impl Eq for u32 {
     fn eq(self, other: Self) -> bool {
         __eq(self, other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for u32 {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for u32 {}
+
+#[cfg(experimental_partial_eq = false)]
 impl Eq for u16 {
     fn eq(self, other: Self) -> bool {
         __eq(self, other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for u16 {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for u16 {}
+
+#[cfg(experimental_partial_eq = false)]
 impl Eq for u8 {
     fn eq(self, other: Self) -> bool {
         __eq(self, other)
     }
 }
 
-impl Eq for b256 {
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for u8 {
     fn eq(self, other: Self) -> bool {
-        // Both self and other are addresses of the values, so we can use MEQ.
-        asm(r1: self, r2: other, r3, r4) {
-            addi r3 zero i32;
-            meq r4 r1 r2 r3;
-            r4: bool
-        }
+        __eq(self, other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+impl Eq for u8 {}
+
+#[cfg(experimental_partial_eq = false)]
 impl Eq for raw_ptr {
     fn eq(self, other: Self) -> bool {
         __eq(self, other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for raw_ptr {
+    fn eq(self, other: Self) -> bool {
+        __eq(self, other)
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for raw_ptr {}
+
+/// Trait to evaluate if one value is greater or less than another of the same type.
 pub trait Ord {
+    /// Evaluates if one value of the same type is greater than another.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if `self` is greater than `other`, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Ord for MyStruct {
+    ///     fn gt(self, other: Self) -> bool {
+    ///         self.val > other.val
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result = struct1 > struct2;
+    ///     assert(result);
+    /// }
+    /// ```
     fn gt(self, other: Self) -> bool;
+
+    /// Evaluates if one value of the same type is less than another.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if `self` is less than `other`, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Ord for MyStruct {
+    ///     fn lt(self, other: Self) -> bool {
+    ///         self.val < other.val
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 2 };
+    ///     let result = struct1 < struct2;
+    ///     assert(!result);
+    /// }
+    /// ```
     fn lt(self, other: Self) -> bool;
+}
+
+impl Ord for u256 {
+    fn gt(self, other: Self) -> bool {
+        __gt(self, other)
+    }
+
+    fn lt(self, other: Self) -> bool {
+        __lt(self, other)
+    }
+}
+
+impl Ord for b256 {
+    fn gt(self, other: Self) -> bool {
+        __gt(self, other)
+    }
+
+    fn lt(self, other: Self) -> bool {
+        __lt(self, other)
+    }
 }
 
 impl Ord for u64 {
@@ -336,44 +966,54 @@ impl Ord for u8 {
     }
 }
 
-impl Ord for b256 {
-    fn gt(self, other: Self) -> bool {
-        let (self_word_1, self_word_2, self_word_3, self_word_4) = decompose(self);
-        let (other_word_1, other_word_2, other_word_3, other_word_4) = decompose(other);
+/// Trait to bitwise AND two values of the same type.
+pub trait BitwiseAnd {
+    /// Bitwise AND two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the bitwise AND of the two values.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl BitwiseAnd for MyStruct {
+    ///     fn binary_and(self, other: Self) -> Self {
+    ///         let val = self.val & other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 11 };
+    ///     let result_struct = struct1 & struct2;
+    ///     assert(result_struct.val == 10);
+    /// }
+    /// ```
+    fn binary_and(self, other: Self) -> Self;
+}
 
-        if self.eq(other) {
-            false
-        } else if self_word_1.neq(other_word_1) {
-            self_word_1.gt(other_word_1)
-        } else if self_word_2.neq(other_word_2) {
-            self_word_2.gt(other_word_2)
-        } else if self_word_3.neq(other_word_3) {
-            self_word_3.gt(other_word_3)
-        } else {
-            self_word_4.gt(other_word_4)
-        }
-    }
-
-    fn lt(self, other: Self) -> bool {
-        let (self_word_1, self_word_2, self_word_3, self_word_4) = decompose(self);
-        let (other_word_1, other_word_2, other_word_3, other_word_4) = decompose(other);
-
-        if self.eq(other) {
-            false
-        } else if self_word_1.neq(other_word_1) {
-            self_word_1.lt(other_word_1)
-        } else if self_word_2.neq(other_word_2) {
-            self_word_2.lt(other_word_2)
-        } else if self_word_3.neq(other_word_3) {
-            self_word_3.lt(other_word_3)
-        } else {
-            self_word_4.lt(other_word_4)
-        }
+impl BitwiseAnd for u256 {
+    fn binary_and(self, other: Self) -> Self {
+        __and(self, other)
     }
 }
 
-pub trait BitwiseAnd {
-    fn binary_and(self, other: Self) -> Self;
+impl BitwiseAnd for b256 {
+    fn binary_and(self, other: Self) -> Self {
+        __and(self, other)
+    }
 }
 
 impl BitwiseAnd for u64 {
@@ -400,8 +1040,54 @@ impl BitwiseAnd for u8 {
     }
 }
 
+/// Trait to bitwise OR two values of the same type.
 pub trait BitwiseOr {
+    /// Bitwise OR two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the bitwise OR of the two values.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl BitwiseOr for MyStruct {
+    ///     fn binary_or(self, other: Self) -> Self {
+    ///         let val = self.val | other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 11 };
+    ///     let result_struct = struct1 | struct2;
+    ///     assert(result_struct.val == 11);
+    /// }
+    /// ```
     fn binary_or(self, other: Self) -> Self;
+}
+
+impl BitwiseOr for u256 {
+    fn binary_or(self, other: Self) -> Self {
+        __or(self, other)
+    }
+}
+
+impl BitwiseOr for b256 {
+    fn binary_or(self, other: Self) -> Self {
+        __or(self, other)
+    }
 }
 
 impl BitwiseOr for u64 {
@@ -428,8 +1114,54 @@ impl BitwiseOr for u8 {
     }
 }
 
+/// Trait to bitwise XOR two values of the same type.
 pub trait BitwiseXor {
+    /// Bitwise XOR two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the bitwise XOR of the two values.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl BitwiseXOr for MyStruct {
+    ///     fn binary_xor(self, other: Self) -> Self {
+    ///         let val = self.val ^ other.val;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 11 };
+    ///     let result_struct = struct1 ^ struct2;
+    ///     assert(result_struct.val == 1);
+    /// }
+    /// ```
     fn binary_xor(self, other: Self) -> Self;
+}
+
+impl BitwiseXor for u256 {
+    fn binary_xor(self, other: Self) -> Self {
+        __xor(self, other)
+    }
+}
+
+impl BitwiseXor for b256 {
+    fn binary_xor(self, other: Self) -> Self {
+        __xor(self, other)
+    }
 }
 
 impl BitwiseXor for u64 {
@@ -456,91 +1188,292 @@ impl BitwiseXor for u8 {
     }
 }
 
-impl Not for u64 {
-    fn not(self) -> Self {
-        __not(self)
-    }
-}
-
-impl Not for u32 {
-    fn not(self) -> Self {
-        let v = __not(self);
-        __and(v, u32::max())
-    }
-}
-
-impl Not for u16 {
-    fn not(self) -> Self {
-        let v = __not(self);
-        __and(v, u16::max())
-    }
-}
-
-impl Not for u8 {
-    fn not(self) -> Self {
-        let v = __not(self);
-        __and(v, u8::max())
-    }
-}
-
-impl BitwiseAnd for b256 {
-    fn binary_and(val: self, other: Self) -> Self {
-        let (value_word_1, value_word_2, value_word_3, value_word_4) = decompose(val);
-        let (other_word_1, other_word_2, other_word_3, other_word_4) = decompose(other);
-        let word_1 = value_word_1.binary_and(other_word_1);
-        let word_2 = value_word_2.binary_and(other_word_2);
-        let word_3 = value_word_3.binary_and(other_word_3);
-        let word_4 = value_word_4.binary_and(other_word_4);
-        let rebuilt = compose((word_1, word_2, word_3, word_4));
-        rebuilt
-    }
-}
-
-impl BitwiseOr for b256 {
-    fn binary_or(val: self, other: Self) -> Self {
-        let (value_word_1, value_word_2, value_word_3, value_word_4) = decompose(val);
-        let (other_word_1, other_word_2, other_word_3, other_word_4) = decompose(other);
-        let word_1 = value_word_1.binary_or(other_word_1);
-        let word_2 = value_word_2.binary_or(other_word_2);
-        let word_3 = value_word_3.binary_or(other_word_3);
-        let word_4 = value_word_4.binary_or(other_word_4);
-        let rebuilt = compose((word_1, word_2, word_3, word_4));
-        rebuilt
-    }
-}
-
-impl BitwiseXor for b256 {
-    fn binary_xor(val: self, other: Self) -> Self {
-        let (value_word_1, value_word_2, value_word_3, value_word_4) = decompose(val);
-        let (other_word_1, other_word_2, other_word_3, other_word_4) = decompose(other);
-        let word_1 = value_word_1.binary_xor(other_word_1);
-        let word_2 = value_word_2.binary_xor(other_word_2);
-        let word_3 = value_word_3.binary_xor(other_word_3);
-        let word_4 = value_word_4.binary_xor(other_word_4);
-        let rebuilt = compose((word_1, word_2, word_3, word_4));
-        rebuilt
-    }
-}
-
-trait OrdEq: Ord + Eq {
+/// Trait to evaluate if one value is greater than or equal, or less than or equal to another of the same type.
+#[cfg(experimental_partial_eq = false)]
+pub trait OrdEq: Ord + Eq {
 } {
+    /// Evaluates if one value of the same type is greater or equal to than another.
+    ///
+    /// # Additional Information
+    ///
+    /// This trait requires that the `Ord` and `Eq` traits are implemented.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if `self` is greater than or equal to `other`, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Eq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///         self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// impl Ord for MyStruct {
+    ///     fn gt(self, other: Self) -> bool {
+    ///         self.val > other.val
+    ///     }
+    /// }
+    ///
+    /// impl OrdEq for MyStruct {}
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 10 };
+    ///     let result = struct1 >= struct2;
+    ///     assert(result);
+    /// }
+    /// ```
     fn ge(self, other: Self) -> bool {
         self.gt(other) || self.eq(other)
     }
+    /// Evaluates if one value of the same type is less or equal to than another.
+    ///
+    /// # Additional Information
+    ///
+    /// This trait requires that the `Ord` and `Eq` traits are implemented.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if `self` is less than or equal to `other`, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Eq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///         self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// impl Ord for MyStruct {
+    ///     fn lt(self, other: Self) -> bool {
+    ///         self.val < other.val
+    ///     }
+    /// }
+    ///
+    /// impl OrdEq for MyStruct {}
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 10 };
+    ///     let result = struct1 <= struct2;
+    ///     assert(result);
+    /// }
+    /// ```
     fn le(self, other: Self) -> bool {
         self.lt(other) || self.eq(other)
     }
 }
 
+#[cfg(experimental_partial_eq = true)]
+pub trait OrdEq: Ord + PartialEq {
+} {
+    /// Evaluates if one value of the same type is greater or equal to than another.
+    ///
+    /// # Additional Information
+    ///
+    /// This trait requires that the `Ord` and `Eq` traits are implemented.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if `self` is greater than or equal to `other`, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Eq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///         self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// impl Ord for MyStruct {
+    ///     fn gt(self, other: Self) -> bool {
+    ///         self.val > other.val
+    ///     }
+    /// }
+    ///
+    /// impl OrdEq for MyStruct {}
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 10 };
+    ///     let result = struct1 >= struct2;
+    ///     assert(result);
+    /// }
+    /// ```
+    fn ge(self, other: Self) -> bool {
+        self.gt(other) || self.eq(other)
+    }
+    /// Evaluates if one value of the same type is less or equal to than another.
+    ///
+    /// # Additional Information
+    ///
+    /// This trait requires that the `Ord` and `Eq` traits are implemented.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * [bool] - `true` if `self` is less than or equal to `other`, otherwise `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Eq for MyStruct {
+    ///     fn eq(self, other: Self) -> bool {
+    ///         self.val == other.val
+    ///     }
+    /// }
+    ///
+    /// impl Ord for MyStruct {
+    ///     fn lt(self, other: Self) -> bool {
+    ///         self.val < other.val
+    ///     }
+    /// }
+    ///
+    /// impl OrdEq for MyStruct {}
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 10 };
+    ///     let result = struct1 <= struct2;
+    ///     assert(result);
+    /// }
+    /// ```
+    fn le(self, other: Self) -> bool {
+        self.lt(other) || self.eq(other)
+    }
+}
+
+impl OrdEq for u256 {}
 impl OrdEq for u64 {}
 impl OrdEq for u32 {}
 impl OrdEq for u16 {}
 impl OrdEq for u8 {}
 impl OrdEq for b256 {}
 
+/// Trait to bit shift a value.
 pub trait Shift {
+    /// Bit shift left by an amount.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [u64] - The amount to bit shift by.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the value bit shifted to the left.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Shift for MyStruct {
+    ///     fn lsh(self, other: u64) -> Self {
+    ///         let val = self.val << other;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let result_struct = struct1 << 3;
+    ///     assert(result_struct.val == 80);
+    /// }
+    /// ```
     fn lsh(self, other: u64) -> Self;
+
+    /// Bit shift right by an amount.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [u64] - The amount to bit shift by.
+    ///
+    /// # Returns
+    ///
+    /// * [Self] - The result of the value bit shifted to the right.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl Shift for MyStruct {
+    ///     fn rsh(self, other: u64) -> Self {
+    ///         let val = self.val >> other;
+    ///         Self {
+    ///             val
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let result_struct = struct1 >> 1;
+    ///     assert(result_struct.val == 5);
+    /// }
+    /// ```
     fn rsh(self, other: u64) -> Self;
+}
+
+impl Shift for u256 {
+    fn lsh(self, other: u64) -> Self {
+        __lsh(self, other)
+    }
+    fn rsh(self, other: u64) -> Self {
+        __rsh(self, other)
+    }
+}
+
+impl Shift for b256 {
+    fn lsh(self, other: u64) -> Self {
+        __lsh(self, other)
+    }
+
+    fn rsh(self, other: u64) -> Self {
+        __rsh(self, other)
+    }
 }
 
 impl Shift for u64 {
@@ -572,6 +1505,122 @@ impl Shift for u16 {
     }
 }
 
+/// Trait to compare values of the same type.
+pub trait TotalOrd {
+    /// Finds the minimum value of two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * Self - the minimum of the two values, or the same value if they are equal.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl TotalOrd for MyStruct {
+    ///     fn min(self, other: Self) -> Self {
+    ///         if self.val < other.val { self } else { other }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 20 };
+    ///     let min = struct1.min(struct2);
+    ///     assert(min.val == struct1.val);
+    /// }
+    /// ```
+    fn min(self, other: Self) -> Self;
+    /// Finds the maximum value of two values of the same type.
+    ///
+    /// # Arguments
+    ///
+    /// * `other`: [Self] - The value of the same type.
+    ///
+    /// # Returns
+    ///
+    /// * Self - the maximum of the two values, or the same value if they are equal.
+    ///
+    /// # Examples
+    ///
+    /// ```sway
+    /// struct MyStruct {
+    ///     val: u64,
+    /// }
+    ///
+    /// impl TotalOrd for MyStruct {
+    ///     fn max(self, other: Self) -> Self {
+    ///         if self.val > other.val { self } else { other }
+    ///     }
+    /// }
+    ///
+    /// fn foo() {
+    ///     let struct1 = MyStruct { val: 10 };
+    ///     let struct2 = MyStruct { val: 20 };
+    ///     let max = struct1.max(struct2);
+    ///     assert(max.val == struct2.val);
+    /// }
+    /// ```
+    fn max(self, other: Self) -> Self;
+}
+
+impl TotalOrd for u8 {
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self > other { self } else { other }
+    }
+}
+
+impl TotalOrd for u16 {
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self > other { self } else { other }
+    }
+}
+
+impl TotalOrd for u32 {
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self > other { self } else { other }
+    }
+}
+
+impl TotalOrd for u64 {
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self > other { self } else { other }
+    }
+}
+
+impl TotalOrd for u256 {
+    fn min(self, other: Self) -> Self {
+        if self < other { self } else { other }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self > other { self } else { other }
+    }
+}
+
 impl Shift for u8 {
     fn lsh(self, other: u64) -> Self {
         __and(__lsh(self, other), Self::max())
@@ -581,101 +1630,22 @@ impl Shift for u8 {
     }
 }
 
-impl Shift for b256 {
-    fn lsh(self, shift_amount: u64) -> Self {
-        let (word_1, word_2, word_3, word_4) = decompose(self);
-        let mut w1 = 0;
-        let mut w2 = 0;
-        let mut w3 = 0;
-        let mut w4 = 0;
-
-        let w = shift_amount.divide(64); // num of whole words to shift in addition to b
-        let b = shift_amount.modulo(64); // num of bits to shift within each word
-        // TODO: Use generalized looping version when vec lands !
-        if w.eq(0) {
-            let (shifted_2, carry_2) = lsh_with_carry(word_2, b);
-            w1 = word_1.lsh(b).add(carry_2);
-            let (shifted_3, carry_3) = lsh_with_carry(word_3, b);
-            w2 = shifted_2.add(carry_3);
-            let (shifted_4, carry_4) = lsh_with_carry(word_4, b);
-            w3 = shifted_3.add(carry_4);
-            w4 = shifted_4;
-        } else if w.eq(1) {
-            let (shifted_3, carry_3) = lsh_with_carry(word_3, b);
-            w1 = word_2.lsh(b).add(carry_3);
-            let (shifted_4, carry_4) = lsh_with_carry(word_4, b);
-            w2 = shifted_3.add(carry_4);
-            w3 = shifted_4;
-        } else if w.eq(2) {
-            let (shifted_4, carry_4) = lsh_with_carry(word_4, b);
-            w1 = word_3.lsh(b).add(carry_4);
-            w2 = shifted_4;
-        } else if w.eq(3) { w1 = word_4.lsh(b); } else { (); };
-
-        compose((w1, w2, w3, w4))
-    }
-
-    fn rsh(self, shift_amount: u64) -> Self {
-        let (word_1, word_2, word_3, word_4) = decompose(self);
-        let mut w1 = 0;
-        let mut w2 = 0;
-        let mut w3 = 0;
-        let mut w4 = 0;
-
-        let w = shift_amount.divide(64); // num of whole words to shift in addition to b
-        let b = shift_amount.modulo(64); // num of bits to shift within each word
-        // TODO: Use generalized looping version when vec lands !
-        if w.eq(0) {
-            let (shifted_3, carry_3) = rsh_with_carry(word_3, b);
-            w4 = word_4.rsh(b).add(carry_3);
-            let (shifted_2, carry_2) = rsh_with_carry(word_2, b);
-            w3 = shifted_3.add(carry_2);
-            let (shifted_1, carry_1) = rsh_with_carry(word_1, b);
-            w2 = shifted_2.add(carry_1);
-            w1 = shifted_1;
-        } else if w.eq(1) {
-            let (shifted_2, carry_2) = rsh_with_carry(word_2, b);
-            w4 = word_3.rsh(b).add(carry_2);
-            let (shifted_1, carry_1) = rsh_with_carry(word_1, b);
-            w3 = shifted_2.add(carry_1);
-            w2 = shifted_1;
-        } else if w.eq(2) {
-            let (shifted_1, carry_1) = rsh_with_carry(word_1, b);
-            w4 = word_2.rsh(b).add(carry_1);
-            w3 = shifted_1;
-        } else if w.eq(3) { w4 = word_1.rsh(b); } else { (); };
-
-        compose((w1, w2, w3, w4))
-    }
-}
-
 /////////////////////////////////////////////////
 // Internal Helpers
 /////////////////////////////////////////////////
-/// Left shift a u64 and preserve the overflow amount if any
-fn lsh_with_carry(word: u64, shift_amount: u64) -> (u64, u64) {
-    let right_shift_amount = 64.subtract(shift_amount);
-    let carry = word.rsh(right_shift_amount);
-    let shifted = word.lsh(shift_amount);
-    (shifted, carry)
-}
-
-/// Right shift a u64 and preserve the overflow amount if any
-fn rsh_with_carry(word: u64, shift_amount: u64) -> (u64, u64) {
-    let left_shift_amount = 64.subtract(shift_amount);
-    let carry = word.lsh(left_shift_amount);
-    let shifted = word.rsh(shift_amount);
-    (shifted, carry)
-}
 
 /// Build a single b256 value from a tuple of 4 u64 values.
 fn compose(words: (u64, u64, u64, u64)) -> b256 {
-    asm(r1: words) { r1: b256 }
+    asm(r1: words) {
+        r1: b256
+    }
 }
 
 /// Get a tuple of 4 u64 values from a single b256 value.
 fn decompose(val: b256) -> (u64, u64, u64, u64) {
-    asm(r1: val) { r1: (u64, u64, u64, u64) }
+    asm(r1: val) {
+        r1: (u64, u64, u64, u64)
+    }
 }
 
 #[test]
@@ -699,4 +1669,75 @@ fn test_decompose() {
     {
         __revert(0)
     }
+}
+
+use ::str::*;
+
+#[cfg(experimental_partial_eq = false)]
+impl Eq for str {
+    fn eq(self, other: Self) -> bool {
+        if self.len() != other.len() {
+            false
+        } else {
+            let self_ptr = self.as_ptr();
+            let other_ptr = other.as_ptr();
+            let l = self.len();
+            asm(r1: self_ptr, r2: other_ptr, r3: l, r4) {
+                meq r4 r1 r2 r3;
+                r4: bool
+            }
+        }
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl PartialEq for str {
+    fn eq(self, other: Self) -> bool {
+        if self.len() != other.len() {
+            false
+        } else {
+            let self_ptr = self.as_ptr();
+            let other_ptr = other.as_ptr();
+            let l = self.len();
+            asm(r1: self_ptr, r2: other_ptr, r3: l, r4) {
+                meq r4 r1 r2 r3;
+                r4: bool
+            }
+        }
+    }
+}
+
+#[cfg(experimental_partial_eq = true)]
+impl Eq for str {}
+
+fn assert(v: bool) {
+    if !v {
+        __revert(0)
+    }
+}
+
+#[test]
+pub fn ok_str_eq() {
+    assert("" == "");
+    assert("a" == "a");
+
+    assert("a" != "");
+    assert("" != "a");
+    assert("a" != "b");
+}
+
+fn flags() -> u64 {
+    asm() {
+        flag
+    }
+}
+
+fn panic_on_overflow_is_enabled() -> bool {
+    __eq(
+        __and(
+            flags(),
+            0b00000000_00000000_00000000_00000000_00000000_00000000_00000000_00000010,
+        ),
+        0,
+    )
 }

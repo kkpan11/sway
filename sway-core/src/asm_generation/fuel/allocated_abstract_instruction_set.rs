@@ -1,7 +1,10 @@
-use crate::asm_lang::{
-    allocated_ops::{AllocatedOpcode, AllocatedRegister},
-    AllocatedAbstractOp, ConstantRegister, ControlFlowOp, Label, RealizedOp, VirtualImmediate12,
-    VirtualImmediate18, VirtualImmediate24,
+use crate::{
+    asm_generation::fuel::data_section::EntryName,
+    asm_lang::{
+        allocated_ops::{AllocatedOpcode, AllocatedRegister},
+        AllocatedAbstractOp, ConstantRegister, ControlFlowOp, Label, RealizedOp,
+        VirtualImmediate12, VirtualImmediate18, VirtualImmediate24,
+    },
 };
 
 use super::{
@@ -10,6 +13,8 @@ use super::{
     data_section::{DataSection, Entry},
 };
 
+use fuel_vm::fuel_asm::Imm12;
+use indexmap::{IndexMap, IndexSet};
 use sway_types::span::Span;
 
 use std::{
@@ -34,6 +39,30 @@ pub struct AllocatedAbstractInstructionSet {
 }
 
 impl AllocatedAbstractInstructionSet {
+    pub(crate) fn optimize(self) -> AllocatedAbstractInstructionSet {
+        self.remove_redundant_ops()
+    }
+
+    fn remove_redundant_ops(mut self) -> AllocatedAbstractInstructionSet {
+        self.ops.retain(|op| {
+            // It is easier to think in terms of operations we want to remove
+            // than the operations we want to retain ;-)
+            let remove = match &op.opcode {
+                // `cfei i0` and `cfsi i0` pairs.
+                Either::Left(AllocatedOpcode::CFEI(imm))
+                | Either::Left(AllocatedOpcode::CFSI(imm)) => imm.value() == 0u32,
+                // `cfe $zero` and `cfs $zero` pairs.
+                Either::Left(AllocatedOpcode::CFE(reg))
+                | Either::Left(AllocatedOpcode::CFS(reg)) => reg.is_zero(),
+                _ => false,
+            };
+
+            !remove
+        });
+
+        self
+    }
+
     /// Replace each PUSHA instruction with stores of all used registers to the stack, and each
     /// POPA with respective loads from the stack.
     ///
@@ -47,23 +76,23 @@ impl AllocatedAbstractInstructionSet {
             .ops
             .iter()
             .fold(
-                (HashMap::new(), HashSet::new()),
+                (IndexMap::new(), IndexSet::new()),
                 |(mut reg_sets, mut active_sets), op| {
-                    let reg = match &op.opcode {
+                    let regs: Box<dyn Iterator<Item = &AllocatedRegister>> = match &op.opcode {
                         Either::Right(ControlFlowOp::PushAll(label)) => {
                             active_sets.insert(*label);
-                            None
+                            Box::new(std::iter::empty())
                         }
                         Either::Right(ControlFlowOp::PopAll(label)) => {
-                            active_sets.remove(label);
-                            None
+                            active_sets.swap_remove(label);
+                            Box::new(std::iter::empty())
                         }
 
-                        Either::Left(alloc_op) => alloc_op.def_registers().into_iter().next(),
-                        Either::Right(ctrl_op) => ctrl_op.def_registers().into_iter().next(),
+                        Either::Left(alloc_op) => Box::new(alloc_op.def_registers().into_iter()),
+                        Either::Right(ctrl_op) => Box::new(ctrl_op.def_registers().into_iter()),
                     };
 
-                    if let Some(reg) = reg {
+                    for reg in regs {
                         for active_label in active_sets.clone() {
                             reg_sets
                                 .entry(active_label)
@@ -81,6 +110,28 @@ impl AllocatedAbstractInstructionSet {
             )
             .0;
 
+        fn generate_mask(regs: &[&AllocatedRegister]) -> (VirtualImmediate24, VirtualImmediate24) {
+            let mask = regs.iter().fold((0, 0), |mut accum, reg| {
+                let reg_id = reg.to_reg_id().to_u8();
+                assert!((16..64).contains(&reg_id));
+                let reg_id = reg_id - 16;
+                let (mask_ref, bit) = if reg_id < 24 {
+                    (&mut accum.0, reg_id)
+                } else {
+                    (&mut accum.1, reg_id - 24)
+                };
+                // Set bit (from the least significant side) of mask_ref.
+                *mask_ref |= 1 << bit;
+                accum
+            });
+            (
+                VirtualImmediate24::new(mask.0, Span::dummy())
+                    .expect("mask should have fit in 24b"),
+                VirtualImmediate24::new(mask.1, Span::dummy())
+                    .expect("mask should have fit in 24b"),
+            )
+        }
+
         // Now replace the PUSHA/POPA instructions with STOREs and LOADs.
         self.ops = self.ops.drain(..).fold(Vec::new(), |mut new_ops, op| {
             match &op.opcode {
@@ -93,35 +144,21 @@ impl AllocatedAbstractInstructionSet {
                         .chain([&AllocatedRegister::Constant(ConstantRegister::LocalsBase)])
                         .collect::<Vec<_>>();
 
-                    let stack_use_bytes = regs.len() as u64 * 8;
-                    new_ops.push(AllocatedAbstractOp {
-                        opcode: Either::Left(AllocatedOpcode::MOVE(
-                            AllocatedRegister::Constant(ConstantRegister::Scratch),
-                            AllocatedRegister::Constant(ConstantRegister::StackPointer),
-                        )),
-                        comment: "save base stack value".into(),
-                        owning_span: None,
-                    });
-                    new_ops.push(AllocatedAbstractOp {
-                        opcode: Either::Left(AllocatedOpcode::CFEI(
-                            VirtualImmediate24::new(stack_use_bytes, Span::dummy()).unwrap(),
-                        )),
-                        comment: "reserve space for saved registers".into(),
-                        owning_span: None,
-                    });
-
-                    regs.into_iter().enumerate().for_each(|(idx, reg)| {
-                        let store_op = AllocatedOpcode::SW(
-                            AllocatedRegister::Constant(ConstantRegister::Scratch),
-                            reg.clone(),
-                            VirtualImmediate12::new(idx as u64, Span::dummy()).unwrap(),
-                        );
+                    let (mask_l, mask_h) = generate_mask(&regs);
+                    if mask_l.value() != 0 {
                         new_ops.push(AllocatedAbstractOp {
-                            opcode: Either::Left(store_op),
-                            comment: format!("save {reg}"),
-                            owning_span: None,
+                            opcode: Either::Left(AllocatedOpcode::PSHL(mask_l)),
+                            comment: "save registers 16..40".into(),
+                            owning_span: op.owning_span.clone(),
                         });
-                    })
+                    }
+                    if mask_h.value() != 0 {
+                        new_ops.push(AllocatedAbstractOp {
+                            opcode: Either::Left(AllocatedOpcode::PSHH(mask_h)),
+                            comment: "save registers 40..64".into(),
+                            owning_span: op.owning_span.clone(),
+                        });
+                    }
                 }
 
                 Either::Right(ControlFlowOp::PopAll(label)) => {
@@ -133,37 +170,21 @@ impl AllocatedAbstractInstructionSet {
                         .chain([&AllocatedRegister::Constant(ConstantRegister::LocalsBase)])
                         .collect::<Vec<_>>();
 
-                    let stack_use_bytes = regs.len() as u64 * 8;
-                    new_ops.push(AllocatedAbstractOp {
-                        opcode: Either::Left(AllocatedOpcode::SUBI(
-                            AllocatedRegister::Constant(ConstantRegister::Scratch),
-                            AllocatedRegister::Constant(ConstantRegister::StackPointer),
-                            VirtualImmediate12::new(stack_use_bytes, Span::dummy()).unwrap(),
-                        )),
-                        comment: "save base stack value".into(),
-                        owning_span: None,
-                    });
-
-                    regs.into_iter().enumerate().for_each(|(idx, reg)| {
-                        let load_op = AllocatedOpcode::LW(
-                            reg.clone(),
-                            AllocatedRegister::Constant(ConstantRegister::Scratch),
-                            VirtualImmediate12::new(idx as u64, Span::dummy()).unwrap(),
-                        );
+                    let (mask_l, mask_h) = generate_mask(&regs);
+                    if mask_h.value() != 0 {
                         new_ops.push(AllocatedAbstractOp {
-                            opcode: Either::Left(load_op),
-                            comment: format!("restore {reg}"),
-                            owning_span: None,
+                            opcode: Either::Left(AllocatedOpcode::POPH(mask_h)),
+                            comment: "restore registers 40..64".into(),
+                            owning_span: op.owning_span.clone(),
                         });
-                    });
-
-                    new_ops.push(AllocatedAbstractOp {
-                        opcode: Either::Left(AllocatedOpcode::CFSI(
-                            VirtualImmediate24::new(stack_use_bytes, Span::dummy()).unwrap(),
-                        )),
-                        comment: "recover space from saved registers".into(),
-                        owning_span: None,
-                    });
+                    }
+                    if mask_l.value() != 0 {
+                        new_ops.push(AllocatedAbstractOp {
+                            opcode: Either::Left(AllocatedOpcode::POPL(mask_l)),
+                            comment: "restore registers 16..40".into(),
+                            owning_span: op.owning_span.clone(),
+                        });
+                    }
                 }
 
                 _otherwise => new_ops.push(op),
@@ -306,16 +327,17 @@ impl AllocatedAbstractInstructionSet {
                                 AllocatedRegister::Constant(ConstantRegister::InstructionStart),
                             ),
                             owning_span: owning_span.clone(),
-                            comment: "Get current instruction offset from Instruction start".into(),
+                            comment: "get current instruction offset from instructions start ($is)"
+                                .into(),
                         });
                         realized_ops.push(RealizedOp {
                             opcode: AllocatedOpcode::SRLI(
                                 r1.clone(),
                                 r1.clone(),
-                                VirtualImmediate12 { value: 2 },
+                                VirtualImmediate12::new_unchecked(2, "two must fit in 12 bits"),
                             ),
                             owning_span: owning_span.clone(),
-                            comment: "Current instruction offset in 32b words".into(),
+                            comment: "get current instruction offset in 32-bit words".into(),
                         });
                         realized_ops.push(RealizedOp {
                             opcode: AllocatedOpcode::ADDI(r1.clone(), r1, imm),
@@ -326,6 +348,13 @@ impl AllocatedAbstractInstructionSet {
                     ControlFlowOp::DataSectionOffsetPlaceholder => {
                         realized_ops.push(RealizedOp {
                             opcode: AllocatedOpcode::DataSectionOffsetPlaceholder,
+                            owning_span: None,
+                            comment: String::new(),
+                        });
+                    }
+                    ControlFlowOp::ConfigurablesOffsetPlaceholder => {
+                        realized_ops.push(RealizedOp {
+                            opcode: AllocatedOpcode::ConfigurablesOffsetPlaceholder,
                             owning_span: None,
                             comment: String::new(),
                         });
@@ -345,10 +374,13 @@ impl AllocatedAbstractInstructionSet {
                         // We compute the relative offset w.r.t the actual jump.
                         // Sub 1 because the relative jumps add a 1.
                         let offset = rel_offset(curr_offset + 1, lab) - 1;
-                        let data_id =
-                            data_section.insert_data_value(Entry::new_word(offset, None, None));
+                        let data_id = data_section.insert_data_value(Entry::new_word(
+                            offset,
+                            EntryName::NonConfigurable,
+                            None,
+                        ));
                         realized_ops.push(RealizedOp {
-                            opcode: AllocatedOpcode::LWDataId(r1, data_id),
+                            opcode: AllocatedOpcode::LoadDataId(r1, data_id),
                             owning_span,
                             comment,
                         });
@@ -413,8 +445,8 @@ impl AllocatedAbstractInstructionSet {
         match op.opcode {
             Either::Right(Label(_)) => 0,
 
-            // A special case for LWDataId which may be 1 or 2 ops, depending on the source size.
-            Either::Left(AllocatedOpcode::LWDataId(_, ref data_id)) => {
+            // A special case for LoadDataId which may be 1 or 2 ops, depending on the source size.
+            Either::Left(AllocatedOpcode::LoadDataId(_, ref data_id)) => {
                 let has_copy_type = data_section.has_copy_type(data_id).expect(
                     "Internal miscalculation in data section -- \
                         data id did not match up to any actual data",
@@ -426,8 +458,24 @@ impl AllocatedAbstractInstructionSet {
                 }
             }
 
+            Either::Left(AllocatedOpcode::AddrDataId(_, ref id)) => {
+                if data_section.data_id_to_offset(id) > usize::from(Imm12::MAX.to_u16()) {
+                    2
+                } else {
+                    1
+                }
+            }
+
+            // cfei 0 and cfsi 0 are omitted from asm emission, don't count them for offsets
+            Either::Left(AllocatedOpcode::CFEI(ref op))
+            | Either::Left(AllocatedOpcode::CFSI(ref op))
+                if op.value() == 0 =>
+            {
+                0
+            }
+
             // Another special case for the blob opcode, used for testing.
-            Either::Left(AllocatedOpcode::BLOB(ref count)) => count.value as u64,
+            Either::Left(AllocatedOpcode::BLOB(ref count)) => count.value() as u64,
 
             // These ops will end up being exactly one op, so the cur_offset goes up one.
             Either::Right(Jump(..) | JumpIfNotZero(..) | Call(..) | LoadLabel(..))
@@ -446,6 +494,8 @@ impl AllocatedAbstractInstructionSet {
                 // to load the data, which loads a whole word, so for now this is 2.
                 2
             }
+
+            Either::Right(ConfigurablesOffsetPlaceholder) => 2,
 
             Either::Right(PushAll(_)) | Either::Right(PopAll(_)) => unreachable!(
                 "fix me, pushall and popall don't really belong in control flow ops \
@@ -539,7 +589,7 @@ impl AllocatedAbstractInstructionSet {
                         if rel_offset(lab) == 0 {
                             new_ops.push(AllocatedAbstractOp {
                                 opcode: Either::Left(AllocatedOpcode::NOOP),
-                                comment: "NOP for self loop".into(),
+                                comment: "emit noop for self loop".into(),
                                 owning_span: None,
                             });
                             new_ops.push(op);
@@ -562,7 +612,7 @@ impl AllocatedAbstractInstructionSet {
                                 new_ops.push(AllocatedAbstractOp {
                                     opcode: Either::Left(AllocatedOpcode::JMPB(
                                         AllocatedRegister::Constant(ConstantRegister::Scratch),
-                                        VirtualImmediate18 { value: 0 },
+                                        VirtualImmediate18::new_unchecked(0, "zero must fit in 18 bits"),
                                     )),
                                     ..op
                                 });
@@ -570,7 +620,7 @@ impl AllocatedAbstractInstructionSet {
                                 new_ops.push(AllocatedAbstractOp {
                                     opcode: Either::Left(AllocatedOpcode::JMPF(
                                         AllocatedRegister::Constant(ConstantRegister::Scratch),
-                                        VirtualImmediate18 { value: 0 },
+                                        VirtualImmediate18 ::new_unchecked(0, "zero must fit in 18 bits"),
                                     )),
                                     ..op
                                 });
@@ -582,7 +632,7 @@ impl AllocatedAbstractInstructionSet {
                         if rel_offset(lab) == 0 {
                             new_ops.push(AllocatedAbstractOp {
                                 opcode: Either::Left(AllocatedOpcode::NOOP),
-                                comment: "NOP for self loop".into(),
+                                comment: "emit noop for self loop".into(),
                                 owning_span: None,
                             });
                             new_ops.push(op);
@@ -606,7 +656,7 @@ impl AllocatedAbstractInstructionSet {
                                     opcode: Either::Left(AllocatedOpcode::JNZB(
                                         r1.clone(),
                                         AllocatedRegister::Constant(ConstantRegister::Scratch),
-                                        VirtualImmediate12 { value: 0 },
+                                        VirtualImmediate12::new_unchecked(0, "zero must fit in 12 bits"),
                                     )),
                                     ..op
                                 });
@@ -615,7 +665,7 @@ impl AllocatedAbstractInstructionSet {
                                     opcode: Either::Left(AllocatedOpcode::JNZF(
                                         r1.clone(),
                                         AllocatedRegister::Constant(ConstantRegister::Scratch),
-                                        VirtualImmediate12 { value: 0 },
+                                        VirtualImmediate12::new_unchecked(0, "zero must fit in 12 bits"),
                                     )),
                                     ..op
                                 });
@@ -627,7 +677,7 @@ impl AllocatedAbstractInstructionSet {
                         if rel_offset(lab) <= consts::TWELVE_BITS {
                             new_ops.push(op)
                         } else {
-                            panic!("Return to address must be right after the call for which we saved this addr.");
+                            panic!("Return to address must be right after the call for which we saved this address.");
                         }
                     }
 

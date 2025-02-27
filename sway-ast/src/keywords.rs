@@ -61,6 +61,7 @@ define_keyword!(FnToken, "fn");
 define_keyword!(TraitToken, "trait");
 define_keyword!(ImplToken, "impl");
 define_keyword!(ForToken, "for");
+define_keyword!(InToken, "in");
 define_keyword!(AbiToken, "abi");
 define_keyword!(ConstToken, "const");
 define_keyword!(StorageToken, "storage");
@@ -75,7 +76,6 @@ define_keyword!(LetToken, "let");
 define_keyword!(WhileToken, "while");
 define_keyword!(WhereToken, "where");
 define_keyword!(RefToken, "ref");
-define_keyword!(DerefToken, "deref");
 define_keyword!(TrueToken, "true");
 define_keyword!(FalseToken, "false");
 define_keyword!(BreakToken, "break");
@@ -85,12 +85,12 @@ define_keyword!(TypeToken, "type");
 define_keyword!(PtrToken, "__ptr");
 define_keyword!(SliceToken, "__slice");
 
-/// The type is a keyword.
+/// The type is a token.
 pub trait Token: Spanned + Sized {
-    /// Creates the keyword from the given `span`.
+    /// Creates the token from the given `span`.
     fn new(span: Span) -> Self;
 
-    /// Returns an identifier for this keyword.
+    /// Returns an identifier for this token.
     fn ident(&self) -> Ident;
 
     /// The sequence of punctuations that make up the token.
@@ -98,10 +98,13 @@ pub trait Token: Spanned + Sized {
 
     /// Punctuations that will not follow the token.
     const NOT_FOLLOWED_BY: &'static [PunctKind];
+
+    /// What the string representation of the token is when lexing.
+    const AS_STR: &'static str;
 }
 
 macro_rules! define_token (
-    ($ty_name:ident, $description:literal, [$($punct_kinds:ident),*], [$($not_followed_by:ident),*]) => {
+    ($ty_name:ident, $description:literal, $as_str:literal, [$($punct_kinds:ident),*], [$($not_followed_by:ident),*]) => {
         #[derive(Clone, Debug, Serialize)]
         pub struct $ty_name {
             span: Span,
@@ -132,6 +135,7 @@ macro_rules! define_token (
 
             const PUNCT_KINDS: &'static [PunctKind] = &[$(PunctKind::$punct_kinds,)*];
             const NOT_FOLLOWED_BY: &'static [PunctKind] = &[$(PunctKind::$not_followed_by,)*];
+            const AS_STR: &'static str = $as_str;
         }
 
         impl From<$ty_name> for Ident {
@@ -142,93 +146,121 @@ macro_rules! define_token (
     };
 );
 
-define_token!(SemicolonToken, "a semicolon", [Semicolon], []);
+define_token!(SemicolonToken, "a semicolon", ";", [Semicolon], []);
 define_token!(
     ForwardSlashToken,
     "a forward slash",
+    "/",
     [ForwardSlash],
     [Equals]
 );
 define_token!(
     DoubleColonToken,
     "a double colon (::)",
+    "::",
     [Colon, Colon],
     [Colon]
 );
-define_token!(StarToken, "an asterisk (*)", [Star], [Equals]);
-define_token!(DoubleStarToken, "`**`", [Star, Star], []);
-define_token!(CommaToken, "a comma", [Comma], []);
-define_token!(ColonToken, "a colon", [Colon], [Colon]);
+define_token!(StarToken, "an asterisk (*)", "*", [Star], [Equals]);
+define_token!(DoubleStarToken, "`**`", "**", [Star, Star], []);
+define_token!(CommaToken, "a comma", ",", [Comma], []);
+define_token!(ColonToken, "a colon", ":", [Colon], [Colon]);
 define_token!(
     RightArrowToken,
     "`->`",
+    "->",
     [Sub, GreaterThan],
     [GreaterThan, Equals]
 );
-define_token!(LessThanToken, "`<`", [LessThan], [LessThan, Equals]);
+define_token!(LessThanToken, "`<`", "<", [LessThan], [LessThan, Equals]);
 define_token!(
     GreaterThanToken,
     "`>`",
+    ">",
     [GreaterThan],
     [GreaterThan, Equals]
 );
-define_token!(OpenAngleBracketToken, "`<`", [LessThan], []);
-define_token!(CloseAngleBracketToken, "`>`", [GreaterThan], []);
-define_token!(EqToken, "`=`", [Equals], [GreaterThan, Equals]);
-define_token!(AddEqToken, "`+=`", [Add, Equals], []);
-define_token!(SubEqToken, "`-=`", [Sub, Equals], []);
-define_token!(StarEqToken, "`*=`", [Star, Equals], []);
-define_token!(DivEqToken, "`/=`", [ForwardSlash, Equals], []);
-define_token!(ShlEqToken, "`<<=`", [LessThan, LessThan, Equals], []);
-define_token!(ShrEqToken, "`>>=`", [GreaterThan, GreaterThan, Equals], []);
+define_token!(OpenAngleBracketToken, "`<`", "<", [LessThan], []);
+define_token!(CloseAngleBracketToken, "`>`", ">", [GreaterThan], []);
+define_token!(EqToken, "`=`", "=", [Equals], [GreaterThan, Equals]);
+define_token!(AddEqToken, "`+=`", "+=", [Add, Equals], []);
+define_token!(SubEqToken, "`-=`", "-=", [Sub, Equals], []);
+define_token!(StarEqToken, "`*=`", "*=", [Star, Equals], []);
+define_token!(DivEqToken, "`/=`", "/=", [ForwardSlash, Equals], []);
+define_token!(ShlEqToken, "`<<=`", "<<=", [LessThan, LessThan, Equals], []);
+define_token!(
+    ShrEqToken,
+    "`>>=`",
+    ">>=",
+    [GreaterThan, GreaterThan, Equals],
+    []
+);
 define_token!(
     FatRightArrowToken,
     "`=>`",
+    "=>",
     [Equals, GreaterThan],
     [GreaterThan, Equals]
 );
-define_token!(DotToken, "`.`", [Dot], []);
-define_token!(DoubleDotToken, "`..`", [Dot, Dot], [Dot]);
-define_token!(BangToken, "`!`", [Bang], [Equals]);
-define_token!(PercentToken, "`%`", [Percent], []);
-define_token!(AddToken, "`+`", [Add], [Equals]);
-define_token!(SubToken, "`-`", [Sub], [Equals]);
+define_token!(DotToken, "`.`", ".", [Dot], []);
+define_token!(DoubleDotToken, "`..`", "..", [Dot, Dot], [Dot]);
+define_token!(BangToken, "`!`", "!", [Bang], [Equals]);
+define_token!(PercentToken, "`%`", "%", [Percent], []);
+define_token!(AddToken, "`+`", "+", [Add], [Equals]);
+define_token!(SubToken, "`-`", "-", [Sub], [Equals]);
 define_token!(
     ShrToken,
     "`>>`",
+    ">>",
     [GreaterThan, GreaterThan],
     [GreaterThan, Equals]
 );
-define_token!(ShlToken, "`<<`", [LessThan, LessThan], [LessThan, Equals]);
-define_token!(AmpersandToken, "`&`", [Ampersand], [Ampersand]);
-define_token!(CaretToken, "`^`", [Caret], []);
-define_token!(PipeToken, "`|`", [Pipe], [Pipe]);
+define_token!(
+    ShlToken,
+    "`<<`",
+    "<<",
+    [LessThan, LessThan],
+    [LessThan, Equals]
+);
+define_token!(AmpersandToken, "`&`", "&", [Ampersand], [Ampersand]);
+define_token!(CaretToken, "`^`", "^", [Caret], []);
+define_token!(PipeToken, "`|`", "|", [Pipe], [Pipe]);
 define_token!(
     DoubleEqToken,
     "`==`",
+    "==",
     [Equals, Equals],
     [Equals, GreaterThan]
 );
-define_token!(BangEqToken, "`!=`", [Bang, Equals], [Equals, GreaterThan]);
+define_token!(
+    BangEqToken,
+    "`!=`",
+    "!=",
+    [Bang, Equals],
+    [Equals, GreaterThan]
+);
 define_token!(
     GreaterThanEqToken,
     "`>=`",
+    ">=",
     [GreaterThan, Equals],
     [Equals, GreaterThan]
 );
 define_token!(
     LessThanEqToken,
     "`<=`",
+    "<=",
     [LessThan, Equals],
     [Equals, GreaterThan]
 );
 define_token!(
     DoubleAmpersandToken,
     "`&&`",
+    "&&",
     [Ampersand, Ampersand],
     [Ampersand]
 );
-define_token!(DoublePipeToken, "`||`", [Pipe, Pipe], [Pipe]);
-define_token!(UnderscoreToken, "`_`", [Underscore], [Underscore]);
-define_token!(HashToken, "`#`", [Sharp], []);
-define_token!(HashBangToken, "`#!`", [Sharp, Bang], []);
+define_token!(DoublePipeToken, "`||`", "||", [Pipe, Pipe], [Pipe]);
+define_token!(UnderscoreToken, "`_`", "_", [Underscore], [Underscore]);
+define_token!(HashToken, "`#`", "#", [Sharp], []);
+define_token!(HashBangToken, "`#!`", "#!", [Sharp, Bang], []);

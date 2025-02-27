@@ -1,605 +1,406 @@
-use crate::{
-    decl_engine::{DeclRefConstant, DeclRefFunction},
-    engine_threading::*,
-    language::{ty, CallPath, Visibility},
-    type_system::*,
-    Ident,
+use crate::{language::Visibility, Engines, Ident};
+
+use super::{module::Module, root::Root, ModulePath, ModulePathBuf};
+
+use sway_error::handler::{ErrorEmitted, Handler};
+use sway_types::{
+    constants::{CONTRACT_ID, CORE, PRELUDE, STD},
+    span::Span,
 };
-
-use super::{module::Module, root::Root, submodule_namespace::SubmoduleNamespace, Path, PathBuf};
-
-use sway_error::{
-    error::CompileError,
-    handler::{ErrorEmitted, Handler},
-};
-use sway_types::{span::Span, Spanned};
-
-use std::collections::{HashMap, VecDeque};
 
 /// The set of items that represent the namespace context passed throughout type checking.
 #[derive(Clone, Debug)]
 pub struct Namespace {
-    /// An immutable namespace that consists of the names that should always be present, no matter
-    /// what module or scope we are currently checking.
-    ///
-    /// These include external library dependencies and (when it's added) the `std` prelude.
-    ///
-    /// This is passed through type-checking in order to initialise the namespace of each submodule
-    /// within the project.
-    init: Module,
     /// The `root` of the project namespace.
     ///
     /// From the root, the entirety of the project's namespace can always be accessed.
     ///
     /// The root is initialised from the `init` namespace before type-checking begins.
     pub(crate) root: Root,
-    /// An absolute path from the `root` that represents the current module being checked.
+    /// An absolute path from the `root` that represents the module location.
     ///
-    /// E.g. when type-checking the root module, this is equal to `[]`. When type-checking a
-    /// submodule of the root called "foo", this would be equal to `[foo]`.
-    pub(crate) mod_path: PathBuf,
+    /// The path of the root module in a package is `[package_name]`. If a module `X` is a submodule
+    /// of module `Y` which is a submodule of the root module in the package `P`, then the path is
+    /// `[P, Y, X]`.
+    pub(crate) current_mod_path: ModulePathBuf,
 }
 
 impl Namespace {
-    /// Initialise the namespace at its root from the given initial namespace.
-    pub fn init_root(init: Module) -> Self {
-        let root = Root::from(init.clone());
-        let mod_path = vec![];
-        Self {
-            init,
-            root,
-            mod_path,
+    /// Initialize the namespace
+    /// See also the factory functions in contract_helpers.rs
+    ///
+    /// If `import_preludes_into_root` is true then core::prelude::* and std::prelude::* will be
+    /// imported into the root module, provided core and std are available in the external modules.
+    pub fn new(
+        handler: &Handler,
+        engines: &Engines,
+        package_root: Root,
+        import_preludes_into_root: bool,
+    ) -> Result<Self, ErrorEmitted> {
+        let package_name = package_root.current_package_name().clone();
+        let mut res = Self {
+            root: package_root,
+            current_mod_path: vec![package_name],
+        };
+
+        if import_preludes_into_root {
+            res.import_implicits(handler, engines)?;
         }
+        Ok(res)
     }
 
-    /// A reference to the path of the module currently being type-checked.
-    pub fn mod_path(&self) -> &Path {
-        &self.mod_path
+    pub fn root(self) -> Root {
+        self.root
     }
 
-    /// Find the module that these prefixes point to
-    pub fn find_module_path<'a>(
-        &'a self,
-        prefixes: impl IntoIterator<Item = &'a Ident>,
-    ) -> PathBuf {
-        self.mod_path.iter().chain(prefixes).cloned().collect()
-    }
-
-    /// A reference to the root of the project namespace.
-    pub fn root(&self) -> &Root {
+    pub fn root_ref(&self) -> &Root {
         &self.root
     }
 
-    /// A mutable reference to the root of the project namespace.
-    pub fn root_mut(&mut self) -> &mut Root {
-        &mut self.root
-    }
-
-    /// Access to the current [Module], i.e. the module at the inner `mod_path`.
-    ///
-    /// Note that the [Namespace] will automatically dereference to this [Module] when attempting
-    /// to call any [Module] methods.
-    pub fn module(&self) -> &Module {
-        &self.root.module[&self.mod_path]
-    }
-
-    /// Mutable access to the current [Module], i.e. the module at the inner `mod_path`.
-    ///
-    /// Note that the [Namespace] will automatically dereference to this [Module] when attempting
-    /// to call any [Module] methods.
-    pub fn module_mut(&mut self) -> &mut Module {
-        &mut self.root.module[&self.mod_path]
-    }
-
-    /// Short-hand for calling [Root::resolve_symbol] on `root` with the `mod_path`.
-    pub(crate) fn resolve_symbol(
-        &self,
-        handler: &Handler,
-        symbol: &Ident,
-    ) -> Result<&ty::TyDecl, ErrorEmitted> {
-        self.root.resolve_symbol(handler, &self.mod_path, symbol)
-    }
-
-    /// Short-hand for calling [Root::resolve_call_path] on `root` with the `mod_path`.
-    pub(crate) fn resolve_call_path(
-        &self,
-        handler: &Handler,
-        call_path: &CallPath,
-    ) -> Result<&ty::TyDecl, ErrorEmitted> {
+    pub fn current_module(&self) -> &Module {
         self.root
-            .resolve_call_path(handler, &self.mod_path, call_path)
+            .module_in_current_package(&self.current_mod_path)
+            .unwrap_or_else(|| panic!("Could not retrieve submodule for mod_path."))
     }
 
-    /// Short-hand for calling [Root::resolve_call_path_with_visibility_check] on `root` with the `mod_path`.
-    pub(crate) fn resolve_call_path_with_visibility_check(
+    pub fn current_module_mut(&mut self) -> &mut Module {
+        self.root
+            .module_mut_in_current_package(&self.current_mod_path)
+            .unwrap_or_else(|| panic!("Could not retrieve submodule for mod_path."))
+    }
+
+    pub(crate) fn current_module_has_submodule(&self, submod_name: &Ident) -> bool {
+        self.current_module()
+            .submodule(&[submod_name.clone()])
+            .is_some()
+    }
+
+    pub fn current_package_name(&self) -> &Ident {
+        self.root.current_package_name()
+    }
+
+    /// A reference to the path of the module currently being processed.
+    pub fn current_mod_path(&self) -> &ModulePathBuf {
+        &self.current_mod_path
+    }
+
+    /// Prepends the module path into the prefixes.
+    pub fn prepend_module_path<'a>(
+        &'a self,
+        prefixes: impl IntoIterator<Item = &'a Ident>,
+    ) -> ModulePathBuf {
+        self.current_mod_path
+            .iter()
+            .chain(prefixes)
+            .cloned()
+            .collect()
+    }
+
+    /// Convert a parsed path to a full path.
+    pub fn parsed_path_to_full_path(
+        &self,
+        _engines: &Engines,
+        parsed_path: &ModulePathBuf,
+        is_relative_to_package_root: bool,
+    ) -> ModulePathBuf {
+        if is_relative_to_package_root {
+            // Path is relative to the root module in the current package. Prepend the package name
+            let mut path = vec![self.current_package_name().clone()];
+            for ident in parsed_path.iter() {
+                path.push(ident.clone())
+            }
+            path
+        } else if self.current_module_has_submodule(&parsed_path[0]) {
+            // The first identifier is a submodule of the current module
+            // The path is therefore assumed to be relative to the current module, so prepend the current module path.
+            self.prepend_module_path(parsed_path)
+        } else if self.module_is_external(parsed_path) {
+            // The path refers to an external module, so the path is already a full path.
+            parsed_path.to_vec()
+        } else {
+            // The first identifier is neither a submodule nor an external package. It must
+            // therefore refer to a binding in the local environment
+            self.prepend_module_path(parsed_path)
+        }
+    }
+
+    pub fn current_package_root_module(&self) -> &Module {
+        self.root.current_package_root_module()
+    }
+
+    pub fn module_from_absolute_path(&self, path: &ModulePathBuf) -> Option<&Module> {
+        self.root.module_from_absolute_path(path)
+    }
+
+    // Like module_from_absolute_path, but throws an error if the module is not found
+    pub fn require_module_from_absolute_path(
         &self,
         handler: &Handler,
-        engines: &Engines,
-        call_path: &CallPath,
-    ) -> Result<&ty::TyDecl, ErrorEmitted> {
-        self.root.resolve_call_path_with_visibility_check(
-            handler,
-            engines,
-            &self.mod_path,
-            call_path,
-        )
+        path: &ModulePathBuf,
+    ) -> Result<&Module, ErrorEmitted> {
+        self.root.require_module(handler, path)
     }
 
-    /// Short-hand for calling [Root::resolve_type_with_self] on `root` with the `mod_path`.
-    #[allow(clippy::too_many_arguments)] // TODO: remove lint bypass once private modules are no longer experimental
-    pub(crate) fn resolve_type_with_self(
-        &mut self,
-        handler: &Handler,
-        engines: &Engines,
-        type_id: TypeId,
-        self_type: TypeId,
-        span: &Span,
-        enforce_type_arguments: EnforceTypeArguments,
-        type_info_prefix: Option<&Path>,
-    ) -> Result<TypeId, ErrorEmitted> {
-        let mod_path = self.mod_path.clone();
-        engines.te().resolve_with_self(
-            handler,
-            engines,
-            type_id,
-            self_type,
-            span,
-            enforce_type_arguments,
-            type_info_prefix,
-            self,
-            &mod_path,
-        )
-    }
-
-    /// Short-hand for calling [Root::resolve_type_without_self] on `root` and with the `mod_path`.
-    pub(crate) fn resolve_type_without_self(
-        &mut self,
-        handler: &Handler,
-        engines: &Engines,
-        type_id: TypeId,
-        span: &Span,
-        type_info_prefix: Option<&Path>,
-    ) -> Result<TypeId, ErrorEmitted> {
-        let mod_path = self.mod_path.clone();
-        engines.te().resolve(
-            handler,
-            engines,
-            type_id,
-            span,
-            EnforceTypeArguments::Yes,
-            type_info_prefix,
-            self,
-            &mod_path,
-        )
-    }
-
-    /// Given a name and a type (plus a `self_type` to potentially
-    /// resolve it), find items matching in the namespace.
-    pub(crate) fn find_items_for_type(
-        &mut self,
-        handler: &Handler,
-        mut type_id: TypeId,
-        item_prefix: &Path,
-        item_name: &Ident,
-        self_type: TypeId,
-        engines: &Engines,
-    ) -> Result<Vec<ty::TyTraitItem>, ErrorEmitted> {
-        let type_engine = engines.te();
-        let _decl_engine = engines.de();
-
-        // If the type that we are looking for is the error recovery type, then
-        // we want to return the error case without creating a new error
-        // message.
-        if let TypeInfo::ErrorRecovery(err) = type_engine.get(type_id) {
-            return Err(err);
+    /// Returns true if the current module being checked is a direct or indirect submodule of
+    /// the module given by the `absolute_module_path`.
+    ///
+    /// The current module being checked is determined by `mod_path`.
+    ///
+    /// E.g., the `mod_path` `[fist, second, third]` of the root `foo` is a submodule of the module
+    /// `[foo, first]`. Note that the `mod_path` does not contain the root name, while the
+    /// `absolute_module_path` always contains it.
+    ///
+    /// If the current module being checked is the same as the module given by the `absolute_module_path`,
+    /// the `true_if_same` is returned.
+    pub(crate) fn module_is_submodule_of(
+        &self,
+        absolute_module_path: &ModulePath,
+        true_if_same: bool,
+    ) -> bool {
+        if self.current_mod_path.len() < absolute_module_path.len() {
+            return false;
         }
 
-        // grab the local module
-        let local_module = self.root().check_submodule(handler, &self.mod_path)?;
+        let is_submodule = absolute_module_path
+            .iter()
+            .zip(self.current_mod_path.iter())
+            .all(|(left, right)| left == right);
 
-        // grab the local items from the local module
-        let local_items = local_module.get_items_for_type(engines, type_id);
+        if is_submodule {
+            if self.current_mod_path.len() == absolute_module_path.len() {
+                true_if_same
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
 
-        type_id.replace_self_type(engines, self_type);
+    /// Returns true if the module given by the `absolute_module_path` is external
+    /// to the current package. External modules are imported in the `Forc.toml` file.
+    pub(crate) fn module_is_external(&self, absolute_module_path: &ModulePath) -> bool {
+        assert!(!absolute_module_path.is_empty(), "Absolute module path must have at least one element, because it always contains the package name.");
 
-        // resolve the type
-        let type_id = type_engine
-            .resolve(
+        self.root.current_package_name() != &absolute_module_path[0]
+    }
+
+    pub fn package_exists(&self, name: &Ident) -> bool {
+        self.module_from_absolute_path(&vec![name.clone()])
+            .is_some()
+    }
+
+    pub(crate) fn module_has_binding(
+        &self,
+        engines: &Engines,
+        mod_path: &ModulePathBuf,
+        symbol: &Ident,
+    ) -> bool {
+        let dummy_handler = Handler::default();
+        if let Some(module) = self.module_from_absolute_path(mod_path) {
+            module
+                .resolve_symbol(&dummy_handler, engines, symbol)
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
+    // Import core::prelude::*, std::prelude::* and ::CONTRACT_ID as appropriate into the current module
+    fn import_implicits(
+        &mut self,
+        handler: &Handler,
+        engines: &Engines,
+    ) -> Result<(), ErrorEmitted> {
+        // Import preludes
+        let package_name = self.current_package_name().to_string();
+        let core_string = CORE.to_string();
+        let core_ident = Ident::new_no_span(core_string.clone());
+        let prelude_ident = Ident::new_no_span(PRELUDE.to_string());
+        if package_name == CORE {
+            // Do nothing
+        } else if package_name == STD {
+            // Import core::prelude::*
+            assert!(self.root.exists_as_external(&core_string));
+            self.root.star_import(
                 handler,
                 engines,
-                type_id,
-                &item_name.span(),
-                EnforceTypeArguments::No,
-                None,
-                self,
-                item_prefix,
-            )
-            .unwrap_or_else(|err| type_engine.insert(engines, TypeInfo::ErrorRecovery(err)));
-
-        // grab the module where the type itself is declared
-        let type_module = self.root().check_submodule(handler, item_prefix)?;
-
-        // grab the items from where the type is declared
-        let mut type_items = type_module.get_items_for_type(engines, type_id);
-
-        let mut items = local_items;
-        items.append(&mut type_items);
-
-        let mut matching_item_decl_refs: Vec<ty::TyTraitItem> = vec![];
-
-        for item in items.into_iter() {
-            match &item {
-                ty::TyTraitItem::Fn(decl_ref) => {
-                    if decl_ref.name() == item_name {
-                        matching_item_decl_refs.push(item.clone());
-                    }
-                }
-                ty::TyTraitItem::Constant(decl_ref) => {
-                    if decl_ref.name() == item_name {
-                        matching_item_decl_refs.push(item.clone());
-                    }
-                }
-            }
-        }
-
-        Ok(matching_item_decl_refs)
-    }
-
-    /// Given a name and a type (plus a `self_type` to potentially
-    /// resolve it), find that method in the namespace. Requires `args_buf`
-    /// because of some special casing for the standard library where we pull
-    /// the type from the arguments buffer.
-    ///
-    /// This function will generate a missing method error if the method is not
-    /// found.
-    #[allow(clippy::too_many_arguments)] // TODO: remove lint bypass once private modules are no longer experimental
-    pub(crate) fn find_method_for_type(
-        &mut self,
-        handler: &Handler,
-        type_id: TypeId,
-        method_prefix: &Path,
-        method_name: &Ident,
-        self_type: TypeId,
-        annotation_type: TypeId,
-        args_buf: &VecDeque<ty::TyExpression>,
-        as_trait: Option<TypeInfo>,
-        engines: &Engines,
-        try_inserting_trait_impl_on_failure: bool,
-    ) -> Result<DeclRefFunction, ErrorEmitted> {
-        let decl_engine = engines.de();
-        let type_engine = engines.te();
-
-        let eq_check = UnifyCheck::non_dynamic_equality(engines);
-        let coercion_check = UnifyCheck::coercion(engines);
-
-        // default numeric types to u64
-        if type_engine.contains_numeric(decl_engine, type_id) {
-            type_engine.decay_numeric(handler, engines, type_id, &method_name.span())?;
-        }
-
-        let matching_item_decl_refs = self.find_items_for_type(
-            handler,
-            type_id,
-            method_prefix,
-            method_name,
-            self_type,
-            engines,
-        )?;
-
-        let matching_method_decl_refs = matching_item_decl_refs
-            .into_iter()
-            .flat_map(|item| match item {
-                ty::TyTraitItem::Fn(decl_ref) => Some(decl_ref),
-                ty::TyTraitItem::Constant(_) => None,
-            })
-            .collect::<Vec<_>>();
-
-        let mut qualified_call_path = None;
-        let matching_method_decl_ref = {
-            // Case where multiple methods exist with the same name
-            // This is the case of https://github.com/FuelLabs/sway/issues/3633
-            // where multiple generic trait impls use the same method name but with different parameter types
-            let mut maybe_method_decl_refs: Vec<DeclRefFunction> = vec![];
-            for decl_ref in matching_method_decl_refs.clone().into_iter() {
-                let method = decl_engine.get_function(&decl_ref);
-                if method.parameters.len() == args_buf.len()
-                    && method
-                        .parameters
-                        .iter()
-                        .zip(args_buf.iter())
-                        .all(|(p, a)| coercion_check.check(p.type_argument.type_id, a.return_type))
-                    && (matches!(type_engine.get(annotation_type), TypeInfo::Unknown)
-                        || coercion_check.check(annotation_type, method.return_type.type_id))
-                {
-                    maybe_method_decl_refs.push(decl_ref);
-                }
-            }
-
-            if !maybe_method_decl_refs.is_empty() {
-                let mut trait_methods =
-                    HashMap::<(CallPath, Vec<WithEngines<TypeArgument>>), DeclRefFunction>::new();
-                let mut impl_self_method = None;
-                for method_ref in maybe_method_decl_refs.clone() {
-                    let method = decl_engine.get_function(&method_ref);
-                    if let Some(ty::TyDecl::ImplTrait(impl_trait)) =
-                        method.implementing_type.clone()
-                    {
-                        let trait_decl = decl_engine.get_impl_trait(&impl_trait.decl_id);
-                        if let Some(TypeInfo::Custom {
-                            call_path,
-                            type_arguments,
-                        }) = as_trait.clone()
-                        {
-                            qualified_call_path = Some(call_path.clone());
-                            // When `<S as Trait<T>>::method()` is used we only add methods to `trait_methods` that
-                            // originate from the qualified trait.
-                            if trait_decl.trait_name == call_path {
-                                let mut params_equal = true;
-                                if let Some(params) = type_arguments {
-                                    if params.len() != trait_decl.trait_type_arguments.len() {
-                                        params_equal = false;
-                                    } else {
-                                        for (p1, p2) in params
-                                            .iter()
-                                            .zip(trait_decl.trait_type_arguments.clone())
-                                        {
-                                            let p1_type_id = self.resolve_type_without_self(
-                                                handler, engines, p1.type_id, &p1.span, None,
-                                            )?;
-                                            let p2_type_id = self.resolve_type_without_self(
-                                                handler, engines, p2.type_id, &p2.span, None,
-                                            )?;
-                                            if !eq_check.check(p1_type_id, p2_type_id) {
-                                                params_equal = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if params_equal {
-                                    trait_methods.insert(
-                                        (
-                                            trait_decl.trait_name,
-                                            trait_decl
-                                                .trait_type_arguments
-                                                .iter()
-                                                .cloned()
-                                                .map(|a| engines.help_out(a))
-                                                .collect::<Vec<_>>(),
-                                        ),
-                                        method_ref.clone(),
-                                    );
-                                }
-                            }
-                        } else {
-                            trait_methods.insert(
-                                (
-                                    trait_decl.trait_name,
-                                    trait_decl
-                                        .trait_type_arguments
-                                        .iter()
-                                        .cloned()
-                                        .map(|a| engines.help_out(a))
-                                        .collect::<Vec<_>>(),
-                                ),
-                                method_ref.clone(),
-                            );
-                        }
-                        if trait_decl.trait_decl_ref.is_none() {
-                            impl_self_method = Some(method_ref);
-                        }
-                    }
-                }
-
-                if trait_methods.len() == 1 {
-                    trait_methods.values().next().cloned()
-                } else if trait_methods.len() > 1 {
-                    if impl_self_method.is_some() {
-                        // In case we have trait methods and a impl self method we use the impl self method.
-                        impl_self_method
-                    } else {
-                        fn to_string(
-                            trait_name: CallPath,
-                            trait_type_args: Vec<WithEngines<TypeArgument>>,
-                        ) -> String {
-                            format!(
-                                "{}{}",
-                                trait_name.suffix,
-                                if trait_type_args.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(
-                                        "<{}>",
-                                        trait_type_args
-                                            .iter()
-                                            .map(|type_arg| type_arg.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    )
-                                }
-                            )
-                        }
-                        let mut trait_strings = trait_methods
-                            .keys()
-                            .map(|t| to_string(t.0.clone(), t.1.clone()))
-                            .collect::<Vec<String>>();
-                        // Sort so the output of the error is always the same.
-                        trait_strings.sort();
-                        return Err(handler.emit_err(
-                            CompileError::MultipleApplicableItemsInScope {
-                                method_name: method_name.as_str().to_string(),
-                                type_name: engines.help_out(type_id).to_string(),
-                                as_traits: trait_strings,
-                                span: method_name.span(),
-                            },
-                        ));
-                    }
-                } else if qualified_call_path.is_some() {
-                    // When we use a qualified path the expected method should be in trait_methods.
-                    None
-                } else {
-                    maybe_method_decl_refs.get(0).cloned()
-                }
-            } else {
-                // When we can't match any method with parameter types we still return the first method found
-                // This was the behavior before introducing the parameter type matching
-                matching_method_decl_refs.get(0).cloned()
-            }
-        };
-
-        if let Some(method_decl_ref) = matching_method_decl_ref {
-            return Ok(method_decl_ref);
-        }
-
-        if let Some(TypeInfo::ErrorRecovery(err)) =
-            args_buf.get(0).map(|x| type_engine.get(x.return_type))
-        {
-            Err(err)
+                &[core_ident, prelude_ident],
+                &self.current_mod_path,
+                Visibility::Private,
+            )?
         } else {
-            if try_inserting_trait_impl_on_failure {
-                // Retrieve the implemented traits for the type and insert them in the namespace.
-                // insert_trait_implementation_for_type is already called when we do type check of structs, enums, arrays and tuples.
-                // In cases such as blanket trait implementation and usage of builtin types a method may not be found because
-                // insert_trait_implementation_for_type has yet to be called for that type.
-                self.insert_trait_implementation_for_type(engines, type_id);
-
-                return self.find_method_for_type(
+            // Import core::prelude::* and std::prelude::*
+            if self.root.exists_as_external(&core_string) {
+                self.root.star_import(
                     handler,
-                    type_id,
-                    method_prefix,
-                    method_name,
-                    self_type,
-                    annotation_type,
-                    args_buf,
-                    as_trait,
                     engines,
-                    false,
-                );
+                    &[core_ident, prelude_ident.clone()],
+                    &self.current_mod_path,
+                    Visibility::Private,
+                )?;
             }
-            let type_name = if let Some(call_path) = qualified_call_path {
-                format!("{} as {}", engines.help_out(type_id), call_path)
-            } else {
-                engines.help_out(type_id).to_string()
-            };
-            Err(handler.emit_err(CompileError::MethodNotFound {
-                method_name: method_name.clone(),
-                type_name,
-                span: method_name.span(),
-            }))
+
+            let std_string = STD.to_string();
+            // Only import std::prelude::* if std exists as a dependency
+            if self.root.exists_as_external(&std_string) {
+                self.root.star_import(
+                    handler,
+                    engines,
+                    &[Ident::new_no_span(std_string), prelude_ident],
+                    &self.current_mod_path,
+                    Visibility::Private,
+                )?
+            }
+        }
+
+        // Import contract id. CONTRACT_ID is declared in the root module, so only import it into non-root modules
+        if self.root.is_contract_package() && self.current_mod_path.len() > 1 {
+            // import ::CONTRACT_ID
+            self.root.item_import(
+                handler,
+                engines,
+                &[Ident::new_no_span(package_name)],
+                &Ident::new_no_span(CONTRACT_ID.to_string()),
+                &self.current_mod_path,
+                None,
+                Visibility::Private,
+            )?
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn enter_submodule(
+        &mut self,
+        handler: &Handler,
+        engines: &Engines,
+        mod_name: Ident,
+        visibility: Visibility,
+        module_span: Span,
+    ) -> Result<(), ErrorEmitted> {
+        let mut import_implicits = false;
+
+        // Ensure the new module exists and is initialized properly
+        if !self
+            .current_module()
+            .submodules()
+            .contains_key(&mod_name.to_string())
+        {
+            // Entering a new module. Add a new one.
+            self.current_module_mut()
+                .add_new_submodule(&mod_name, visibility, Some(module_span));
+            import_implicits = true;
+        }
+
+        // Update self to point to the new module
+        self.current_mod_path.push(mod_name.clone());
+
+        // Import implicits into the newly created module.
+        if import_implicits {
+            self.import_implicits(handler, engines)?;
+        }
+
+        Ok(())
+    }
+
+    /// Pushes a new submodule to the namespace's module hierarchy.
+    pub fn push_submodule(
+        &mut self,
+        handler: &Handler,
+        engines: &Engines,
+        mod_name: Ident,
+        visibility: Visibility,
+        module_span: Span,
+    ) -> Result<(), ErrorEmitted> {
+        match self.enter_submodule(handler, engines, mod_name, visibility, module_span) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
-    /// Given a name and a type (plus a `self_type` to potentially
-    /// resolve it), find that method in the namespace. Requires `args_buf`
-    /// because of some special casing for the standard library where we pull
-    /// the type from the arguments buffer.
-    ///
-    /// This function will generate a missing method error if the method is not
-    /// found.
-    pub(crate) fn find_constant_for_type(
-        &mut self,
-        handler: &Handler,
-        type_id: TypeId,
-        item_name: &Ident,
-        self_type: TypeId,
-        engines: &Engines,
-    ) -> Result<Option<DeclRefConstant>, ErrorEmitted> {
-        let matching_item_decl_refs = self.find_items_for_type(
-            handler,
-            type_id,
-            &Vec::<Ident>::new(),
-            item_name,
-            self_type,
-            engines,
-        )?;
-
-        let matching_constant_decl_refs = matching_item_decl_refs
-            .into_iter()
-            .flat_map(|item| match item {
-                ty::TyTraitItem::Fn(_decl_ref) => None,
-                ty::TyTraitItem::Constant(decl_ref) => Some(decl_ref),
-            })
-            .collect::<Vec<_>>();
-
-        Ok(matching_constant_decl_refs.first().cloned())
+    /// Pops the current submodule from the namespace's module hierarchy.
+    pub fn pop_submodule(&mut self) {
+        self.current_mod_path.pop();
     }
 
-    /// Short-hand for performing a [Module::star_import] with `mod_path` as the destination.
-    pub(crate) fn star_import(
+    pub(crate) fn star_import_to_current_module(
         &mut self,
         handler: &Handler,
-        src: &Path,
         engines: &Engines,
-        is_absolute: bool,
+        src: &ModulePath,
+        visibility: Visibility,
     ) -> Result<(), ErrorEmitted> {
         self.root
-            .star_import(handler, src, &self.mod_path, engines, is_absolute)
+            .star_import(handler, engines, src, &self.current_mod_path, visibility)
     }
 
-    /// Short-hand for performing a [Module::variant_star_import] with `mod_path` as the destination.
-    pub(crate) fn variant_star_import(
+    pub(crate) fn variant_star_import_to_current_module(
         &mut self,
         handler: &Handler,
-        src: &Path,
         engines: &Engines,
+        src: &ModulePath,
         enum_name: &Ident,
-        is_absolute: bool,
+        visibility: Visibility,
     ) -> Result<(), ErrorEmitted> {
         self.root.variant_star_import(
             handler,
-            src,
-            &self.mod_path,
             engines,
+            src,
+            &self.current_mod_path,
             enum_name,
-            is_absolute,
+            visibility,
         )
     }
 
-    /// Short-hand for performing a [Module::self_import] with `mod_path` as the destination.
-    pub(crate) fn self_import(
+    pub(crate) fn self_import_to_current_module(
         &mut self,
         handler: &Handler,
         engines: &Engines,
-        src: &Path,
+        src: &ModulePath,
         alias: Option<Ident>,
-        is_absolute: bool,
+        visibility: Visibility,
     ) -> Result<(), ErrorEmitted> {
-        self.root
-            .self_import(handler, engines, src, &self.mod_path, alias, is_absolute)
+        self.root.self_import(
+            handler,
+            engines,
+            src,
+            &self.current_mod_path,
+            alias,
+            visibility,
+        )
     }
 
-    /// Short-hand for performing a [Module::item_import] with `mod_path` as the destination.
-    pub(crate) fn item_import(
+    pub(crate) fn item_import_to_current_module(
         &mut self,
         handler: &Handler,
         engines: &Engines,
-        src: &Path,
+        src: &ModulePath,
         item: &Ident,
         alias: Option<Ident>,
-        is_absolute: bool,
+        visibility: Visibility,
     ) -> Result<(), ErrorEmitted> {
         self.root.item_import(
             handler,
             engines,
             src,
             item,
-            &self.mod_path,
+            &self.current_mod_path,
             alias,
-            is_absolute,
+            visibility,
         )
     }
 
-    /// Short-hand for performing a [Module::variant_import] with `mod_path` as the destination.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn variant_import(
+    pub(crate) fn variant_import_to_current_module(
         &mut self,
         handler: &Handler,
         engines: &Engines,
-        src: &Path,
+        src: &ModulePath,
         enum_name: &Ident,
         variant_name: &Ident,
         alias: Option<Ident>,
-        is_absolute: bool,
+        visibility: Visibility,
     ) -> Result<(), ErrorEmitted> {
         self.root.variant_import(
             handler,
@@ -607,97 +408,9 @@ impl Namespace {
             src,
             enum_name,
             variant_name,
-            &self.mod_path,
+            &self.current_mod_path,
             alias,
-            is_absolute,
+            visibility,
         )
-    }
-
-    /// "Enter" the submodule at the given path by returning a new [SubmoduleNamespace].
-    ///
-    /// Here we temporarily change `mod_path` to the given `dep_mod_path` and wrap `self` in a
-    /// [SubmoduleNamespace] type. When dropped, the [SubmoduleNamespace] resets the `mod_path`
-    /// back to the original path so that we can continue type-checking the current module after
-    /// finishing with the dependency.
-    pub(crate) fn enter_submodule(
-        &mut self,
-        mod_name: Ident,
-        visibility: Visibility,
-        module_span: Span,
-    ) -> SubmoduleNamespace {
-        let init = self.init.clone();
-        self.submodules.entry(mod_name.to_string()).or_insert(init);
-        let submod_path: Vec<_> = self
-            .mod_path
-            .iter()
-            .cloned()
-            .chain(Some(mod_name.clone()))
-            .collect();
-        let parent_mod_path = std::mem::replace(&mut self.mod_path, submod_path);
-        self.name = Some(mod_name);
-        self.span = Some(module_span);
-        self.visibility = visibility;
-        self.is_external = false;
-        SubmoduleNamespace {
-            namespace: self,
-            parent_mod_path,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn insert_trait_implementation(
-        &mut self,
-        handler: &Handler,
-        trait_name: CallPath,
-        trait_type_args: Vec<TypeArgument>,
-        type_id: TypeId,
-        items: &[ty::TyImplItem],
-        impl_span: &Span,
-        trait_decl_span: Option<Span>,
-        is_impl_self: bool,
-        engines: &Engines,
-    ) -> Result<(), ErrorEmitted> {
-        // Use trait name with full path, improves consistency between
-        // this inserting and getting in `get_methods_for_type_and_trait_name`.
-        let full_trait_name = trait_name.to_fullpath(self);
-
-        self.implemented_traits.insert(
-            handler,
-            full_trait_name,
-            trait_type_args,
-            type_id,
-            items,
-            impl_span,
-            trait_decl_span,
-            is_impl_self,
-            engines,
-        )
-    }
-
-    pub(crate) fn get_items_for_type_and_trait_name(
-        &self,
-        engines: &Engines,
-        type_id: TypeId,
-        trait_name: &CallPath,
-    ) -> Vec<ty::TyTraitItem> {
-        // Use trait name with full path, improves consistency between
-        // this get and inserting in `insert_trait_implementation`.
-        let trait_name = trait_name.to_fullpath(self);
-
-        self.implemented_traits
-            .get_items_for_type_and_trait_name(engines, type_id, &trait_name)
-    }
-}
-
-impl std::ops::Deref for Namespace {
-    type Target = Module;
-    fn deref(&self) -> &Self::Target {
-        self.module()
-    }
-}
-
-impl std::ops::DerefMut for Namespace {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.module_mut()
     }
 }

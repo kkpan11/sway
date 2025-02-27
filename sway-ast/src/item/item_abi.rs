@@ -5,7 +5,7 @@ pub struct ItemAbi {
     pub abi_token: AbiToken,
     pub name: Ident,
     pub super_traits: Option<(ColonToken, Traits)>,
-    pub abi_items: Braces<Vec<(Annotated<ItemTraitItem>, SemicolonToken)>>,
+    pub abi_items: Braces<Vec<Annotated<ItemTraitItem>>>,
     pub abi_defs_opt: Option<Braces<Vec<Annotated<ItemFn>>>>,
 }
 
@@ -16,6 +16,6 @@ impl Spanned for ItemAbi {
             Some(abi_defs) => abi_defs.span(),
             None => self.abi_items.span(),
         };
-        Span::join(start, end)
+        Span::join(start, &end)
     }
 }

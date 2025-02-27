@@ -9,6 +9,7 @@ pub(crate) mod allocated_ops;
 pub(crate) mod virtual_immediate;
 pub(crate) mod virtual_ops;
 pub(crate) mod virtual_register;
+use indexmap::IndexMap;
 pub(crate) use virtual_immediate::*;
 pub(crate) use virtual_ops::*;
 pub(crate) use virtual_register::*;
@@ -36,6 +37,31 @@ use std::{
 /// The column where the ; for comments starts
 const COMMENT_START_COLUMN: usize = 40;
 
+fn fmt_opcode_and_comment(
+    opcode: String,
+    comment: &str,
+    fmtr: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    // We want the comment to be at the `COMMENT_START_COLUMN` offset to the right,
+    // to not interfere with the ASM but to be aligned.
+    // Some operations like, e.g., data section offset, can span multiple lines.
+    // In that case, we put the comment at the end of the last line, aligned.
+    let mut op_and_comment = opcode;
+    if !comment.is_empty() {
+        let mut op_length = match op_and_comment.rfind('\n') {
+            Some(new_line_index) => op_and_comment.len() - new_line_index - 1,
+            None => op_and_comment.len(),
+        };
+        while op_length < COMMENT_START_COLUMN {
+            op_and_comment.push(' ');
+            op_length += 1;
+        }
+        write!(op_and_comment, "; {}", comment)?;
+    }
+
+    write!(fmtr, "{op_and_comment}")
+}
+
 impl From<&AsmRegister> for VirtualRegister {
     fn from(o: &AsmRegister) -> Self {
         VirtualRegister::Virtual(o.name.clone())
@@ -45,7 +71,25 @@ impl From<&AsmRegister> for VirtualRegister {
 #[derive(Debug, Clone)]
 pub(crate) struct Op {
     pub(crate) opcode: Either<VirtualOp, OrganizationalOp>,
-    /// A descriptive comment for ASM readability
+    /// A descriptive comment for ASM readability.
+    ///
+    /// Comments are a part of the compiler output and meant to
+    /// help both Sway developers interested in the generated ASM
+    /// and the Sway compiler developers.
+    ///
+    /// Comments follow these guidelines:
+    ///   - they start with an imperative verb. E.g.: "allocate" and not "allocating".
+    ///   - they start with a lowercase letter. E.g.: "allocate" and not "Allocate".
+    ///   - they do not end in punctuation. E.g.: "store value" and not "store value.".
+    ///   - they use full words. E.g.: "load return address" and not "load reta" or "load return addr".
+    ///   - abbreviations are written in upper-case. E.g.: "ABI" and not "abi".
+    ///   - names (e.g., function, argument, etc.) are written without quotes. E.g. "main" and not "'main'".
+    ///   - assembly operations are written in lowercase. E.g.: "move" and not "MOVE".
+    ///   - they are short and concise.
+    ///   - if an operation is a part of a logical group of operations, start the comment
+    ///     by a descriptive group name enclosed in square brackets and followed by colon.
+    ///     The remaining part of the comment follows the above guidelines. E.g.:
+    ///     "[bitcast to bool]: convert value to inverted boolean".
     pub(crate) comment: String,
     pub(crate) owning_span: Option<Span>,
 }
@@ -53,7 +97,9 @@ pub(crate) struct Op {
 #[derive(Clone, Debug)]
 pub(crate) struct AllocatedAbstractOp {
     pub(crate) opcode: Either<AllocatedOpcode, ControlFlowOp<AllocatedRegister>>,
-    /// A descriptive comment for ASM readability
+    /// A descriptive comment for ASM readability.
+    ///
+    /// For writing guidelines, see [Op::comment].
     pub(crate) comment: String,
     pub(crate) owning_span: Option<Span>,
 }
@@ -61,47 +107,23 @@ pub(crate) struct AllocatedAbstractOp {
 #[derive(Clone, Debug)]
 pub(crate) struct RealizedOp {
     pub(crate) opcode: AllocatedOpcode,
-    /// A descriptive comment for ASM readability
+    /// A descriptive comment for ASM readability.
+    ///
+    /// For writing guidelines, see [Op::comment].
     pub(crate) comment: String,
     pub(crate) owning_span: Option<Span>,
 }
 
 impl Op {
-    /// Write value in given [VirtualRegister] `value_to_write` to given memory address that is held within the
-    /// [VirtualRegister] `destination_address`
-    pub(crate) fn write_register_to_memory(
-        destination_address: VirtualRegister,
-        value_to_write: VirtualRegister,
-        offset: VirtualImmediate12,
-        span: Span,
-    ) -> Self {
-        Op {
-            opcode: Either::Left(VirtualOp::SW(destination_address, value_to_write, offset)),
-            comment: String::new(),
-            owning_span: Some(span),
-        }
-    }
-    /// Write value in given [VirtualRegister] `value_to_write` to given memory address that is held within the
-    /// [VirtualRegister] `destination_address`, with the provided comment.
-    pub(crate) fn write_register_to_memory_comment(
-        destination_address: VirtualRegister,
-        value_to_write: VirtualRegister,
-        offset: VirtualImmediate12,
-        span: Span,
-        comment: impl Into<String>,
-    ) -> Self {
-        Op {
-            opcode: Either::Left(VirtualOp::SW(destination_address, value_to_write, offset)),
-            comment: comment.into(),
-            owning_span: Some(span),
-        }
-    }
     /// Moves the stack pointer by the given amount (i.e. allocates stack memory)
     pub(crate) fn unowned_stack_allocate_memory(
         size_to_allocate_in_bytes: VirtualImmediate24,
     ) -> Self {
         Op {
-            opcode: Either::Left(VirtualOp::CFEI(size_to_allocate_in_bytes)),
+            opcode: Either::Left(VirtualOp::CFEI(
+                VirtualRegister::Constant(ConstantRegister::StackPointer),
+                size_to_allocate_in_bytes,
+            )),
             comment: String::new(),
             owning_span: None,
         }
@@ -148,7 +170,7 @@ impl Op {
         comment: impl Into<String>,
     ) -> Self {
         Op {
-            opcode: Either::Left(VirtualOp::LWDataId(reg, data)),
+            opcode: Either::Left(VirtualOp::LoadDataId(reg, data)),
             comment: comment.into(),
             owning_span: None,
         }
@@ -239,7 +261,7 @@ impl Op {
         }
     }
 
-    /// Jumps to [Label] `label`  if the given [VirtualRegister] `reg0` is not equal to zero.
+    /// Jumps to [Label] `label` if the given [VirtualRegister] `reg0` is not equal to zero.
     pub(crate) fn jump_if_not_zero(reg0: VirtualRegister, label: Label) -> Self {
         Op {
             opcode: Either::Right(OrganizationalOp::JumpIfNotZero(reg0, label)),
@@ -248,7 +270,20 @@ impl Op {
         }
     }
 
-    /// Dymamically jumps to a register value.
+    /// Jumps to [Label] `label` if the given [VirtualRegister] `reg0` is not equal to zero.
+    pub(crate) fn jump_if_not_zero_comment(
+        reg0: VirtualRegister,
+        label: Label,
+        comment: impl Into<String>,
+    ) -> Self {
+        Op {
+            opcode: Either::Right(OrganizationalOp::JumpIfNotZero(reg0, label)),
+            comment: comment.into(),
+            owning_span: None,
+        }
+    }
+
+    /// Dynamically jumps to a register value.
     pub(crate) fn jump_to_register(
         reg: VirtualRegister,
         comment: impl Into<String>,
@@ -383,6 +418,34 @@ impl Op {
                 let (r1, r2, imm) = two_regs_imm_12(handler, args, immediate, whole_op_span)?;
                 VirtualOp::SUBI(r1, r2, imm)
             }
+            "wqcm" => {
+                let (r1, r2, r3, imm) = three_regs_imm_06(handler, args, immediate, whole_op_span)?;
+                VirtualOp::WQCM(r1, r2, r3, imm)
+            }
+            "wqop" => {
+                let (r1, r2, r3, imm) = three_regs_imm_06(handler, args, immediate, whole_op_span)?;
+                VirtualOp::WQOP(r1, r2, r3, imm)
+            }
+            "wqml" => {
+                let (r1, r2, r3, imm) = three_regs_imm_06(handler, args, immediate, whole_op_span)?;
+                VirtualOp::WQML(r1, r2, r3, imm)
+            }
+            "wqdv" => {
+                let (r1, r2, r3, imm) = three_regs_imm_06(handler, args, immediate, whole_op_span)?;
+                VirtualOp::WQDV(r1, r2, r3, imm)
+            }
+            "wqmd" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::WQMD(r1, r2, r3, r4)
+            }
+            "wqam" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::WQAM(r1, r2, r3, r4)
+            }
+            "wqmm" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::WQMM(r1, r2, r3, r4)
+            }
             "xor" => {
                 let (r1, r2, r3) = three_regs(handler, args, immediate, whole_op_span)?;
                 VirtualOp::XOR(r1, r2, r3)
@@ -421,15 +484,35 @@ impl Op {
             /* Memory Instructions */
             "aloc" => {
                 let r1 = single_reg(handler, args, immediate, whole_op_span)?;
-                VirtualOp::ALOC(r1)
+                VirtualOp::ALOC(VirtualRegister::Constant(ConstantRegister::HeapPointer), r1)
             }
             "cfei" => {
                 let imm = single_imm_24(handler, args, immediate, whole_op_span)?;
-                VirtualOp::CFEI(imm)
+                VirtualOp::CFEI(
+                    VirtualRegister::Constant(ConstantRegister::StackPointer),
+                    imm,
+                )
             }
             "cfsi" => {
                 let imm = single_imm_24(handler, args, immediate, whole_op_span)?;
-                VirtualOp::CFSI(imm)
+                VirtualOp::CFSI(
+                    VirtualRegister::Constant(ConstantRegister::StackPointer),
+                    imm,
+                )
+            }
+            "cfe" => {
+                let r1 = single_reg(handler, args, immediate, whole_op_span)?;
+                VirtualOp::CFE(
+                    VirtualRegister::Constant(ConstantRegister::StackPointer),
+                    r1,
+                )
+            }
+            "cfs" => {
+                let r1 = single_reg(handler, args, immediate, whole_op_span)?;
+                VirtualOp::CFS(
+                    VirtualRegister::Constant(ConstantRegister::StackPointer),
+                    r1,
+                )
             }
             "lb" => {
                 let (r1, r2, imm) = two_regs_imm_12(handler, args, immediate, whole_op_span)?;
@@ -482,8 +565,8 @@ impl Op {
                 VirtualOp::BHSH(r1, r2)
             }
             "burn" => {
-                let r1 = single_reg(handler, args, immediate, whole_op_span)?;
-                VirtualOp::BURN(r1)
+                let (r1, r2) = two_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::BURN(r1, r2)
             }
             "call" => {
                 let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
@@ -505,10 +588,17 @@ impl Op {
                 let (r1, r2) = two_regs(handler, args, immediate, whole_op_span)?;
                 VirtualOp::CSIZ(r1, r2)
             }
-
+            "bsiz" => {
+                let (r1, r2) = two_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::BSIZ(r1, r2)
+            }
             "ldc" => {
-                let (r1, r2, r3) = three_regs(handler, args, immediate, whole_op_span)?;
-                VirtualOp::LDC(r1, r2, r3)
+                let (r1, r2, r3, i0) = three_regs_imm_06(handler, args, immediate, whole_op_span)?;
+                VirtualOp::LDC(r1, r2, r3, i0)
+            }
+            "bldd" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::BLDD(r1, r2, r3, r4)
             }
             "log" => {
                 let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
@@ -519,8 +609,8 @@ impl Op {
                 VirtualOp::LOGD(r1, r2, r3, r4)
             }
             "mint" => {
-                let r1 = single_reg(handler, args, immediate, whole_op_span)?;
-                VirtualOp::MINT(r1)
+                let (r1, r2) = two_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::MINT(r1, r2)
             }
             "retd" => {
                 let (r1, r2) = two_regs(handler, args, immediate, whole_op_span)?;
@@ -568,9 +658,17 @@ impl Op {
             }
 
             /* Cryptographic Instructions */
-            "ecr" => {
+            "eck1" => {
                 let (r1, r2, r3) = three_regs(handler, args, immediate, whole_op_span)?;
-                VirtualOp::ECR(r1, r2, r3)
+                VirtualOp::ECK1(r1, r2, r3)
+            }
+            "ecr1" => {
+                let (r1, r2, r3) = three_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::ECR1(r1, r2, r3)
+            }
+            "ed19" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::ED19(r1, r2, r3, r4)
             }
             "k256" => {
                 let (r1, r2, r3) = three_regs(handler, args, immediate, whole_op_span)?;
@@ -580,8 +678,20 @@ impl Op {
                 let (r1, r2, r3) = three_regs(handler, args, immediate, whole_op_span)?;
                 VirtualOp::S256(r1, r2, r3)
             }
+            "ecop" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::ECOP(r1, r2, r3, r4)
+            }
+            "epar" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::EPAR(r1, r2, r3, r4)
+            }
 
             /* Other Instructions */
+            "ecal" => {
+                let (r1, r2, r3, r4) = four_regs(handler, args, immediate, whole_op_span)?;
+                VirtualOp::ECAL(r1, r2, r3, r4)
+            }
             "flag" => {
                 let r1 = single_reg(handler, args, immediate, whole_op_span)?;
                 VirtualOp::FLAG(r1)
@@ -630,6 +740,13 @@ impl Op {
         }
     }
 
+    pub(crate) fn def_const_registers(&self) -> BTreeSet<&VirtualRegister> {
+        match &self.opcode {
+            Either::Left(virt_op) => virt_op.def_const_registers(),
+            Either::Right(org_op) => org_op.def_const_registers(),
+        }
+    }
+
     pub(crate) fn successors(
         &self,
         index: usize,
@@ -644,7 +761,7 @@ impl Op {
 
     pub(crate) fn update_register(
         &self,
-        reg_to_reg_map: &HashMap<&VirtualRegister, &VirtualRegister>,
+        reg_to_reg_map: &IndexMap<&VirtualRegister, &VirtualRegister>,
     ) -> Self {
         Op {
             opcode: match &self.opcode {
@@ -681,7 +798,7 @@ fn single_reg(
         });
     }
 
-    let reg = match args.get(0) {
+    let reg = match args.first() {
         Some(reg) => reg,
         _ => {
             return Err(
@@ -717,7 +834,7 @@ fn two_regs(
         });
     }
 
-    let (reg, reg2) = match (args.get(0), args.get(1)) {
+    let (reg, reg2) = match (args.first(), args.get(1)) {
         (Some(reg), Some(reg2)) => (reg, reg2),
         _ => {
             return Err(
@@ -761,7 +878,7 @@ fn four_regs(
         });
     }
 
-    let (reg, reg2, reg3, reg4) = match (args.get(0), args.get(1), args.get(2), args.get(3)) {
+    let (reg, reg2, reg3, reg4) = match (args.first(), args.get(1), args.get(2), args.get(3)) {
         (Some(reg), Some(reg2), Some(reg3), Some(reg4)) => (reg, reg2, reg3, reg4),
         _ => {
             return Err(
@@ -779,32 +896,6 @@ fn four_regs(
             handler.emit_err(CompileError::MissingImmediate { span: i.span() });
         }
     };
-
-    impl ConstantRegister {
-        pub(crate) fn parse_register_name(raw: &str) -> Option<ConstantRegister> {
-            use ConstantRegister::*;
-            Some(match raw {
-                "zero" => Zero,
-                "one" => One,
-                "of" => Overflow,
-                "pc" => ProgramCounter,
-                "ssp" => StackStartPointer,
-                "sp" => StackPointer,
-                "fp" => FramePointer,
-                "hp" => HeapPointer,
-                "err" => Error,
-                "ggas" => GlobalGas,
-                "cgas" => ContextGas,
-                "bal" => Balance,
-                "is" => InstructionStart,
-                "flag" => Flags,
-                "retl" => ReturnLength,
-                "ret" => ReturnValue,
-                "ds" => DataSectionStart,
-                _ => return None,
-            })
-        }
-    }
 
     // Immediate Value.
     pub type ImmediateValue = u32;
@@ -826,7 +917,7 @@ fn three_regs(
         });
     }
 
-    let (reg, reg2, reg3) = match (args.get(0), args.get(1), args.get(2)) {
+    let (reg, reg2, reg3) = match (args.first(), args.get(1), args.get(2)) {
         (Some(reg), Some(reg2), Some(reg3)) => (reg, reg2, reg3),
         _ => {
             return Err(
@@ -898,7 +989,7 @@ fn single_reg_imm_18(
             received: args.len(),
         });
     }
-    let reg = match args.get(0) {
+    let reg = match args.first() {
         Some(reg) => reg,
         _ => {
             return Err(
@@ -948,7 +1039,7 @@ fn two_regs_imm_12(
             received: args.len(),
         });
     }
-    let (reg, reg2) = match (args.get(0), args.get(1)) {
+    let (reg, reg2) = match (args.first(), args.get(1)) {
         (Some(reg), Some(reg2)) => (reg, reg2),
         _ => {
             return Err(
@@ -986,19 +1077,68 @@ fn two_regs_imm_12(
     Ok((reg.clone(), reg2.clone(), imm))
 }
 
+fn three_regs_imm_06(
+    handler: &Handler,
+    args: &[VirtualRegister],
+    immediate: &Option<Ident>,
+    whole_op_span: Span,
+) -> Result<
+    (
+        VirtualRegister,
+        VirtualRegister,
+        VirtualRegister,
+        VirtualImmediate06,
+    ),
+    ErrorEmitted,
+> {
+    if args.len() > 3 {
+        handler.emit_err(CompileError::IncorrectNumberOfAsmRegisters {
+            span: whole_op_span.clone(),
+            expected: 3,
+            received: args.len(),
+        });
+    }
+    let (reg, reg2, reg3) = match (args.first(), args.get(1), args.get(2)) {
+        (Some(reg), Some(reg2), Some(reg3)) => (reg, reg2, reg3),
+        _ => {
+            return Err(
+                handler.emit_err(CompileError::IncorrectNumberOfAsmRegisters {
+                    span: whole_op_span,
+                    expected: 3,
+                    received: args.len(),
+                }),
+            );
+        }
+    };
+    let (imm, imm_span): (u64, _) = match immediate {
+        None => {
+            return Err(handler.emit_err(CompileError::MissingImmediate {
+                span: whole_op_span,
+            }));
+        }
+        Some(i) => match i.as_str()[1..].parse() {
+            Ok(o) => (o, i.span()),
+            Err(_) => {
+                return Err(
+                    handler.emit_err(CompileError::InvalidImmediateValue { span: i.span() })
+                );
+            }
+        },
+    };
+
+    let imm = match VirtualImmediate06::new(imm, imm_span) {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(handler.emit_err(e));
+        }
+    };
+
+    Ok((reg.clone(), reg2.clone(), reg3.clone(), imm))
+}
+
 impl fmt::Display for Op {
     fn fmt(&self, fmtr: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // We want the comment to always be 40 characters offset to the right to not interfere with
-        // the ASM but to be aligned.
-        let mut op_and_comment = self.opcode.to_string();
-        if !self.comment.is_empty() {
-            while op_and_comment.len() < COMMENT_START_COLUMN {
-                op_and_comment.push(' ');
-            }
-            write!(op_and_comment, "; {}", self.comment)?;
-        }
-
-        write!(fmtr, "{op_and_comment}")
+        fmt_opcode_and_comment(self.opcode.to_string(), &self.comment, fmtr)
     }
 }
 
@@ -1041,8 +1181,10 @@ impl fmt::Display for VirtualOp {
             WQOP(a, b, c, d) => write!(fmtr, "wqop {a} {b} {c} {d}"),
             WQML(a, b, c, d) => write!(fmtr, "wqml {a} {b} {c} {d}"),
             WQDV(a, b, c, d) => write!(fmtr, "wqdv {a} {b} {c} {d}"),
+            WQMD(a, b, c, d) => write!(fmtr, "wqmd {a} {b} {c} {d}"),
             WQCM(a, b, c, d) => write!(fmtr, "wqcm {a} {b} {c} {d}"),
             WQAM(a, b, c, d) => write!(fmtr, "wqam {a} {b} {c} {d}"),
+            WQMM(a, b, c, d) => write!(fmtr, "wqmm {a} {b} {c} {d}"),
 
             /* Control Flow Instructions */
             JMP(a) => write!(fmtr, "jmp {a}"),
@@ -1053,9 +1195,11 @@ impl fmt::Display for VirtualOp {
             RET(a) => write!(fmtr, "ret {a}"),
 
             /* Memory Instructions */
-            ALOC(a) => write!(fmtr, "aloc {a}"),
-            CFEI(a) => write!(fmtr, "cfei {a}"),
-            CFSI(a) => write!(fmtr, "cfsi {a}"),
+            ALOC(_hp, a) => write!(fmtr, "aloc {a}"),
+            CFEI(_sp, a) => write!(fmtr, "cfei {a}"),
+            CFSI(_sp, a) => write!(fmtr, "cfsi {a}"),
+            CFE(_sp, a) => write!(fmtr, "cfe {a}"),
+            CFS(_sp, a) => write!(fmtr, "cfs {a}"),
             LB(a, b, c) => write!(fmtr, "lb {a} {b} {c}"),
             LW(a, b, c) => write!(fmtr, "lw {a} {b} {c}"),
             MCL(a, b) => write!(fmtr, "mcl {a} {b}"),
@@ -1070,16 +1214,18 @@ impl fmt::Display for VirtualOp {
             BAL(a, b, c) => write!(fmtr, "bal {a} {b} {c}"),
             BHEI(a) => write!(fmtr, "bhei {a}"),
             BHSH(a, b) => write!(fmtr, "bhsh {a} {b}"),
-            BURN(a) => write!(fmtr, "burn {a}"),
+            BURN(a, b) => write!(fmtr, "burn {a} {b}"),
             CALL(a, b, c, d) => write!(fmtr, "call {a} {b} {c} {d}"),
             CB(a) => write!(fmtr, "cb {a}"),
             CCP(a, b, c, d) => write!(fmtr, "ccp {a} {b} {c} {d}"),
             CROO(a, b) => write!(fmtr, "croo {a} {b}"),
             CSIZ(a, b) => write!(fmtr, "csiz {a} {b}"),
-            LDC(a, b, c) => write!(fmtr, "ldc {a} {b} {c}"),
+            BSIZ(a, b) => write!(fmtr, "bsiz {a} {b}"),
+            LDC(a, b, c, d) => write!(fmtr, "ldc {a} {b} {c} {d}"),
+            BLDD(a, b, c, d) => write!(fmtr, "bldd {a} {b} {c} {d}"),
             LOG(a, b, c, d) => write!(fmtr, "log {a} {b} {c} {d}"),
             LOGD(a, b, c, d) => write!(fmtr, "logd {a} {b} {c} {d}"),
-            MINT(a) => write!(fmtr, "mint {a}"),
+            MINT(a, b) => write!(fmtr, "mint {a} {b}"),
             RETD(a, b) => write!(fmtr, "retd {a} {b}"),
             RVRT(a) => write!(fmtr, "rvrt {a}"),
             SMO(a, b, c, d) => write!(fmtr, "smo {a} {b} {c} {d}"),
@@ -1093,11 +1239,16 @@ impl fmt::Display for VirtualOp {
             TRO(a, b, c, d) => write!(fmtr, "tro {a} {b} {c} {d}"),
 
             /* Cryptographic Instructions */
-            ECR(a, b, c) => write!(fmtr, "ecr {a} {b} {c}"),
+            ECK1(a, b, c) => write!(fmtr, "eck1 {a} {b} {c}"),
+            ECR1(a, b, c) => write!(fmtr, "ecr1 {a} {b} {c}"),
+            ED19(a, b, c, d) => write!(fmtr, "ed19 {a} {b} {c} {d}"),
             K256(a, b, c) => write!(fmtr, "k256 {a} {b} {c}"),
             S256(a, b, c) => write!(fmtr, "s256 {a} {b} {c}"),
+            ECOP(a, b, c, d) => write!(fmtr, "ecop {a} {b} {c} {d}"),
+            EPAR(a, b, c, d) => write!(fmtr, "epar {a} {b} {c} {d}"),
 
             /* Other Instructions */
+            ECAL(a, b, c, d) => write!(fmtr, "ecal {a} {b} {c} {d}"),
             FLAG(a) => write!(fmtr, "flag {a}"),
             GM(a, b) => write!(fmtr, "gm {a} {b}"),
             GTF(a, b, c) => write!(fmtr, "gtf {a} {b} {c}"),
@@ -1105,10 +1256,9 @@ impl fmt::Display for VirtualOp {
             /* Non-VM Instructions */
             BLOB(a) => write!(fmtr, "blob {a}"),
             DataSectionOffsetPlaceholder => write!(fmtr, "data section offset placeholder"),
-            DataSectionRegisterLoadPlaceholder => {
-                write!(fmtr, "data section register load placeholder")
-            }
-            LWDataId(a, b) => write!(fmtr, "lw {a} {b}"),
+            ConfigurablesOffsetPlaceholder => write!(fmtr, "configurables offset placeholder"),
+            LoadDataId(a, b) => write!(fmtr, "load {a} {b}"),
+            AddrDataId(a, b) => write!(fmtr, "addr {a} {b}"),
             Undefined => write!(fmtr, "undefined op"),
         }
     }
@@ -1116,17 +1266,7 @@ impl fmt::Display for VirtualOp {
 
 impl fmt::Display for AllocatedAbstractOp {
     fn fmt(&self, fmtr: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // We want the comment to always be 40 characters offset to the right to not interfere with
-        // the ASM but to be aligned.
-        let mut op_and_comment = self.opcode.to_string();
-        if !self.comment.is_empty() {
-            while op_and_comment.len() < COMMENT_START_COLUMN {
-                op_and_comment.push(' ');
-            }
-            write!(op_and_comment, "; {}", self.comment)?;
-        }
-
-        write!(fmtr, "{op_and_comment}")
+        fmt_opcode_and_comment(self.opcode.to_string(), &self.comment, fmtr)
     }
 }
 
@@ -1146,6 +1286,8 @@ pub(crate) enum ControlFlowOp<Reg> {
     Call(Label),
     // Save a return label address in a register.
     SaveRetAddr(Reg, Label),
+    // Placeholder for the offset into the configurables section.
+    ConfigurablesOffsetPlaceholder,
     // placeholder for the DataSection offset
     DataSectionOffsetPlaceholder,
     // Placeholder for loading an address from the data section.
@@ -1173,6 +1315,8 @@ impl<Reg: fmt::Display> fmt::Display for ControlFlowOp<Reg> {
                 SaveRetAddr(r1, lab) => format!("mova {r1} {lab}"),
                 DataSectionOffsetPlaceholder =>
                     "DATA SECTION OFFSET[0..32]\nDATA SECTION OFFSET[32..64]".into(),
+                ConfigurablesOffsetPlaceholder =>
+                    "CONFIGURABLES_OFFSET[0..32]\nCONFIGURABLES_OFFSET[32..64]".into(),
                 LoadLabel(r1, lab) => format!("lwlab {r1} {lab}"),
                 PushAll(lab) => format!("pusha {lab}"),
                 PopAll(lab) => format!("popa {lab}"),
@@ -1190,6 +1334,7 @@ impl<Reg: Clone + Eq + Ord + Hash> ControlFlowOp<Reg> {
             | Jump(_)
             | Call(_)
             | DataSectionOffsetPlaceholder
+            | ConfigurablesOffsetPlaceholder
             | PushAll(_)
             | PopAll(_) => vec![],
 
@@ -1208,6 +1353,7 @@ impl<Reg: Clone + Eq + Ord + Hash> ControlFlowOp<Reg> {
             | Call(_)
             | SaveRetAddr(..)
             | DataSectionOffsetPlaceholder
+            | ConfigurablesOffsetPlaceholder
             | LoadLabel(..)
             | PushAll(_)
             | PopAll(_) => vec![],
@@ -1229,6 +1375,7 @@ impl<Reg: Clone + Eq + Ord + Hash> ControlFlowOp<Reg> {
             | JumpIfNotZero(..)
             | Call(_)
             | DataSectionOffsetPlaceholder
+            | ConfigurablesOffsetPlaceholder
             | PushAll(_)
             | PopAll(_) => vec![],
         })
@@ -1236,7 +1383,11 @@ impl<Reg: Clone + Eq + Ord + Hash> ControlFlowOp<Reg> {
         .collect()
     }
 
-    pub(crate) fn update_register(&self, reg_to_reg_map: &HashMap<&Reg, &Reg>) -> Self {
+    pub(crate) fn def_const_registers(&self) -> BTreeSet<&VirtualRegister> {
+        BTreeSet::new()
+    }
+
+    pub(crate) fn update_register(&self, reg_to_reg_map: &IndexMap<&Reg, &Reg>) -> Self {
         let update_reg = |reg: &Reg| -> Reg { (*reg_to_reg_map.get(reg).unwrap_or(&reg)).clone() };
 
         use ControlFlowOp::*;
@@ -1246,6 +1397,7 @@ impl<Reg: Clone + Eq + Ord + Hash> ControlFlowOp<Reg> {
             | Jump(_)
             | Call(_)
             | DataSectionOffsetPlaceholder
+            | ConfigurablesOffsetPlaceholder
             | PushAll(_)
             | PopAll(_) => self.clone(),
 
@@ -1275,6 +1427,7 @@ impl<Reg: Clone + Eq + Ord + Hash> ControlFlowOp<Reg> {
             | Call(_)
             | SaveRetAddr(..)
             | DataSectionOffsetPlaceholder
+            | ConfigurablesOffsetPlaceholder
             | LoadLabel(..)
             | PushAll(_)
             | PopAll(_) => (),
@@ -1331,6 +1484,7 @@ impl ControlFlowOp<VirtualRegister> {
             Jump(label) => Jump(*label),
             Call(label) => Call(*label),
             DataSectionOffsetPlaceholder => DataSectionOffsetPlaceholder,
+            ConfigurablesOffsetPlaceholder => ConfigurablesOffsetPlaceholder,
             PushAll(label) => PushAll(*label),
             PopAll(label) => PopAll(*label),
 

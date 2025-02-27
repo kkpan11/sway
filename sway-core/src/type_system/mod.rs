@@ -1,20 +1,63 @@
-mod ast_elements;
+pub(crate) mod ast_elements;
 mod engine;
 mod id;
 mod info;
+pub(crate) mod monomorphization;
 mod priv_prelude;
 mod substitute;
-mod unify;
+pub(crate) mod unify;
 
+#[allow(unused)]
+use std::ops::Deref;
+
+pub use substitute::subst_types::SubstTypesContext;
+
+#[cfg(test)]
+use crate::language::{CallPath, CallPathType};
+#[cfg(test)]
+use crate::{language::ty::TyEnumDecl, transform::AttributesMap};
 pub use priv_prelude::*;
 #[cfg(test)]
 use sway_error::handler::Handler;
-
 #[cfg(test)]
-use crate::{language::ty::TyEnumDecl, transform::AttributesMap};
-
+use sway_types::BaseIdent;
 #[cfg(test)]
 use sway_types::{integer_bits::IntegerBits, Span};
+
+/// This type is used to denote if, during monomorphization, the compiler
+/// should enforce that type arguments be provided. An example of that
+/// might be this:
+///
+/// ```ignore
+/// struct Point<T> {
+///   x: u64,
+///   y: u64
+/// }
+///
+/// fn add<T>(p1: Point<T>, p2: Point<T>) -> Point<T> {
+///   Point {
+///     x: p1.x + p2.x,
+///     y: p1.y + p2.y
+///   }
+/// }
+/// ```
+///
+/// `EnforceTypeArguments` would require that the type annotations
+/// for `p1` and `p2` contain `<...>`. This is to avoid ambiguous definitions:
+///
+/// ```ignore
+/// fn add(p1: Point, p2: Point) -> Point {
+///   Point {
+///     x: p1.x + p2.x,
+///     y: p1.y + p2.y
+///   }
+/// }
+/// ```
+#[derive(Clone, Copy)]
+pub(crate) enum EnforceTypeArguments {
+    Yes,
+    No,
+}
 
 #[test]
 fn generic_enum_resolution() {
@@ -34,28 +77,22 @@ fn generic_enum_resolution() {
         a: _
     }
     */
-    let generic_type = engines.te().insert(
-        &engines,
-        TypeInfo::UnknownGeneric {
-            name: generic_name.clone(),
-            trait_constraints: VecSet(Vec::new()),
-        },
-    );
-    let placeholder_type = engines.te().insert(
-        &engines,
-        TypeInfo::Placeholder(TypeParameter {
-            type_id: generic_type,
-            initial_type_id: generic_type,
-            name_ident: generic_name.clone(),
-            trait_constraints: vec![],
-            trait_constraints_span: sp.clone(),
-            is_from_parent: false,
-        }),
-    );
+    let generic_type =
+        engines
+            .te()
+            .new_unknown_generic(generic_name.clone(), VecSet(vec![]), None, false);
+    let placeholder_type = engines.te().new_placeholder(TypeParameter {
+        type_id: generic_type,
+        initial_type_id: generic_type,
+        name: generic_name.clone(),
+        trait_constraints: vec![],
+        trait_constraints_span: sp.clone(),
+        is_from_parent: false,
+    });
     let placeholder_type_param = TypeParameter {
         type_id: placeholder_type,
         initial_type_id: placeholder_type,
-        name_ident: generic_name.clone(),
+        name: generic_name.clone(),
         trait_constraints: vec![],
         trait_constraints_span: sp.clone(),
         is_from_parent: false,
@@ -73,22 +110,27 @@ fn generic_enum_resolution() {
         attributes: transform::AttributesMap::default(),
     }];
 
-    let decl_ref_1 = engines.de().insert(TyEnumDecl {
-        call_path: result_name.clone().into(),
-        type_parameters: vec![placeholder_type_param],
-        variants: variant_types,
-        span: sp.clone(),
-        visibility: crate::language::Visibility::Public,
-        attributes: AttributesMap::default(),
-    });
-    let ty_1 = engines.te().insert(&engines, TypeInfo::Enum(decl_ref_1));
+    let mut call_path: CallPath<BaseIdent> = result_name.clone().into();
+    call_path.callpath_type = CallPathType::Full;
+    let decl_ref_1 = engines.de().insert(
+        TyEnumDecl {
+            call_path,
+            type_parameters: vec![placeholder_type_param],
+            variants: variant_types,
+            span: sp.clone(),
+            visibility: crate::language::Visibility::Public,
+            attributes: AttributesMap::default(),
+        },
+        None,
+    );
+    let ty_1 = engines.te().insert_enum(&engines, *decl_ref_1.id());
 
     /*
     Result<bool> {
         a: bool
     }
     */
-    let boolean_type = engines.te().insert(&engines, TypeInfo::Boolean);
+    let boolean_type = engines.te().id_of_bool();
     let variant_types = vec![ty::TyEnumVariant {
         name: a_name,
         tag: 0,
@@ -104,20 +146,26 @@ fn generic_enum_resolution() {
     let type_param = TypeParameter {
         type_id: boolean_type,
         initial_type_id: boolean_type,
-        name_ident: generic_name,
+        name: generic_name,
         trait_constraints: vec![],
         trait_constraints_span: sp.clone(),
         is_from_parent: false,
     };
-    let decl_ref_2 = engines.de().insert(TyEnumDecl {
-        call_path: result_name.into(),
-        type_parameters: vec![type_param],
-        variants: variant_types.clone(),
-        span: sp.clone(),
-        visibility: crate::language::Visibility::Public,
-        attributes: AttributesMap::default(),
-    });
-    let ty_2 = engines.te().insert(&engines, TypeInfo::Enum(decl_ref_2));
+
+    let mut call_path: CallPath<BaseIdent> = result_name.into();
+    call_path.callpath_type = CallPathType::Full;
+    let decl_ref_2 = engines.de().insert(
+        TyEnumDecl {
+            call_path,
+            type_parameters: vec![type_param],
+            variants: variant_types.clone(),
+            span: sp.clone(),
+            visibility: crate::language::Visibility::Public,
+            attributes: AttributesMap::default(),
+        },
+        None,
+    );
+    let ty_2 = engines.te().insert_enum(&engines, *decl_ref_2.id());
 
     // Unify them together...
     let h = Handler::default();
@@ -125,11 +173,11 @@ fn generic_enum_resolution() {
     let (_, errors) = h.consume();
     assert!(errors.is_empty());
 
-    if let TypeInfo::Enum(decl_ref_1) = engines.te().get(ty_1) {
-        let decl = engines.de().get_enum(&decl_ref_1);
+    if let TypeInfo::Enum(decl_ref_1) = &*engines.te().get(ty_1) {
+        let decl = engines.de().get_enum(decl_ref_1);
         assert_eq!(decl.call_path.suffix.as_str(), "Result");
         assert!(matches!(
-            engines.te().get(variant_types[0].type_argument.type_id),
+            &*engines.te().get(variant_types[0].type_argument.type_id),
             TypeInfo::Boolean
         ));
     } else {
@@ -144,10 +192,8 @@ fn basic_numeric_unknown() {
 
     let sp = Span::dummy();
     // numerics
-    let id = engines.te().insert(&engines, TypeInfo::Numeric);
-    let id2 = engines
-        .te()
-        .insert(&engines, TypeInfo::UnsignedInteger(IntegerBits::Eight));
+    let id = engines.te().new_numeric();
+    let id2 = engines.te().id_of_u8();
 
     // Unify them together...
     let h = Handler::default();
@@ -168,10 +214,8 @@ fn unify_numerics() {
     let sp = Span::dummy();
 
     // numerics
-    let id = engines.te().insert(&engines, TypeInfo::Numeric);
-    let id2 = engines
-        .te()
-        .insert(&engines, TypeInfo::UnsignedInteger(IntegerBits::Eight));
+    let id = engines.te().new_numeric();
+    let id2 = engines.te().id_of_u8();
 
     // Unify them together...
     let h = Handler::default();
@@ -193,8 +237,8 @@ fn unify_numerics_2() {
     let sp = Span::dummy();
 
     // numerics
-    let id = type_engine.insert(&engines, TypeInfo::Numeric);
-    let id2 = type_engine.insert(&engines, TypeInfo::UnsignedInteger(IntegerBits::Eight));
+    let id = engines.te().new_numeric();
+    let id2 = engines.te().id_of_u8();
 
     // Unify them together...
     let h = Handler::default();

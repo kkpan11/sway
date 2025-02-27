@@ -3,14 +3,18 @@ pub use abi::*;
 pub mod asm_builder;
 pub mod evm;
 pub use evm::*;
-mod miden_vm;
-pub use miden_vm::*;
 pub mod from_ir;
 pub mod fuel;
-mod instruction_set;
-mod programs;
+pub mod instruction_set;
 
 mod finalized_asm;
-pub use finalized_asm::{CompiledBytecode, FinalizedAsm, FinalizedEntry};
+pub use finalized_asm::*;
+pub use fuel::data_section::{Datum, Entry};
 
-pub(crate) use programs::ProgramKind;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramKind {
+    Contract,
+    Library,
+    Predicate,
+    Script,
+}

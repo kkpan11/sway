@@ -1,7 +1,7 @@
 library;
 
 use ::bytes::Bytes;
-use ::option::Option;
+use ::option::Option::{self, *};
 use ::storage::storable_slice::*;
 use ::storage::storage_api::read;
 use ::string::String;
@@ -11,127 +11,131 @@ pub struct StorageString {}
 impl StorableSlice<String> for StorageKey<StorageString> {
     /// Takes a `String` type and saves the underlying data in storage.
     ///
-    /// ### Arguments
+    /// # Arguments
     ///
-    /// * `string` - The string which will be stored.
+    /// * `string`: [String] - The string which will be stored.
     ///
-    /// ### Number of Storage Accesses
+    /// # Number of Storage Accesses
     ///
     /// * Writes: `2`
     ///
-    /// ### Examples
+    /// # Examples
     ///
     /// ```sway
+    /// use std::{storage::storage_string::StorageString, string::String};
+    ///
     /// storage {
     ///     stored_string: StorageString = StorageString {}
     /// }
     ///
     /// fn foo() {
-    ///     let mut bytes = Bytes::new();
-    ///     bytes.push(5_u8);
-    ///     bytes.push(7_u8);
-    ///     bytes.push(9_u8);
-    ///     let string = String::from(bytes);
-    /// 
+    ///     let string = String::from_ascii_str("Fuel is blazingly fast");
+    ///
     ///     storage.stored_string.write_slice(string);
     /// }
     /// ```
     #[storage(read, write)]
     fn write_slice(self, string: String) {
-        write_slice(self.slot, string.as_raw_slice());
+        write_slice(self.field_id(), string.as_raw_slice());
     }
 
     /// Constructs a `String` type from storage.
     ///
-    /// ### Number of Storage Accesses
+    /// # Returns
+    ///
+    /// * [Option<String>] - The valid `String` stored, otherwise `None`.
+    ///
+    /// # Number of Storage Accesses
     ///
     /// * Reads: `2`
     ///
-    /// ### Examples
+    /// # Examples
     ///
     /// ```sway
+    /// use std::{storage::storage_string::StorageString, string::String};
+    ///
     /// storage {
     ///     stored_string: StorageString = StorageString {}
     /// }
     ///
     /// fn foo() {
-    ///     let mut bytes = Bytes::new();
-    ///     bytes.push(5_u8);
-    ///     bytes.push(7_u8);
-    ///     bytes.push(9_u8);
-    ///     let string = String::from(bytes);
+    ///     let string = String::from_ascii_str("Fuel is blazingly fast");
     ///
-    ///     assert(storage.stored_string.read_slice(key).is_none());
+    ///     assert(storage.stored_string.read_slice().is_none());
     ///     storage.stored_string.write_slice(string);
-    ///     let retrieved_string = storage.stored_string.read_slice(key).unwrap();
+    ///     let retrieved_string = storage.stored_string.read_slice().unwrap();
     ///     assert(string == retrieved_string);
     /// }
     /// ```
     #[storage(read)]
     fn read_slice(self) -> Option<String> {
-        match read_slice(self.slot) {
-            Option::Some(slice) => {
-                Option::Some(String::from(slice))
+        match read_slice(self.field_id()) {
+            Some(slice) => {
+                Some(String::from(slice))
             },
-            Option::None => Option::None,
+            None => None,
         }
     }
 
     /// Clears a stored `String` in storage.
     ///
-    /// ### Number of Storage Accesses
+    /// # Returns
+    ///
+    /// * [bool] - Indicates whether all of the storage slots cleared were previously set.
+    ///
+    /// # Number of Storage Accesses
     ///
     /// * Reads: `1`
     /// * Clears: `2`
     ///
-    /// ### Examples
+    /// # Examples
     ///
     /// ```sway
+    /// use std::{storage::storage_string::StorageString, string::String};
+    ///
     /// storage {
     ///     stored_string: StorageString = StorageString {}
     /// }
     ///
     /// fn foo() {
-    ///     let mut bytes = Bytes::new();
-    ///     bytes.push(5_u8);
-    ///     bytes.push(7_u8);
-    ///     bytes.push(9_u8);
-    ///     let string = String::from(bytes);
-    /// 
+    ///     let string = String::from_ascii_str("Fuel is blazingly fast");
+    ///
     ///     storage.stored_string.write_slice(string);
     ///
-    ///     assert(storage.stored_string.read_slice(key).is_some());
+    ///     assert(storage.stored_string.read_slice().is_some());
     ///     let cleared = storage.stored_string.clear();
     ///     assert(cleared);
-    ///     let retrieved_string = storage.stored_string.read_slice(key);
+    ///     let retrieved_string = storage.stored_string.read_slice();
     ///     assert(retrieved_string.is_none());
     /// }
     /// ```
     #[storage(read, write)]
     fn clear(self) -> bool {
-        clear_slice(self.slot)
+        clear_slice(self.field_id())
     }
 
     /// Returns the length of `String` in storage.
     ///
-    /// ### Number of Storage Accesses
+    /// # Returns
+    ///
+    /// * [u64] - The length of the bytes in storage.
+    ///
+    /// # Number of Storage Accesses
     ///
     /// * Reads: `1`
     ///
-    /// ### Examples
+    /// # Examples
     ///
     /// ```sway
+    /// use std::{storage::storage_string::StorageString, string::String};
+    ///
     /// storage {
     ///     stored_string: StorageString = StorageString {}
     /// }
     ///
     /// fn foo() {
-    ///     let mut bytes = Bytes::new();
-    ///     bytes.push(5_u8);
-    ///     bytes.push(7_u8);
-    ///     bytes.push(9_u8);
-    ///     let string = String::from(bytes);
-    /// 
+    ///     let string = String::from_ascii_str("Fuel is blazingly fast");
+    ///
     ///     assert(storage.stored_string.len() == 0)
     ///     storage.stored_string.write_slice(string);
     ///     assert(storage.stored_string.len() == 3);
@@ -139,6 +143,6 @@ impl StorableSlice<String> for StorageKey<StorageString> {
     /// ```
     #[storage(read)]
     fn len(self) -> u64 {
-        read::<u64>(self.slot, 0).unwrap_or(0)
+        read::<u64>(self.field_id(), 0).unwrap_or(0)
     }
 }

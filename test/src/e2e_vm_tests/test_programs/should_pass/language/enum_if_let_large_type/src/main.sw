@@ -16,12 +16,12 @@ struct Product {
 }
 
 struct ItemDetails {
-    name: str[4],
+    name: str,
     price: u64,
 }
 
 enum SaleError {
-    NotEnoughInventory: str[3],
+    NotEnoughInventory: str,
 }
 
 fn main() -> u64 {
@@ -43,7 +43,7 @@ fn main() -> u64 {
 fn sell_product(product: Product) -> Result<Product, SaleError> {
     let mut product = product;
     if product.number_available < 1 {
-        return Result::Err::<Product, SaleError>(SaleError::NotEnoughInventory("noo"));
+        return Result::Err::<Product, SaleError>(SaleError::NotEnoughInventory("no"));
     };
     product.number_sold = product.number_sold + 1;
     product.number_available = product.number_available - 1;

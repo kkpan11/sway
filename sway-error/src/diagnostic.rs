@@ -5,10 +5,10 @@ use sway_types::{SourceEngine, Span};
 /// Provides detailed, rich description of a compile error or warning.
 #[derive(Debug, Default)]
 pub struct Diagnostic {
-    pub(crate) reason: Option<Reason>, // TODO: Make mandatory once we remove all old-style warnings and errors.
-    pub(crate) issue: Issue,
-    pub(crate) hints: Vec<Hint>,
-    pub(crate) help: Vec<String>,
+    pub reason: Option<Reason>, // TODO: Make mandatory once we remove all old-style warnings and errors.
+    pub issue: Issue,
+    pub hints: Vec<Hint>,
+    pub help: Vec<String>,
 }
 
 impl Diagnostic {
@@ -23,7 +23,8 @@ impl Diagnostic {
         match self.issue.label_type {
             LabelType::Error => Level::Error,
             LabelType::Warning => Level::Warning,
-            _ => unreachable!("The diagnostic level can be only Error or Warning, and this is enforced via Diagnostics API.")
+            LabelType::Info => Level::Info,
+            _ => unreachable!("The diagnostic level can be only Error, Warning, or Info, and this is enforced via Diagnostics API.")
         }
     }
 
@@ -39,14 +40,12 @@ impl Diagnostic {
     pub fn labels(&self) -> Vec<&Label> {
         let mut labels = Vec::<&Label>::new();
 
-        for hint in self.hints.iter().filter(|hint| hint.is_in_source()) {
-            labels.push(hint);
+        if self.issue.is_in_source() {
+            labels.push(&self.issue);
         }
 
-        // If the issue is in source and there are no hints that override the issue,
-        // add the issue to the labels.
-        if self.issue.is_in_source() && self.hints.iter().all(|hint| hint.span != self.issue.span) {
-            labels.push(&self.issue);
+        for hint in self.hints.iter().filter(|hint| hint.is_in_source()) {
+            labels.push(hint);
         }
 
         labels
@@ -76,22 +75,40 @@ impl Diagnostic {
         self.help.iter().filter(|help| !help.is_empty())
     }
 
+    /// A help text that will never be displayed. Convenient when defining help lines
+    /// that are displayed only when a condition is met.
+    pub fn help_none() -> String {
+        String::new()
+    }
+
+    /// Displays an empty line in the help footer.
+    /// Convenient when defining visual separations within suggestions.
+    pub fn help_empty_line() -> String {
+        String::from(" ")
+    }
+
     /// All the source files that are related to the diagnostic.
     /// This means the source file of the issue itself as well
     /// as source files of all the hints.
     pub fn related_sources(&self, include_issue_source: bool) -> Vec<&SourcePath> {
         let mut source_files = vec![];
 
-        // All unwrappings are safe because we check the existence
-        // either in is_in_source() or in in_source_info().
-        if self.issue.is_in_source() && include_issue_source {
+        let issue_is_in_source = self.issue.is_in_source();
+
+        // All `source_path()` unwrappings are safe because we check the existence
+        // of source in case of an issue, and `self.labels()` returns
+        // only labels that are in source.
+        if issue_is_in_source && include_issue_source {
             source_files.push(self.issue.source_path().unwrap());
         }
 
         for hint in self.labels() {
             let file = hint.source_path().unwrap();
 
-            if !include_issue_source && file == self.issue.source_path().unwrap() {
+            if !include_issue_source
+                && issue_is_in_source
+                && file == self.issue.source_path().unwrap()
+            {
                 continue;
             }
 
@@ -106,6 +123,7 @@ impl Diagnostic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Level {
+    Info,
     Warning,
     #[default]
     Error,
@@ -115,6 +133,7 @@ pub enum Level {
 pub enum LabelType {
     #[default]
     Info,
+    Help,
     Warning,
     Error,
 }
@@ -137,13 +156,16 @@ pub struct Label {
     label_type: LabelType,
     span: Span,
     text: String,
-    friendly_text: String,
     source_path: Option<SourcePath>,
 }
 
 impl Label {
     pub fn info(source_engine: &SourceEngine, span: Span, text: String) -> Label {
         Self::new(source_engine, LabelType::Info, span, text)
+    }
+
+    pub fn help(source_engine: &SourceEngine, span: Span, text: String) -> Label {
+        Self::new(source_engine, LabelType::Help, span, text)
     }
 
     pub fn warning(source_engine: &SourceEngine, span: Span, text: String) -> Label {
@@ -155,13 +177,11 @@ impl Label {
     }
 
     fn new(source_engine: &SourceEngine, label_type: LabelType, span: Span, text: String) -> Label {
-        let friendly_text = Self::maybe_uwuify(text.as_str());
         let source_path = Self::get_source_path(source_engine, &span);
         Label {
             label_type,
             span,
             text,
-            friendly_text,
             source_path,
         }
     }
@@ -183,10 +203,6 @@ impl Label {
         self.text.as_ref()
     }
 
-    pub fn friendly_text(&self) -> &str {
-        self.friendly_text.as_ref()
-    }
-
     pub fn source_path(&self) -> Option<&SourcePath> {
         self.source_path.as_ref()
     }
@@ -206,23 +222,6 @@ impl Label {
             _ => None,
         }
     }
-
-    #[cfg(all(feature = "uwu", any(target_arch = "x86", target_arch = "x86_64")))]
-    fn maybe_uwuify(raw: &str) -> String {
-        use uwuifier::uwuify_str_sse;
-        uwuify_str_sse(raw)
-    }
-
-    #[cfg(all(feature = "uwu", not(any(target_arch = "x86", target_arch = "x86_64"))))]
-    fn maybe_uwuify(raw: &str) -> String {
-        compile_error!("The `uwu` feature only works on x86 or x86_64 processors.");
-        Default::default()
-    }
-
-    #[cfg(not(feature = "uwu"))]
-    fn maybe_uwuify(raw: &str) -> String {
-        raw.to_string()
-    }
 }
 
 impl Default for Label {
@@ -231,7 +230,6 @@ impl Default for Label {
             label_type: LabelType::Info,
             span: Span::dummy(),
             text: "".to_string(),
-            friendly_text: "".to_string(),
             source_path: None,
         }
     }
@@ -252,6 +250,12 @@ impl Issue {
     pub fn error(source_engine: &SourceEngine, span: Span, text: String) -> Self {
         Self {
             label: Label::error(source_engine, span, text),
+        }
+    }
+
+    pub fn info(source_engine: &SourceEngine, span: Span, text: String) -> Self {
+        Self {
+            label: Label::info(source_engine, span, text),
         }
     }
 }
@@ -286,15 +290,61 @@ impl Hint {
         }
     }
 
+    pub fn multi_info(source_engine: &SourceEngine, span: &Span, hints: Vec<String>) -> Vec<Self> {
+        hints
+            .into_iter()
+            .map(|hint| Self::info(source_engine, span.clone(), hint))
+            .collect()
+    }
+
+    pub fn help(source_engine: &SourceEngine, span: Span, text: String) -> Self {
+        Self {
+            label: Label::help(source_engine, span, text),
+        }
+    }
+
+    pub fn multi_help(source_engine: &SourceEngine, span: &Span, hints: Vec<String>) -> Vec<Self> {
+        hints
+            .into_iter()
+            .map(|hint| Self::help(source_engine, span.clone(), hint))
+            .collect()
+    }
+
     pub fn warning(source_engine: &SourceEngine, span: Span, text: String) -> Self {
         Self {
             label: Label::warning(source_engine, span, text),
         }
     }
 
+    pub fn multi_warning(
+        source_engine: &SourceEngine,
+        span: &Span,
+        hints: Vec<String>,
+    ) -> Vec<Self> {
+        hints
+            .into_iter()
+            .map(|hint| Self::warning(source_engine, span.clone(), hint))
+            .collect()
+    }
+
     pub fn error(source_engine: &SourceEngine, span: Span, text: String) -> Self {
         Self {
             label: Label::error(source_engine, span, text),
+        }
+    }
+
+    pub fn multi_error(source_engine: &SourceEngine, span: &Span, hints: Vec<String>) -> Vec<Self> {
+        hints
+            .into_iter()
+            .map(|hint| Self::error(source_engine, span.clone(), hint))
+            .collect()
+    }
+
+    /// A [Hint] that will never be displayed. Convenient when defining [Hint]s that
+    /// are displayed only if a condition is met.
+    pub fn none() -> Self {
+        Self {
+            label: Label::default(),
         }
     }
 }
@@ -335,6 +385,7 @@ pub enum DiagnosticArea {
     TypeChecking,
     SemanticAnalysis,
     Warnings,
+    Migrations,
 }
 
 impl DiagnosticArea {
@@ -346,6 +397,7 @@ impl DiagnosticArea {
             Self::TypeChecking => "E3",
             Self::SemanticAnalysis => "E4",
             Self::Warnings => "W0",
+            Self::Migrations => "M0",
         }
     }
 }
@@ -380,6 +432,10 @@ impl Code {
 
     pub fn warnings(number: u16) -> Code {
         Self::new(DiagnosticArea::Warnings, number)
+    }
+
+    pub fn migrations(number: u16) -> Code {
+        Self::new(DiagnosticArea::Migrations, number)
     }
 
     fn new(area: DiagnosticArea, number: u16) -> Self {

@@ -8,16 +8,21 @@ use std::{
 use anyhow::Result;
 use colored::Colorize;
 use sway_core::{
-    compile_ir_to_asm, compile_to_ast, ir_generation::compile_program, namespace, BuildTarget,
-    Engines,
+    compile_ir_context_to_finalized_asm, compile_to_ast,
+    ir_generation::compile_program,
+    namespace::{self, Root},
+    BuildTarget, Engines,
 };
 use sway_error::handler::Handler;
 
+use sway_features::ExperimentalFeatures;
 use sway_ir::{
-    create_inline_in_module_pass, register_known_passes, PassGroup, PassManager, ARGDEMOTION_NAME,
-    CONSTDEMOTION_NAME, DCE_NAME, MEMCPYOPT_NAME, MISCDEMOTION_NAME, RETDEMOTION_NAME,
+    create_fn_inline_pass, register_known_passes, PassGroup, PassManager, ARG_DEMOTION_NAME,
+    CONST_DEMOTION_NAME, DCE_NAME, MEMCPYOPT_NAME, MISC_DEMOTION_NAME, RET_DEMOTION_NAME,
 };
-use sway_utils::PerformanceData;
+use sway_types::ProgramId;
+
+use crate::RunConfig;
 
 enum Checker {
     Ir,
@@ -31,7 +36,7 @@ impl Checker {
     /// of the file.
     /// Example:
     ///
-    /// ```
+    /// ```sway
     /// // ::check-ir::
     /// // ::check-ir-optimized::
     /// // ::check-ir-asm::
@@ -39,10 +44,10 @@ impl Checker {
     ///
     /// # ::check-ir-optimized::
     ///
-    /// Optimized IR chekcer can be configured with `pass: <PASSNAME or o1>`. When
+    /// Optimized IR checker can be configured with `pass: <PASSNAME or o1>`. When
     /// `o1` is chosen, all the configured passes are chosen automatically.
     ///
-    /// ```
+    /// ```sway
     /// // ::check-ir-optimized::
     /// // pass: o1
     /// ```
@@ -163,11 +168,21 @@ fn pretty_print_error_report(error: &str) {
     }
 }
 
-pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> Result<()> {
+pub(super) async fn run(
+    filter_regex: Option<&regex::Regex>,
+    verbose: bool,
+    run_config: &RunConfig,
+) -> Result<()> {
+    // Create new initial namespace for every test by reusing the precompiled
+    // standard libraries. The namespace, thus its root module, must have the
+    // name set.
+    const PACKAGE_NAME: &str = "test_lib";
+    let core_lib_name = sway_types::Ident::new_no_span(PACKAGE_NAME.to_string());
+
     // Compile core library and reuse it when compiling tests.
     let engines = Engines::default();
     let build_target = BuildTarget::default();
-    let core_lib = compile_core(build_target, &engines);
+    let core_root = compile_core(build_target, &engines, run_config);
 
     // Find all the tests.
     let all_tests = discover_test_files();
@@ -175,39 +190,46 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
     let mut run_test_count = 0;
     all_tests
         .into_iter()
-        .filter(|path| {
+        .filter_map(|path|  {
             // Filter against the regex.
-            path.to_str()
+            if path.to_str()
                 .and_then(|path_str| filter_regex.map(|regex| regex.is_match(path_str)))
-                .unwrap_or(true)
-        })
-        .map(|path| {
-            // Read entire file.
-            let input_bytes = fs::read(&path).expect("Read entire Sway source.");
-            let input = String::from_utf8_lossy(&input_bytes);
+                .unwrap_or(true)  {
+                // Read entire file.
+                let input_bytes = fs::read(&path).expect("Read entire Sway source.");
+                let input = String::from_utf8_lossy(&input_bytes);
 
-            let checkers = Checker::new(&input);
+                let checkers = Checker::new(&input);
 
-            let mut optimisation_inline = false;
-            let mut target_fuelvm = false;
+                let mut optimisation_inline = false;
+                let mut target_fuelvm = false;
 
-            if let Some(first_line) = input.lines().next() {
-                optimisation_inline = first_line.contains("optimisation-inline");
-                target_fuelvm = first_line.contains("target-fuelvm");
+                if let Some(first_line) = input.lines().next() {
+                    optimisation_inline = first_line.contains("optimisation-inline");
+                    target_fuelvm = first_line.contains("target-fuelvm");
+                }
+
+                Some((
+                    path,
+                    input_bytes,
+                    checkers,
+                    optimisation_inline,
+                    target_fuelvm,
+                ))
+            } else {
+                None
             }
-
-            (
-                path,
-                input_bytes,
-                checkers,
-                optimisation_inline,
-                target_fuelvm,
-            )
         })
         .for_each(
             |(path, sway_str, checkers, optimisation_inline, target_fuelvm)| {
                 let test_file_name = path.file_name().unwrap().to_string_lossy().to_string();
                 tracing::info!("Testing {} ...", test_file_name.bold());
+
+                let experimental = ExperimentalFeatures {
+                    new_encoding: false, // IR tests still need encoding v1 off.
+                    // TODO: Properly support experimental features in IR tests.
+                    ..Default::default()
+                };
 
                 // Compile to AST.  We need to provide a faux build config otherwise the IR will have
                 // no span metadata.
@@ -216,19 +238,23 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
                     PathBuf::from("/"),
                     build_target,
                 );
-                // Include unit tests in the build.
-                let bld_cfg = bld_cfg.include_tests(true);
 
-                let mut metrics = PerformanceData::default();
+                // Include unit tests in the build.
+                let bld_cfg = bld_cfg.with_include_tests(true);
+
                 let sway_str = String::from_utf8_lossy(&sway_str);
-                let handler = Handler::default(); let compile_res = compile_to_ast(
+                let handler = Handler::default();
+		let mut initial_namespace = Root::new(core_lib_name.clone(), None, ProgramId::new(0), false);
+		initial_namespace.add_external("core".to_owned(), core_root.clone());
+                let compile_res = compile_to_ast(
                     &handler,
                     &engines,
                     Arc::from(sway_str),
-                    core_lib.clone(),
+                    initial_namespace,
                     Some(&bld_cfg),
-                    "test_lib",
-                    &mut metrics,
+                    PACKAGE_NAME,
+                    None,
+                    experimental
                 );
                 let (errors, _warnings) = handler.consume();
                 if !errors.is_empty() {
@@ -246,13 +272,20 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
                 let programs = compile_res
                     .expect("there were no errors, so there should be a program");
 
+                if verbose {
+                    println!("Declaration Engine");
+                    println!("-----------------------");
+                    println!("{}", engines.de().pretty_print(&engines));
+                }
+
                 let typed_program = programs.typed.as_ref().unwrap();
 
                 // Compile to IR.
                 let include_tests = true;
-                let mut ir = compile_program(typed_program, include_tests, &engines)
+                let mut ir = compile_program(typed_program, include_tests, &engines, experimental)
                     .unwrap_or_else(|e| {
                         use sway_types::span::Spanned;
+                        let e = e[0].clone();
                         let span = e.span();
                         panic!(
                             "Failed to compile test {}:\nError \"{e}\" at {}:{}\nCode: \"{}\"",
@@ -274,10 +307,10 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
                     let mut pass_mgr = PassManager::default();
                     let mut pass_group = PassGroup::default();
                     register_known_passes(&mut pass_mgr);
-                    pass_group.append_pass(CONSTDEMOTION_NAME);
-                    pass_group.append_pass(ARGDEMOTION_NAME);
-                    pass_group.append_pass(RETDEMOTION_NAME);
-                    pass_group.append_pass(MISCDEMOTION_NAME);
+                    pass_group.append_pass(CONST_DEMOTION_NAME);
+                    pass_group.append_pass(ARG_DEMOTION_NAME);
+                    pass_group.append_pass(RET_DEMOTION_NAME);
+                    pass_group.append_pass(MISC_DEMOTION_NAME);
                     pass_group.append_pass(MEMCPYOPT_NAME);
                     pass_group.append_pass(DCE_NAME);
                     if pass_mgr.run(&mut ir, &pass_group).is_err() {
@@ -344,7 +377,8 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
                             // Parse the IR again avoiding mutating the original ir
                             let mut ir = sway_ir::parser::parse(
                                 &ir_output,
-                                 engines.se()
+                                 engines.se(),
+                                 experimental,
                                 )
                                 .unwrap_or_else(|e| panic!("{}: {e}\n{ir_output}", path.display()));
 
@@ -372,7 +406,7 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
                             if optimisation_inline {
                                 let mut pass_mgr = PassManager::default();
                                 let mut pmgr_config = PassGroup::default();
-                                let inline = pass_mgr.register(create_inline_in_module_pass());
+                                let inline = pass_mgr.register(create_fn_inline_pass());
                                 pmgr_config.append_pass(inline);
                                 let inline_res = pass_mgr.run(&mut ir, &pmgr_config);
                                 if inline_res.is_err() {
@@ -391,7 +425,7 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
 
                             // Compile to ASM.
                             let handler = Handler::default();
-                            let asm_result = compile_ir_to_asm(&handler, &ir, None);
+                            let asm_result = compile_ir_context_to_finalized_asm(&handler, &ir, None);
                             let (errors, _warnings) = handler.consume();
 
                             if asm_result.is_err() || !errors.is_empty() {
@@ -439,7 +473,7 @@ pub(super) async fn run(filter_regex: Option<&regex::Regex>, verbose: bool) -> R
                 }
 
                 // Parse the IR again, and print it yet again to make sure that IR de/serialisation works.
-                let parsed_ir = sway_ir::parser::parse(&ir_output, engines.se())
+                let parsed_ir = sway_ir::parser::parse(&ir_output, engines.se(), experimental)
                     .unwrap_or_else(|e| panic!("{}: {e}\n{ir_output}", path.display()));
                 let parsed_ir_output = sway_ir::printer::to_string(&parsed_ir);
                 if ir_output != parsed_ir_output {
@@ -494,7 +528,11 @@ fn discover_test_files() -> Vec<PathBuf> {
     test_files
 }
 
-fn compile_core(build_target: BuildTarget, engines: &Engines) -> namespace::Module {
+fn compile_core(
+    build_target: BuildTarget,
+    engines: &Engines,
+    run_config: &RunConfig,
+) -> namespace::Root {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let libcore_root_dir = format!("{manifest_dir}/../sway-lib-core");
 
@@ -506,6 +544,7 @@ fn compile_core(build_target: BuildTarget, engines: &Engines) -> namespace::Modu
         disable_tests: false,
         locked: false,
         ipfs_node: None,
+        experimental: run_config.experimental.clone(),
     };
 
     let res = match forc::test::forc_check::check(check_cmd, engines) {
@@ -516,22 +555,7 @@ fn compile_core(build_target: BuildTarget, engines: &Engines) -> namespace::Modu
     };
 
     match res.0 {
-        Some(typed_program) => {
-            // Create a module for core and copy the compiled modules into it.  Unfortunately we
-            // can't get mutable access to move them out so they're cloned.
-            let core_module = typed_program.root.namespace.submodules().into_iter().fold(
-                namespace::Module::default(),
-                |mut core_mod, (name, sub_mod)| {
-                    core_mod.insert_submodule(name.clone(), sub_mod.clone());
-                    core_mod
-                },
-            );
-
-            // Create a module for std and insert the core module.
-            let mut std_module = namespace::Module::default();
-            std_module.insert_submodule("core".to_owned(), core_module);
-            std_module
-        }
+        Some(typed_program) => typed_program.namespace.root_ref().clone(),
         _ => {
             let (errors, _warnings) = res.1.consume();
             for err in errors {

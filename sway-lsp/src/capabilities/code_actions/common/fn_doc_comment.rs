@@ -19,7 +19,7 @@ impl<'a, T: Spanned + Named + FunctionSignature> GenerateDocCodeAction<'a, T>
 impl<'a, T: Spanned + Named + FunctionSignature> CodeAction<'a, T>
     for FnDocCommentCodeAction<'a, T>
 {
-    fn new(ctx: CodeActionContext<'a>, decl: &'a T) -> Self {
+    fn new(ctx: &CodeActionContext<'a>, decl: &'a T) -> Self {
         Self {
             engines: ctx.engines,
             decl,
@@ -60,7 +60,7 @@ impl<'a, T: Spanned + Named + FunctionSignature> CodeAction<'a, T>
     }
 }
 
-impl<'a, T: Spanned + Named + FunctionSignature> FnDocCommentCodeAction<'a, T> {
+impl<T: Spanned + Named + FunctionSignature> FnDocCommentCodeAction<'_, T> {
     /// Formats the return value of the function into a vector of strings.
     fn reverts_section(&self) -> Vec<String> {
         vec![
@@ -94,7 +94,7 @@ impl<'a, T: Spanned + Named + FunctionSignature> FnDocCommentCodeAction<'a, T> {
                 self.engines,
                 Some(param.name.to_string()),
                 param.type_argument.type_id,
-            ))
+            ));
         });
         lines
     }
